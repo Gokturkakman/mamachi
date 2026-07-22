@@ -1,12 +1,31 @@
 import { timingSafeEqual } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
-import { isAbsolute, relative } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
 import { parseCommand, type ActionResult, type DomainEvent } from "@mamachi/protocol";
 import { TaskController } from "./controller.ts";
 import { EventStore } from "./event-store.ts";
-import { ArtifactStore, type CapturedContext, type ContextKind } from "./artifact-store.ts";
+import {
+  ArtifactStore,
+  type CapturedContext,
+  type ContextKind,
+  type EvidenceArtifact,
+  type ToolEvidenceInput,
+  type ObserverInterpretation,
+  type ObserverInterpretationInput,
+} from "./artifact-store.ts";
 import { parseRuntimeSettings, type RuntimeSettings } from "./model-router.ts";
+import { FactProjector, type FactSnapshot, type TaskFacts } from "./fact-projector.ts";
+import type { EditorDocumentState, WorkspaceConflict } from "./workspace-guard.ts";
+import type { RealtimePlaybackCursor } from "./realtime-bridge.ts";
+import {
+  EditorContextRequestBroker,
+  editorContextKinds,
+  type EditorContextCapture,
+  type EditorContextError,
+} from "./editor-context-request.ts";
+import { MemoryStore, type MemoryFact, type MemoryScope } from "./memory-store.ts";
+import type { SensitiveFieldKey } from "./sensitive-field-codec.ts";
 
 interface ClientData {
   id: string;
@@ -21,14 +40,18 @@ interface RequestEnvelope {
     | "state.get"
     | "workspace.select"
     | "workspace.focus"
+    | "editor.state"
     | "context.capture"
+    | "context.remove"
     | "command.execute"
     | "settings.update"
     | "voice.connect"
     | "voice.disconnect"
+    | "voice.engagement"
     | "voice.interrupt"
     | "voice.text"
-    | "voice.mode";
+    | "voice.mode"
+    | "editor.context.response";
   payload: unknown;
 }
 
@@ -36,10 +59,13 @@ export interface DaemonHooks {
   onAudioInput?: (pcm: Uint8Array) => void;
   onTaskEvents?: (events: DomainEvent[]) => void | Promise<void>;
   onContextCaptured?: (context: CapturedContext) => void;
+  onContextRemoved?: (id: string) => void;
+  onEditorState?: (state: EditorDocumentState) => void;
   onSettingsUpdate?: (settings: RuntimeSettings) => void;
   onVoiceConnect?: (apiKey?: string) => void | Promise<void>;
   onVoiceDisconnect?: () => void | Promise<void>;
-  onVoiceInterrupt?: () => void;
+  onVoiceEngagement?: (engaged: boolean, playback: RealtimePlaybackCursor | null) => void;
+  onVoiceInterrupt?: (playback: RealtimePlaybackCursor | null) => void;
   onVoiceText?: (text: string) => void | Promise<void>;
   onVoiceMode?: (mode: "voice" | "text") => void;
 }
@@ -50,6 +76,8 @@ export interface IpcServerOptions {
   hostname?: string;
   databasePath?: string;
   initialWorkspace?: string;
+  encryptionKey?: SensitiveFieldKey;
+  editorContextTimeoutMs?: number;
   hooks?: DaemonHooks;
 }
 
@@ -62,6 +90,27 @@ function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): b
   return Object.keys(value).every((key) => allowed.has(key));
 }
 
+
+function parsePlaybackCursor(value: unknown): RealtimePlaybackCursor | null {
+  if (value === null) return null;
+  if (
+    !isObject(value) ||
+    !hasOnlyKeys(value, ["itemId", "contentIndex", "audioEndMs"]) ||
+    typeof value["itemId"] !== "string" ||
+    value["itemId"].length === 0 ||
+    !Number.isInteger(value["contentIndex"]) ||
+    (value["contentIndex"] as number) < 0 ||
+    !Number.isInteger(value["audioEndMs"]) ||
+    (value["audioEndMs"] as number) < 0
+  ) {
+    throw new Error("Playback cursor is invalid");
+  }
+  return {
+    itemId: value["itemId"],
+    contentIndex: value["contentIndex"] as number,
+    audioEndMs: value["audioEndMs"] as number,
+  };
+}
 function parseRequest(input: unknown): RequestEnvelope {
   if (!isObject(input) || !hasOnlyKeys(input, ["version", "id", "type", "payload"])) {
     throw new Error("Invalid IPC request envelope");
@@ -73,14 +122,18 @@ function parseRequest(input: unknown): RequestEnvelope {
     "state.get",
     "workspace.select",
     "workspace.focus",
+    "editor.state",
     "context.capture",
+    "context.remove",
     "command.execute",
     "settings.update",
     "voice.connect",
     "voice.disconnect",
+    "voice.engagement",
     "voice.interrupt",
     "voice.text",
     "voice.mode",
+    "editor.context.response",
   ]);
   if (!supported.has(input["type"])) throw new Error(`Unsupported IPC request type: ${input["type"]}`);
   return input as unknown as RequestEnvelope;
@@ -99,6 +152,9 @@ export class MamachiIpcServer {
   readonly #controller: TaskController;
   readonly #store: EventStore;
   readonly #artifacts: ArtifactStore;
+  readonly #facts: FactProjector;
+  readonly #memories: MemoryStore;
+  readonly #editorRequests: EditorContextRequestBroker;
   readonly #hooks: DaemonHooks;
   readonly #clients = new Set<ClientSocket>();
   readonly #server: Server<ClientData>;
@@ -109,9 +165,15 @@ export class MamachiIpcServer {
     this.#hooks = options.hooks ?? {};
     this.#workspace = realpathSync(options.initialWorkspace ?? process.cwd());
     const databasePath = options.databasePath ?? ":memory:";
-    this.#store = new EventStore(databasePath);
-    this.#artifacts = new ArtifactStore(databasePath);
-    this.#controller = new TaskController(this.#store);
+    this.#store = new EventStore(databasePath, { encryptionKey: options.encryptionKey ?? null });
+    this.#artifacts = new ArtifactStore(databasePath, { encryptionKey: options.encryptionKey ?? null });
+    this.#facts = new FactProjector(this.#artifacts);
+    this.#memories = new MemoryStore(databasePath, options.encryptionKey ?? null);
+    this.#editorRequests = new EditorContextRequestBroker(options.editorContextTimeoutMs);
+    this.#controller = new TaskController(this.#store, {
+      validateEvidence: (taskId, runId, evidenceIds) =>
+        this.#artifacts.validateCompletion(taskId, runId, evidenceIds),
+    });
 
     this.#server = Bun.serve<ClientData>({
       hostname: options.hostname ?? "127.0.0.1",
@@ -124,6 +186,7 @@ export class MamachiIpcServer {
             clientId: socket.data.id,
             workspace: this.#workspace,
             snapshot: this.#controller.snapshot(),
+            facts: this.#facts.project(this.#controller.snapshot()),
           });
         },
         message: (socket, message) => {
@@ -161,18 +224,85 @@ export class MamachiIpcServer {
   snapshot() {
     return this.#controller.snapshot();
   }
+  factSnapshot(): FactSnapshot {
+    return this.#facts.project(this.#controller.snapshot());
+  }
+
+  taskFacts(taskId: string): TaskFacts | undefined {
+    return this.factSnapshot().tasks.find((facts) => facts.taskId === taskId);
+  }
+
+  recordObserverInterpretation(input: ObserverInterpretationInput): ObserverInterpretation {
+    return this.#artifacts.recordObserverInterpretation(input);
+  }
+
   getArtifacts(ids: readonly string[]): CapturedContext[] {
     return this.#artifacts.get(ids);
   }
 
+  getTaskArtifact(taskId: string, artifactId: string): EvidenceArtifact | null {
+    const artifact = this.#artifacts.getEvidence([artifactId])[0];
+    return artifact?.taskId === taskId ? artifact : null;
+  }
+
+  rememberFact(scope: MemoryScope, projectId: string | null, fact: string): MemoryFact {
+    return this.#memories.remember(scope, projectId, fact);
+  }
+
+  forgetFact(memoryId: string): boolean {
+    return this.#memories.forget(memoryId, this.#workspace);
+  }
+
+  async captureEditorContext(kinds: readonly ContextKind[]): Promise<{
+    artifacts: Array<{ id: string; kind: ContextKind; summary: string }>;
+    errors: EditorContextError[];
+  }> {
+    const clients = [...this.#clients];
+    const response = await this.#editorRequests.request(
+      kinds,
+      clients.map((client) => client.data.id),
+      (clientId, requestId, requestedKinds) => {
+        const client = clients.find((candidate) => candidate.data.id === clientId);
+        if (client) {
+          this.#send(client, "editor.context.request", {
+            requestId,
+            kinds: requestedKinds,
+            workspace: this.#workspace,
+          });
+        }
+      },
+    );
+    const artifacts = response.captures.map((capture) =>
+      this.#captureContextPayload({
+        kind: capture.kind,
+        workspace: this.#workspace,
+        ...capture.payload,
+      }),
+    );
+    return { artifacts, errors: response.errors };
+  }
+
   async executeCommand(input: unknown): Promise<ActionResult> {
     const command = parseCommand(input);
-    if (command.type === "task.submit" && command.payload.repositoryId !== this.#workspace) {
-      return {
-        status: "rejected",
-        code: "workspace_mismatch",
-        explanation: "The task repository does not match the selected workspace",
-      };
+    if (command.type === "task.submit") {
+      if (command.payload.repositoryId !== this.#workspace) {
+        return {
+          status: "rejected",
+          code: "workspace_mismatch",
+          explanation: "The task repository does not match the selected workspace",
+        };
+      }
+      const attachments = this.#artifacts.get(command.payload.attachmentIds);
+      if (
+        attachments.length !== command.payload.attachmentIds.length ||
+        attachments.some((artifact) => artifact.workspace !== command.payload.repositoryId)
+      ) {
+        return {
+          status: "rejected",
+          code: "attachment_mismatch",
+          explanation: "Every task attachment must exist and belong to the selected workspace",
+        };
+      }
     }
     const beforeSeq = this.#controller.snapshot().seq;
     const result = this.#controller.handle(command);
@@ -188,11 +318,61 @@ export class MamachiIpcServer {
     return result;
   }
 
+  async authorizeToolCall(taskId: string, toolName: string, input: unknown): Promise<ActionResult> {
+    const beforeSeq = this.#controller.snapshot().seq;
+    const result = this.#controller.authorizeToolCall(Bun.randomUUIDv7(), taskId, toolName, input);
+    await this.#publishControllerEvents(beforeSeq);
+    return result;
+  }
+
   async awaitUserInput(taskId: string, question: string): Promise<ActionResult> {
     const beforeSeq = this.#controller.snapshot().seq;
     const result = this.#controller.awaitUserInput(Bun.randomUUIDv7(), taskId, question);
     await this.#publishControllerEvents(beforeSeq);
     return result;
+  }
+
+  async recordCoderSession(
+    taskId: string,
+    runId: string,
+    sessionId: string,
+    sessionFile: string,
+  ): Promise<ActionResult> {
+    const beforeSeq = this.#controller.snapshot().seq;
+    const result = this.#controller.recordCoderSession(
+      Bun.randomUUIDv7(),
+      taskId,
+      runId,
+      sessionId,
+      sessionFile,
+    );
+    await this.#publishControllerEvents(beforeSeq);
+    return result;
+  }
+
+  async reportWorkspaceConflict(taskId: string, conflict: WorkspaceConflict): Promise<ActionResult> {
+    const beforeSeq = this.#controller.snapshot().seq;
+    const result = this.#controller.reportWorkspaceConflict(
+      Bun.randomUUIDv7(),
+      taskId,
+      conflict.paths,
+      conflict.reason,
+    );
+    await this.#publishControllerEvents(beforeSeq);
+    return result;
+  }
+
+  async recordToolEvidence(input: ToolEvidenceInput): Promise<EvidenceArtifact> {
+    const artifact = this.#artifacts.recordToolEvidence(input);
+    const beforeSeq = this.#controller.snapshot().seq;
+    const recorded = this.#controller.recordArtifact(artifact.id, input.taskId, artifact);
+    await this.#publishControllerEvents(beforeSeq);
+    if (recorded.status !== "accepted") {
+      throw new Error(
+        recorded.status === "rejected" ? recorded.explanation : "Artifact recording requires unexpected confirmation",
+      );
+    }
+    return artifact;
   }
 
   async completeTask(taskId: string, summary: string, evidenceIds: string[] = []): Promise<ActionResult> {
@@ -217,11 +397,13 @@ export class MamachiIpcServer {
 
 
   close(): void {
+    this.#editorRequests.cancelAll();
     for (const client of this.#clients) client.close(1001, "Mamachi daemon stopped");
     this.#clients.clear();
     this.#server.stop(true);
     this.#store.close();
     this.#artifacts.close();
+    this.#memories.close();
   }
 
   #handleUpgrade(request: Request, server: Server<ClientData>): Response | undefined {
@@ -243,7 +425,7 @@ export class MamachiIpcServer {
     try {
       const request = parseRequest(JSON.parse(text));
       requestId = request.id;
-      const result = await this.#dispatch(request);
+      const result = await this.#dispatch(socket, request);
       this.#send(socket, "response", { requestId, ok: true, result });
     } catch (error) {
       this.#send(socket, "response", {
@@ -254,14 +436,29 @@ export class MamachiIpcServer {
     }
   }
 
-  async #dispatch(request: RequestEnvelope): Promise<unknown> {
+  async #dispatch(socket: ClientSocket, request: RequestEnvelope): Promise<unknown> {
     switch (request.type) {
-      case "state.get":
-        this.#assertEmptyPayload(request.payload);
+      case "state.get": {
+        if (!isObject(request.payload) || !hasOnlyKeys(request.payload, ["afterSeq"])) {
+          throw new Error("state.get payload is invalid");
+        }
+        const afterSeq = request.payload["afterSeq"];
+        if (afterSeq !== undefined && afterSeq !== null && (!Number.isInteger(afterSeq) || (afterSeq as number) < 0)) {
+          throw new Error("state.get afterSeq must be a non-negative integer or null");
+        }
+        const snapshot = this.#controller.snapshot();
+        const reset = typeof afterSeq === "number" && afterSeq > snapshot.seq;
+        const events = typeof afterSeq === "number" && !reset
+          ? this.#controller.eventsAfter(afterSeq).filter((event) => event.seq <= snapshot.seq)
+          : [];
         return {
           workspace: this.#workspace,
-          snapshot: this.#controller.snapshot(),
+          snapshot,
+          facts: this.#facts.project(snapshot),
+          events,
+          reset,
         };
+      }
       case "workspace.select":
       case "workspace.focus": {
         if (
@@ -277,68 +474,51 @@ export class MamachiIpcServer {
         this.emit("workspace.changed", { path, source: request.type === "workspace.focus" ? "vscode" : "user" });
         return { path };
       }
-      case "context.capture": {
-        const allowedKeys = [
-          "kind",
-          "workspace",
-          "path",
-          "language",
-          "selection",
-          "range",
-          "diagnostics",
-          "terminalExcerpt",
-        ];
-        if (!isObject(request.payload) || !hasOnlyKeys(request.payload, allowedKeys)) {
-          throw new Error("context.capture payload is invalid");
+      case "editor.state": {
+        if (
+          !isObject(request.payload) ||
+          !hasOnlyKeys(request.payload, ["workspace", "path", "version", "dirty", "open"]) ||
+          typeof request.payload["workspace"] !== "string" ||
+          typeof request.payload["path"] !== "string" ||
+          !Number.isInteger(request.payload["version"]) ||
+          typeof request.payload["dirty"] !== "boolean" ||
+          typeof request.payload["open"] !== "boolean"
+        ) {
+          throw new Error("editor.state payload is invalid");
         }
-        const kind = request.payload["kind"];
-        const workspace = request.payload["workspace"];
-        const supportedKinds = new Set<ContextKind>(["active_file", "selection", "diagnostics", "terminal_excerpt"]);
-        if (typeof kind !== "string" || !supportedKinds.has(kind as ContextKind)) {
-          throw new Error("context.capture kind is invalid");
+        const requestedWorkspace = resolve(request.payload["workspace"]);
+        const workspace = realpathSync(requestedWorkspace);
+        if (workspace !== this.#workspace) throw new Error("Editor state does not belong to the selected workspace");
+        const requestedPath = resolve(requestedWorkspace, request.payload["path"]);
+        const relation = relative(requestedWorkspace, requestedPath);
+        if (relation === "" || relation === ".." || relation.startsWith(`..${sep}`) || isAbsolute(relation)) {
+          throw new Error("Editor state path is outside the selected workspace");
         }
-        if (typeof workspace !== "string" || realpathSync(workspace) !== this.#workspace) {
-          throw new Error("Captured context does not belong to the selected workspace");
+        const state: EditorDocumentState = {
+          workspace,
+          path: resolve(workspace, relation),
+          version: request.payload["version"] as number,
+          dirty: request.payload["dirty"],
+          open: request.payload["open"],
+        };
+        this.#hooks.onEditorState?.(state);
+        return { accepted: true };
+      }
+      case "context.capture":
+        return this.#captureContextPayload(request.payload);
+      case "context.remove": {
+        if (
+          !isObject(request.payload) ||
+          !hasOnlyKeys(request.payload, ["id"]) ||
+          typeof request.payload["id"] !== "string" ||
+          request.payload["id"].length === 0
+        ) {
+          throw new Error("context.remove requires one id string");
         }
-        for (const key of ["path", "language", "selection", "terminalExcerpt"]) {
-          const value = request.payload[key];
-          if (value !== undefined && typeof value !== "string") throw new Error(`context.capture ${key} must be a string`);
-        }
-        if (request.payload["range"] !== undefined && !isObject(request.payload["range"])) {
-          throw new Error("context.capture range must be an object");
-        }
-        if (request.payload["diagnostics"] !== undefined && !Array.isArray(request.payload["diagnostics"])) {
-          throw new Error("context.capture diagnostics must be an array");
-        }
-        const path = typeof request.payload["path"] === "string" ? request.payload["path"] : null;
-        if (path) {
-          const relativePath = relative(this.#workspace, path);
-          if (relativePath.startsWith("..") || isAbsolute(relativePath)) {
-            throw new Error("Captured file is outside the selected workspace");
-          }
-        }
-        const summary =
-          kind === "active_file"
-            ? `Active file: ${path ?? "unknown"}`
-            : kind === "selection"
-              ? `Explicit selection: ${path ?? "unknown"}`
-              : kind === "diagnostics"
-                ? `Diagnostics: ${path ?? "workspace"}`
-                : "Explicit terminal excerpt";
-        const artifact = this.#artifacts.capture(
-          kind as ContextKind,
-          this.#workspace,
-          summary,
-          request.payload,
-        );
-        this.emit("context.captured", {
-          id: artifact.id,
-          kind: artifact.kind,
-          workspace: artifact.workspace,
-          summary: artifact.summary,
-        });
-        this.#hooks.onContextCaptured?.(artifact);
-        return { id: artifact.id, kind: artifact.kind, summary: artifact.summary };
+        const id = request.payload["id"];
+        this.#hooks.onContextRemoved?.(id);
+        this.emit("context.removed", { ids: [id] });
+        return { removed: true };
       }
       case "command.execute": {
         if (!isObject(request.payload) || !hasOnlyKeys(request.payload, ["command"])) {
@@ -378,10 +558,26 @@ export class MamachiIpcServer {
         this.#assertEmptyPayload(request.payload);
         await this.#hooks.onVoiceDisconnect?.();
         return { connected: false };
-      case "voice.interrupt":
-        this.#assertEmptyPayload(request.payload);
-        this.#hooks.onVoiceInterrupt?.();
+      case "voice.engagement": {
+        if (
+          !isObject(request.payload) ||
+          !hasOnlyKeys(request.payload, ["engaged", "playback"]) ||
+          typeof request.payload["engaged"] !== "boolean"
+        ) {
+          throw new Error("voice.engagement payload is invalid");
+        }
+        const playback = parsePlaybackCursor(request.payload["playback"] ?? null);
+        this.#hooks.onVoiceEngagement?.(request.payload["engaged"], playback);
+        return { engaged: request.payload["engaged"] };
+      }
+      case "voice.interrupt": {
+        if (!isObject(request.payload) || !hasOnlyKeys(request.payload, ["playback"])) {
+          throw new Error("voice.interrupt payload is invalid");
+        }
+        const playback = parsePlaybackCursor(request.payload["playback"] ?? null);
+        this.#hooks.onVoiceInterrupt?.(playback);
         return { interrupted: true };
+      }
       case "voice.text": {
         if (
           !isObject(request.payload) ||
@@ -393,7 +589,111 @@ export class MamachiIpcServer {
         await this.#hooks.onVoiceText?.(request.payload["text"]);
         return { accepted: true };
       }
+      case "editor.context.response": {
+        if (
+          !isObject(request.payload) ||
+          !hasOnlyKeys(request.payload, ["requestId", "captures", "errors"]) ||
+          typeof request.payload["requestId"] !== "string" ||
+          !Array.isArray(request.payload["captures"]) ||
+          !Array.isArray(request.payload["errors"]) ||
+          request.payload["captures"].length > editorContextKinds.length ||
+          request.payload["errors"].length > editorContextKinds.length
+        ) {
+          throw new Error("editor.context.response payload is invalid");
+        }
+        const captures: EditorContextCapture[] = request.payload["captures"].map((candidate) => {
+          if (
+            !isObject(candidate) ||
+            !hasOnlyKeys(candidate, ["kind", "payload"]) ||
+            !editorContextKinds.includes(candidate["kind"] as ContextKind) ||
+            !isObject(candidate["payload"])
+          ) {
+            throw new Error("editor.context.response capture is invalid");
+          }
+          return { kind: candidate["kind"] as ContextKind, payload: candidate["payload"] };
+        });
+        const errors: EditorContextError[] = request.payload["errors"].map((candidate) => {
+          if (
+            !isObject(candidate) ||
+            !hasOnlyKeys(candidate, ["kind", "error"]) ||
+            !editorContextKinds.includes(candidate["kind"] as ContextKind) ||
+            typeof candidate["error"] !== "string" ||
+            candidate["error"].trim().length === 0
+          ) {
+            throw new Error("editor.context.response error is invalid");
+          }
+          return { kind: candidate["kind"] as ContextKind, error: candidate["error"].trim() };
+        });
+        if (!this.#editorRequests.respond(socket.data.id, request.payload["requestId"], { captures, errors })) {
+          throw new Error("Editor context response is stale or does not match the request");
+        }
+        return { accepted: true };
+      }
     }
+  }
+
+  #captureContextPayload(payload: unknown): { id: string; kind: ContextKind; summary: string } {
+    const allowedKeys = [
+      "kind",
+      "workspace",
+      "path",
+      "language",
+      "content",
+      "selection",
+      "range",
+      "diagnostics",
+      "terminalExcerpt",
+    ];
+    if (!isObject(payload) || !hasOnlyKeys(payload, allowedKeys)) {
+      throw new Error("context.capture payload is invalid");
+    }
+    const kind = payload["kind"];
+    const workspace = payload["workspace"];
+    if (typeof kind !== "string" || !editorContextKinds.includes(kind as ContextKind)) {
+      throw new Error("context.capture kind is invalid");
+    }
+    if (typeof workspace !== "string" || realpathSync(workspace) !== this.#workspace) {
+      throw new Error("Captured context does not belong to the selected workspace");
+    }
+    for (const key of ["path", "language", "content", "selection", "terminalExcerpt"]) {
+      const value = payload[key];
+      if (value !== undefined && typeof value !== "string") throw new Error(`context.capture ${key} must be a string`);
+    }
+    if (payload["range"] !== undefined && !isObject(payload["range"])) {
+      throw new Error("context.capture range must be an object");
+    }
+    if (payload["diagnostics"] !== undefined && !Array.isArray(payload["diagnostics"])) {
+      throw new Error("context.capture diagnostics must be an array");
+    }
+    const requestedPath = typeof payload["path"] === "string"
+      ? resolve(workspace, payload["path"])
+      : null;
+    const path = requestedPath === null ? null : realpathSync(requestedPath);
+    const relativePath = path === null ? null : relative(this.#workspace, path);
+    if (
+      relativePath !== null &&
+      (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath))
+    ) {
+      throw new Error("Captured file is outside the selected workspace");
+    }
+    const normalizedPayload = { ...payload, workspace: this.#workspace, ...(path ? { path } : {}) };
+    const summary =
+      kind === "active_file"
+        ? `Active file: ${path ?? "unknown"}`
+        : kind === "selection"
+          ? `Explicit selection: ${path ?? "unknown"}`
+          : kind === "diagnostics"
+            ? `Diagnostics: ${path ?? "workspace"}`
+            : "Explicit terminal excerpt";
+    const artifact = this.#artifacts.capture(kind as ContextKind, this.#workspace, summary, normalizedPayload);
+    this.emit("context.captured", {
+      id: artifact.id,
+      kind: artifact.kind,
+      workspace: artifact.workspace,
+      summary: artifact.summary,
+    });
+    this.#hooks.onContextCaptured?.(artifact);
+    return { id: artifact.id, kind: artifact.kind, summary: artifact.summary };
   }
 
   async #publishControllerEvents(beforeSeq: number): Promise<void> {
@@ -403,6 +703,7 @@ export class MamachiIpcServer {
     this.emit("state.snapshot", {
       workspace: this.#workspace,
       snapshot: this.#controller.snapshot(),
+      facts: this.#facts.project(this.#controller.snapshot()),
     });
     await this.#hooks.onTaskEvents?.(events);
   }

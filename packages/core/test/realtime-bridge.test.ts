@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { Server, ServerWebSocket } from "bun";
 import type { ActionResult, DomainEvent } from "@mamachi/protocol";
 import { RealtimeBridge } from "../src/realtime-bridge.ts";
-import type { ControllerSnapshot } from "../src/domain.ts";
+import type { ControllerSnapshot, TaskRecord } from "../src/domain.ts";
 
 interface MockClientData {
   authenticated: boolean;
@@ -73,6 +73,7 @@ describe("RealtimeBridge", () => {
       queue: [],
       tasks: [],
       runs: [],
+      confirmations: [],
     };
     const bridge = new RealtimeBridge({
       apiKey: "test-realtime-key",
@@ -125,19 +126,32 @@ describe("RealtimeBridge", () => {
     });
     expect(session["instructions"]).toContain("Do not speak before any tool call.");
     const tools = session["tools"];
-    expect(Array.isArray(tools) ? tools.map((tool) => isRecord(tool) ? tool["name"] : null) : []).toEqual([
+    const toolList = Array.isArray(tools) ? tools.filter(isRecord) : [];
+    expect(toolList.map((tool) => tool["name"])).toEqual([
+      "wait_for_user",
+      "get_workspace",
+      "list_coding_profiles",
+      "capture_editor_context",
       "submit_task",
       "get_task_status",
+      "get_task_artifact",
+      "answer_task_question",
+      "ask_coder",
+      "propose_task_change",
       "control_task",
-      "revise_task",
+      "manage_queue",
+      "resolve_confirmation",
+      "remember_fact",
+      "forget_fact",
       "inspect_workspace",
       "research_web",
       "set_overlay",
       "control_computer",
       "mute_mamachi",
-      "get_workspace",
-      "wait_for_user",
     ]);
+    expect(
+      toolList.every((tool) => isRecord(tool["parameters"]) && tool["parameters"]["additionalProperties"] === false),
+    ).toBe(true);
     expect(
       incoming.some(
         (event) =>
@@ -166,9 +180,12 @@ describe("RealtimeBridge", () => {
               call_id: callId,
               name: "submit_task",
               arguments: JSON.stringify({
+                repositoryId: "/tmp/mamachi-workspace",
                 objective: "Update the selected function",
                 acceptanceCriteria: ["The function returns two"],
                 constraints: ["Change only the selected file"],
+                attachmentIds: [],
+                codingProfileId: null,
               }),
             },
           ],
@@ -178,12 +195,14 @@ describe("RealtimeBridge", () => {
     await commandExecuted.promise;
     const submitted = commands[0] as { type: string; payload: { attachmentIds: string[] } };
     expect(submitted.type).toBe("task.submit");
-    expect(submitted.payload.attachmentIds).toHaveLength(1);
+    expect(submitted.payload.attachmentIds).toHaveLength(0);
     await functionOutputReceived.promise;
 
     client?.send(
       JSON.stringify({
         type: "response.output_audio.delta",
+        item_id: "assistant_item_task_started",
+        content_index: 0,
         delta: Buffer.from([1, 2, 3, 4]).toString("base64"),
       }),
     );
@@ -236,7 +255,7 @@ describe("RealtimeBridge", () => {
       apiKey: "test-realtime-key",
       endpoint: `ws://127.0.0.1:${server.port}/realtime`,
       getWorkspace: () => "/tmp/mamachi-workspace",
-      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [], confirmations: [] }),
       executeCommand: async () => {
         throw new Error("wait_for_user must not execute a coding command");
       },
@@ -312,7 +331,7 @@ describe("RealtimeBridge", () => {
       apiKey: "test-realtime-key",
       endpoint: `ws://127.0.0.1:${server.port}/realtime`,
       getWorkspace: () => "/tmp/mamachi-workspace",
-      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [], confirmations: [] }),
       executeCommand: async () => {
         throw new Error("get_workspace must not execute a coding command");
       },
@@ -337,6 +356,8 @@ describe("RealtimeBridge", () => {
     let responseCreates = 0;
     const initialResponse = Promise.withResolvers<void>();
     const resumedResponse = Promise.withResolvers<void>();
+    const audioForwarded = Promise.withResolvers<void>();
+    const truncated = Promise.withResolvers<Record<string, unknown>>();
     const emitted: Array<{ type: string; payload: unknown }> = [];
     const audio: Uint8Array[] = [];
     server = Bun.serve<MockClientData>({
@@ -359,6 +380,8 @@ describe("RealtimeBridge", () => {
             responseCreates += 1;
             if (responseCreates === 1) initialResponse.resolve();
             if (responseCreates === 2) resumedResponse.resolve();
+          } else if (event["type"] === "conversation.item.truncate") {
+            truncated.resolve(event);
           }
         },
       },
@@ -367,12 +390,15 @@ describe("RealtimeBridge", () => {
       apiKey: "test-realtime-key",
       endpoint: `ws://127.0.0.1:${server.port}/realtime`,
       getWorkspace: () => "/tmp/mamachi-workspace",
-      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [], confirmations: [] }),
       executeCommand: async () => {
         throw new Error("barge-in must not execute a coding command");
       },
       emit: (type, payload) => emitted.push({ type, payload }),
-      emitAudio: (pcm) => audio.push(pcm),
+      emitAudio: (pcm) => {
+        audio.push(pcm);
+        audioForwarded.resolve();
+      },
     });
 
     await bridge.connect();
@@ -381,13 +407,29 @@ describe("RealtimeBridge", () => {
     client?.send(
       JSON.stringify({
         type: "response.output_audio.delta",
+        item_id: "assistant_item_barge",
+        content_index: 0,
         delta: Buffer.from([1, 2]).toString("base64"),
       }),
     );
+    await audioForwarded.promise;
+    bridge.interrupt({
+      itemId: "assistant_item_barge",
+      contentIndex: 0,
+      audioEndMs: 735,
+    });
+    await expect(truncated.promise).resolves.toEqual({
+      type: "conversation.item.truncate",
+      item_id: "assistant_item_barge",
+      content_index: 0,
+      audio_end_ms: 735,
+    });
     client?.send(JSON.stringify({ type: "input_audio_buffer.speech_started" }));
     client?.send(
       JSON.stringify({
         type: "response.output_audio.delta",
+        item_id: "assistant_item_barge",
+        content_index: 0,
         delta: Buffer.from([3, 4]).toString("base64"),
       }),
     );
@@ -438,7 +480,7 @@ describe("RealtimeBridge", () => {
       apiKey: "test-realtime-key",
       endpoint: `ws://127.0.0.1:${server.port}/realtime`,
       getWorkspace: () => "/tmp/mamachi-workspace",
-      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [], confirmations: [] }),
       executeCommand: async () => {
         throw new Error("cancel race must not execute a coding command");
       },
@@ -513,7 +555,7 @@ describe("RealtimeBridge", () => {
       apiKey: "test-realtime-key",
       endpoint: `ws://127.0.0.1:${server.port}/realtime`,
       getWorkspace: () => "/tmp/mamachi-workspace",
-      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [], confirmations: [] }),
       executeCommand: async () => {
         throw new Error("text chat must not execute a coding command");
       },
@@ -592,7 +634,7 @@ describe("RealtimeBridge", () => {
       apiKey: "test-realtime-key",
       endpoint: `ws://127.0.0.1:${server.port}/realtime`,
       getWorkspace: () => "/tmp/mamachi-workspace",
-      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [], confirmations: [] }),
       executeCommand: async (command) => {
         commands.push(command);
         return { status: "accepted", eventId: Bun.randomUUIDv7(), taskId: Bun.randomUUIDv7() };
@@ -666,7 +708,7 @@ describe("RealtimeBridge", () => {
       apiKey: "test-realtime-key",
       endpoint: `ws://127.0.0.1:${server.port}/realtime`,
       getWorkspace: () => "/tmp/mamachi-workspace",
-      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [], confirmations: [] }),
       executeCommand: async (command) => {
         commands.push(command);
         return { status: "accepted", eventId: Bun.randomUUIDv7(), taskId: Bun.randomUUIDv7() };
@@ -687,6 +729,118 @@ describe("RealtimeBridge", () => {
     expect(isRecord(payload) ? payload["constraints"] : null).toContain(
       "Read-only inspection; do not modify workspace files.",
     );
+    await bridge.disconnect();
+  });
+
+  test("sleeps without provider responses and delivers one queued grounded brief after resume", async () => {
+    let client: ServerWebSocket<MockClientData> | undefined;
+    let responseCreates = 0;
+    const incoming: Record<string, unknown>[] = [];
+    const audio: Uint8Array[] = [];
+    const queued = Promise.withResolvers<void>();
+    const delivered = Promise.withResolvers<void>();
+    const resumedResponse = Promise.withResolvers<void>();
+    const audioForwarded = Promise.withResolvers<void>();
+    const sleepingAudioProcessed = Promise.withResolvers<void>();
+    let sleepingBarrierArmed = false;
+    const emitted: Array<{ type: string; payload: unknown }> = [];
+    server = Bun.serve<MockClientData>({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request, bunServer) {
+        const upgraded = bunServer.upgrade(request, { data: { authenticated: true } });
+        return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
+      },
+      websocket: {
+        open(socket) {
+          client = socket;
+        },
+        message(socket, message) {
+          if (typeof message !== "string") return;
+          const event = JSON.parse(message) as Record<string, unknown>;
+          incoming.push(event);
+          if (event["type"] === "session.update") {
+            socket.send(JSON.stringify({ type: "session.updated", session: { id: "session_sleep" } }));
+          } else if (event["type"] === "response.create") {
+            responseCreates += 1;
+            resumedResponse.resolve();
+          }
+        },
+      },
+    });
+    const bridge = new RealtimeBridge({
+      apiKey: "test-realtime-key",
+      endpoint: `ws://127.0.0.1:${server.port}/realtime`,
+      initiallyEngaged: false,
+      getWorkspace: () => "/tmp/mamachi-workspace",
+      getSnapshot: () => ({ seq: 8, activeTaskId: null, queue: [], tasks: [], runs: [], confirmations: [] }),
+      executeCommand: async () => {
+        throw new Error("sleep brief must not execute another command");
+      },
+      emit: (type, payload) => {
+        emitted.push({ type, payload });
+        if (type === "brief.queued") queued.resolve();
+        if (type === "brief.delivered") delivered.resolve();
+        if (sleepingBarrierArmed && type === "voice.state") sleepingAudioProcessed.resolve();
+      },
+      emitAudio: (pcm) => {
+        audio.push(pcm);
+        audioForwarded.resolve();
+      },
+    });
+
+    await bridge.connect();
+    const eventId = Bun.randomUUIDv7();
+    const taskId = Bun.randomUUIDv7();
+    bridge.handleTaskEvents([{
+      version: 1,
+      id: eventId,
+      seq: 8,
+      at: new Date().toISOString(),
+      type: "task.completed",
+      actor: "controller",
+      taskId,
+      runId: Bun.randomUUIDv7(),
+      correlationId: eventId,
+      payload: {
+        runId: Bun.randomUUIDv7(),
+        summary: "Finished the requested change with targeted verification.",
+        evidenceIds: [],
+      },
+    } as DomainEvent<"task.completed">]);
+    await queued.promise;
+    sleepingBarrierArmed = true;
+    client?.send(JSON.stringify({
+      type: "response.output_audio.delta",
+      item_id: "sleep_race_item",
+      content_index: 0,
+      delta: Buffer.from([9, 9]).toString("base64"),
+    }));
+    client?.send(JSON.stringify({ type: "session.updated", session: { id: "sleep_barrier" } }));
+    await sleepingAudioProcessed.promise;
+
+    expect(responseCreates).toBe(0);
+    expect(audio).toEqual([]);
+    expect(emitted.some((event) => event.type === "voice.notification")).toBe(true);
+    expect(incoming.some((event) => event["type"] === "conversation.item.create")).toBe(false);
+
+    bridge.setEngaged(true);
+    await Promise.all([resumedResponse.promise, delivered.promise]);
+    expect(responseCreates).toBe(1);
+    expect(
+      incoming.filter((event) =>
+        event["type"] === "conversation.item.create" &&
+        JSON.stringify(event).includes("Mamachi resumed after sleeping")
+      ),
+    ).toHaveLength(1);
+    client?.send(JSON.stringify({
+      type: "response.output_audio.delta",
+      item_id: "resumed_brief_item",
+      content_index: 0,
+      delta: Buffer.from([1, 2]).toString("base64"),
+    }));
+    await audioForwarded.promise;
+    expect(audio.map((pcm) => [...pcm])).toEqual([[1, 2]]);
     await bridge.disconnect();
   });
 
@@ -739,7 +893,7 @@ describe("RealtimeBridge", () => {
       apiKey: "test-realtime-key",
       endpoint: `ws://127.0.0.1:${server.port}/realtime`,
       getWorkspace: () => "/tmp/mamachi-workspace",
-      getSnapshot: () => ({ seq: 7, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      getSnapshot: () => ({ seq: 7, activeTaskId: null, queue: [], tasks: [], runs: [], confirmations: [] }),
       executeCommand: async () => {
         throw new Error("completion announcements must not execute another command");
       },
@@ -831,7 +985,7 @@ describe("RealtimeBridge", () => {
       apiKey: "test-realtime-key",
       endpoint: `ws://127.0.0.1:${server.port}/realtime`,
       getWorkspace: () => "/tmp/mamachi-workspace",
-      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [], confirmations: [] }),
       executeCommand: async () => {
         throw new Error("overlay controls must not execute a coding command");
       },
@@ -914,7 +1068,7 @@ describe("RealtimeBridge", () => {
       apiKey: "test-realtime-key",
       endpoint: `ws://127.0.0.1:${server.port}/realtime`,
       getWorkspace: () => "/tmp/mamachi-workspace",
-      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [], confirmations: [] }),
       executeCommand: async () => {
         throw new Error("computer and app controls must not execute a coding command");
       },
@@ -947,4 +1101,388 @@ describe("RealtimeBridge", () => {
     expect(responseCreates).toBe(2);
     await bridge.disconnect();
   });
+
+  test("queues briefs while disengaged in voice mode and flushes them exactly once on re-engage", async () => {
+    let responseCreates = 0;
+    const injectedItems: Record<string, unknown>[] = [];
+    const emitted: Array<{ type: string; payload: unknown }> = [];
+    const flushRequested = Promise.withResolvers<void>();
+    const barriers = new Map<string, () => void>();
+    server = Bun.serve<MockClientData>({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request, bunServer) {
+        const upgraded = bunServer.upgrade(request, { data: { authenticated: true } });
+        return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
+      },
+      websocket: {
+        open() {},
+        message(socket, message) {
+          if (typeof message !== "string") return;
+          const event = JSON.parse(message) as Record<string, unknown>;
+          if (event["type"] === "session.update") {
+            socket.send(JSON.stringify({ type: "session.updated", session: { id: "session_briefs" } }));
+          } else if (event["type"] === "conversation.item.create") {
+            injectedItems.push(event);
+            const serialized = JSON.stringify(event);
+            for (const [marker, release] of barriers) {
+              if (serialized.includes(marker)) {
+                barriers.delete(marker);
+                release();
+              }
+            }
+          } else if (event["type"] === "response.create") {
+            responseCreates += 1;
+            flushRequested.resolve();
+          }
+        },
+      },
+    });
+    const bridge = new RealtimeBridge({
+      apiKey: "test-realtime-key",
+      endpoint: `ws://127.0.0.1:${server.port}/realtime`,
+      getWorkspace: () => "/tmp/mamachi-workspace",
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [], confirmations: [] }),
+      executeCommand: async () => {
+        throw new Error("queued briefs must not execute a coding command");
+      },
+      emit: (type, payload) => {
+        emitted.push({ type, payload });
+      },
+      emitAudio: () => {},
+      initiallyEngaged: false,
+    });
+
+    await bridge.connect();
+
+    // A captured-context injection is a wire barrier: once its item arrives,
+    // every frame the bridge sent before it has arrived too.
+    const barrier = async (marker: string): Promise<void> => {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      barriers.set(marker, resolve);
+      bridge.captureContext({
+        id: marker,
+        kind: "selection",
+        workspace: "/tmp/mamachi-workspace",
+        summary: `barrier ${marker}`,
+        payload: { marker },
+        createdAt: new Date().toISOString(),
+      });
+      await promise;
+    };
+    const flushItems = () =>
+      injectedItems.filter((item) => JSON.stringify(item).includes("resumed after sleeping"));
+
+    const taskA = Bun.randomUUIDv7();
+    const taskB = Bun.randomUUIDv7();
+    const makeEvent = <T extends DomainEvent["type"]>(
+      type: T,
+      taskId: string,
+      payload: unknown,
+    ): DomainEvent => {
+      const id = Bun.randomUUIDv7();
+      return {
+        version: 1,
+        id,
+        seq: 1,
+        at: new Date().toISOString(),
+        type,
+        actor: "controller",
+        taskId,
+        runId: Bun.randomUUIDv7(),
+        correlationId: id,
+        payload,
+      } as DomainEvent;
+    };
+
+    bridge.handleTaskEvents([
+      makeEvent("task.completed", taskA, { runId: Bun.randomUUIDv7(), summary: "First task done.", evidenceIds: [] }),
+    ]);
+    bridge.handleTaskEvents([
+      makeEvent("task.failed", taskB, { runId: Bun.randomUUIDv7(), error: "Second task hit a build failure." }),
+      makeEvent("task.awaitingUser", taskA, { runId: Bun.randomUUIDv7(), question: "Which branch should I target?" }),
+    ]);
+    await barrier("barrier_disengaged");
+
+    expect(responseCreates).toBe(0);
+    expect(flushItems()).toHaveLength(0);
+    const queued = emitted.filter((entry) => entry.type === "brief.queued");
+    expect(queued.map((entry) => entry.payload)).toEqual([
+      { taskId: taskA, kind: "completed", summary: "First task done.", pending: 1 },
+      { taskId: taskB, kind: "failed", summary: "Second task hit a build failure.", pending: 2 },
+      { taskId: taskA, kind: "awaiting_user", summary: "Which branch should I target?", pending: 2 },
+    ]);
+
+    bridge.setEngaged(true);
+    await flushRequested.promise;
+
+    expect(responseCreates).toBe(1);
+    expect(flushItems()).toHaveLength(1);
+    const flushed = JSON.stringify(flushItems()[0]);
+    expect(flushed).toContain("resumed after sleeping");
+    expect(flushed).toContain("Which branch should I target?");
+    expect(flushed).toContain("Second task hit a build failure.");
+    expect(flushed).not.toContain("First task done.");
+    expect(emitted).toContainEqual({ type: "brief.delivered", payload: { count: 2 } });
+
+    bridge.setEngaged(false);
+    bridge.setEngaged(true);
+    await barrier("barrier_reengaged");
+    expect(responseCreates).toBe(1);
+    expect(flushItems()).toHaveLength(1);
+    await bridge.disconnect();
+  });
+});
+
+test("section 16 handlers enforce correlation, ownership, revisions, queue commands, memory, and availability", async () => {
+  const commands: Array<Record<string, unknown>> = [];
+  const pendingCalls = new Map<string, (value: Record<string, unknown>) => void>();
+  let client: ServerWebSocket<MockClientData> | undefined;
+  const connected = Promise.withResolvers<void>();
+  const handlerServer = Bun.serve<MockClientData>({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request, bunServer) {
+      const upgraded = bunServer.upgrade(request, { data: { authenticated: true } });
+      return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
+    },
+    websocket: {
+      open(socket) {
+        client = socket;
+        connected.resolve();
+      },
+      message(socket, message) {
+        if (typeof message !== "string") return;
+        const event = JSON.parse(message) as Record<string, unknown>;
+        if (event["type"] === "session.update") {
+          socket.send(JSON.stringify({ type: "session.updated", session: { id: "section-16" } }));
+        } else if (event["type"] === "conversation.item.create") {
+          const item = event["item"];
+          if (isRecord(item) && item["type"] === "function_call_output" && typeof item["call_id"] === "string") {
+            const output = typeof item["output"] === "string" ? JSON.parse(item["output"]) as Record<string, unknown> : {};
+            pendingCalls.get(item["call_id"])?.(output);
+            pendingCalls.delete(item["call_id"]);
+          }
+        } else if (event["type"] === "response.create") {
+          queueMicrotask(() => socket.send(JSON.stringify({
+            type: "response.done",
+            response: { status: "completed", output: [] },
+          })));
+        }
+      },
+    },
+  });
+
+  const task: TaskRecord = {
+    id: "task-1",
+    repositoryId: "/tmp/mamachi-workspace",
+    state: "paused",
+    spec: {
+      repositoryId: "/tmp/mamachi-workspace",
+      objective: "Implement the original behavior",
+      acceptanceCriteria: ["Original behavior works"],
+      constraints: ["Keep compatibility"],
+      attachmentIds: [],
+      codingProfileId: null,
+    },
+    revision: 1,
+    activeRunId: "run-1",
+    runIds: ["run-1"],
+    evidenceIds: ["artifact-1"],
+    createdAt: "2026-07-23T00:00:00.000Z",
+    updatedAt: "2026-07-23T00:00:00.000Z",
+    terminalSummary: null,
+    workspaceConflict: null,
+    pendingQuestion: "Which API?",
+    specHistory: [],
+  };
+  const snapshot: ControllerSnapshot = {
+    seq: 1,
+    activeTaskId: task.id,
+    queue: ["queued-1", task.id],
+    tasks: [task],
+    runs: [],
+    confirmations: [{
+      id: "confirmation-1",
+      taskId: task.id,
+      taskRevision: 1,
+      category: "external_side_effect",
+      summary: "Publish",
+      effectFingerprint: "fingerprint",
+      toolName: "bash",
+      state: "pending",
+      createdAt: "2026-07-23T00:00:00.000Z",
+      resolvedAt: null,
+      consumedAt: null,
+    }],
+    questions: [{
+      id: "question-1",
+      taskId: task.id,
+      taskRevision: 1,
+      runId: "run-1",
+      question: "Which API?",
+      state: "open",
+      resolution: null,
+      answer: null,
+      askedAt: "2026-07-23T00:00:00.000Z",
+      resolvedAt: null,
+    }],
+  };
+  let coderAvailable = true;
+  const memories = new Set<string>();
+  const bridge = new RealtimeBridge({
+    apiKey: "section-16-key",
+    endpoint: `ws://127.0.0.1:${handlerServer.port}/realtime`,
+    getWorkspace: () => "/tmp/mamachi-workspace",
+    getAvailableWorkspaces: () => ["/tmp/mamachi-workspace", "/tmp/other"],
+    getCodingProfiles: () => ["auto", "fast"],
+    getSnapshot: () => snapshot,
+    getTaskFacts: () => ({
+      taskId: task.id,
+      phase: "paused",
+      progress: 0.5,
+      currentStep: "Reviewing changes",
+      implementationState: "changed",
+      verificationState: "passed",
+      changedFiles: ["src/a.ts"],
+      verificationSummaries: ["focused tests passed"],
+      recentActivity: [],
+      evidenceIds: ["artifact-1"],
+      observerInterpretation: null,
+      groundedAt: "2026-07-23T00:00:00.000Z",
+      groundedAtSeq: 1,
+    }),
+    getTaskArtifact: (taskId, artifactId) => taskId === task.id && artifactId === "artifact-1" ? {
+      id: artifactId,
+      ordinal: 1,
+      taskId,
+      runId: "run-1",
+      toolCallId: "tool-1",
+      toolName: "bash",
+      kind: "verification",
+      summary: "focused verification",
+      successful: true,
+      payload: { resultExcerpt: "x".repeat(7_000), rawArguments: "must not escape", changedFiles: ["src/a.ts"] },
+      createdAt: "2026-07-23T00:00:00.000Z",
+    } : null,
+    executeCommand: async (command): Promise<ActionResult> => {
+      const record = command as Record<string, unknown>;
+      commands.push(record);
+      if (record["type"] === "task.revise") {
+        const payload = record["payload"] as { spec: TaskRecord["spec"] };
+        task.spec = payload.spec;
+        task.revision += 1;
+      }
+      return { status: "accepted", eventId: `event-${commands.length}`, taskId: task.id };
+    },
+    captureEditorContext: async () => ({
+      artifacts: [{ id: "context-1", kind: "selection", summary: "Explicit selection" }],
+      errors: [{ kind: "diagnostics", error: "No diagnostics are available" }],
+    }),
+    askCoder: async () => coderAvailable,
+    rememberFact: (scope, projectId, fact) => {
+      const id = `memory-${memories.size + 1}`;
+      memories.add(id);
+      return { id, scope, projectId, fact };
+    },
+    forgetFact: (memoryId) => memories.delete(memoryId),
+    emit: () => {},
+    emitAudio: () => {},
+  });
+  await bridge.connect();
+  await connected.promise;
+
+  let callOrdinal = 0;
+  async function invoke(name: string, argumentsValue: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const callId = `section-call-${++callOrdinal}`;
+    const result = new Promise<Record<string, unknown>>((resolve) => pendingCalls.set(callId, resolve));
+    client?.send(JSON.stringify({
+      type: "response.done",
+      response: {
+        status: "completed",
+        output: [{ type: "function_call", call_id: callId, name, arguments: JSON.stringify(argumentsValue) }],
+      },
+    }));
+    const output = await result;
+    return output;
+  }
+
+  expect(await invoke("get_workspace", { view: "available" })).toEqual({
+    repositories: ["/tmp/mamachi-workspace", "/tmp/other"],
+  });
+  expect(await invoke("list_coding_profiles", {})).toEqual({ profiles: ["auto", "fast"] });
+  expect(await invoke("list_coding_profiles", { extra: true })).toMatchObject({ status: "rejected" });
+  expect(await invoke("capture_editor_context", { kinds: ["selection", "diagnostics"] })).toMatchObject({
+    status: "accepted",
+    artifactIds: ["context-1"],
+    errors: [{ kind: "diagnostics", error: "No diagnostics are available" }],
+  });
+  expect(await invoke("get_task_status", { taskId: task.id, view: "verification" })).toMatchObject({
+    verificationState: "passed",
+    verificationSummaries: ["focused tests passed"],
+  });
+  const excerpt = await invoke("get_task_artifact", {
+    taskId: task.id,
+    artifactId: "artifact-1",
+    view: "bounded_excerpt",
+  });
+  expect((excerpt["excerpt"] as string).length).toBe(6_000);
+  expect(excerpt["rawArguments"]).toBeUndefined();
+  expect(await invoke("get_task_artifact", {
+    taskId: "other-task",
+    artifactId: "artifact-1",
+    view: "summary",
+  })).toMatchObject({ status: "rejected", code: "artifact_not_found" });
+  expect(await invoke("answer_task_question", { requestId: "stale-question", answer: "Use v2" })).toMatchObject({
+    status: "rejected",
+    code: "question_not_open",
+  });
+  await invoke("answer_task_question", { requestId: "question-1", answer: "Use v2" });
+  expect(commands.at(-1)).toMatchObject({
+    type: "task.answerQuestion",
+    expectedRevision: 1,
+    payload: { taskId: task.id, questionId: "question-1", answer: "Use v2" },
+  });
+  expect(await invoke("ask_coder", { taskId: task.id, question: "What changed?" })).toMatchObject({
+    status: "accepted",
+    taskId: task.id,
+  });
+  coderAvailable = false;
+  expect(await invoke("ask_coder", { taskId: task.id, question: "Are you there?" })).toMatchObject({
+    status: "rejected",
+    code: "coder_unavailable",
+  });
+  await invoke("propose_task_change", {
+    taskId: task.id,
+    change: "Also support JSON",
+    desiredOutcome: "JSON inputs pass",
+    addedConstraints: ["Do not add dependencies"],
+  });
+  expect(commands.slice(-2).map((command) => command["type"])).toEqual(["task.revise", "task.resume"]);
+  expect(task.spec.acceptanceCriteria).toContain("JSON inputs pass");
+  expect(task.spec.constraints).toContain("Requested change: Also support JSON");
+  expect(task.spec.constraints).toContain("Do not add dependencies");
+  await invoke("control_task", { taskId: task.id, action: "cancel" });
+  expect(commands.at(-1)).toMatchObject({ type: "task.cancel", expectedRevision: 2 });
+  await invoke("manage_queue", { taskId: "queued-1", operation: "move_first", anchorTaskId: null });
+  expect(commands.at(-1)).toMatchObject({
+    type: "queue.move",
+    expectedRevision: null,
+    payload: { taskId: "queued-1", operation: "move_first", anchorTaskId: null },
+  });
+  await invoke("resolve_confirmation", { confirmationId: "confirmation-1", decision: "approve" });
+  expect(commands.at(-1)).toMatchObject({ type: "approval.resolve", expectedRevision: 2 });
+  const remembered = await invoke("remember_fact", {
+    scope: "project",
+    projectId: "/tmp/mamachi-workspace",
+    fact: "Use Bun tests",
+  });
+  expect(remembered).toMatchObject({ status: "accepted", memoryId: "memory-1" });
+  expect(await invoke("forget_fact", { memoryId: "memory-1" })).toMatchObject({ status: "accepted" });
+  expect(await invoke("forget_fact", { memoryId: "memory-1" })).toMatchObject({
+    status: "rejected",
+    code: "memory_not_found",
+  });
+  await bridge.disconnect();
+  handlerServer.stop(true);
 });

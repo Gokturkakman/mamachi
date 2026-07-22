@@ -24,7 +24,7 @@ struct ThinkingOrbView: View {
     var body: some View {
         ZStack {
             ambientGlow
-            TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion || (!isAnimated && previousMode == nil))) { timeline in
+            TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion)) { timeline in
                 Canvas(rendersAsynchronously: true) { context, canvasSize in
                     let clock = reduceMotion ? 0.7 : timeline.date.timeIntervalSinceReferenceDate
                     let side = min(canvasSize.width, canvasSize.height)
@@ -104,7 +104,9 @@ struct ThinkingOrbView: View {
         case .speaking:
             OrbRenderer.ribbon(size: size, time: clock * 2.34)
         case .idle:
-            OrbRenderer.wave(size: size, time: 0.7, level: 0.05)
+            // Slow ambient drift: the orb must read as alive before the first
+            // interaction instead of freezing until a click connects voice.
+            OrbRenderer.wave(size: size, time: 0.7 + clock * 0.3, level: 0.05)
         }
     }
 
@@ -118,12 +120,6 @@ struct ThinkingOrbView: View {
         }
     }
 
-    private var isAnimated: Bool {
-        switch state {
-        case .connecting, .connected, .listening, .thinking, .speaking: true
-        case .disconnected, .error: false
-        }
-    }
 
     private var accessibilityLabel: String {
         switch state {

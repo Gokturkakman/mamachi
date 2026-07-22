@@ -8,6 +8,11 @@ export const IdSchema = {
   pattern: uuidV7Pattern,
 } as const;
 
+export const EffectFingerprintSchema = {
+  type: "string",
+  pattern: "^[0-9a-f]{64}$",
+} as const;
+
 export const TaskSpecSchema = {
   type: "object",
   additionalProperties: false,
@@ -125,6 +130,26 @@ export const CommandSchema = {
       additionalProperties: false,
       properties: {
         ...commandBaseProperties,
+        type: { const: "task.answerQuestion" },
+        expectedRevision: { type: "integer", minimum: 1 },
+        payload: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            ...taskIdentityPayloadProperties,
+            questionId: IdSchema,
+            answer: { type: "string", minLength: 1 },
+          },
+          required: ["taskId", "questionId", "answer"],
+        },
+      },
+      required: ["id", "type", "actor", "expectedRevision", "payload"],
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ...commandBaseProperties,
         type: { const: "task.cancel" },
         expectedRevision: { type: "integer", minimum: 1 },
         payload: {
@@ -159,6 +184,25 @@ export const CommandSchema = {
             },
           },
           required: ["taskId", "operation", "anchorTaskId"],
+        },
+      },
+      required: ["id", "type", "actor", "expectedRevision", "payload"],
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ...commandBaseProperties,
+        type: { const: "approval.resolve" },
+        expectedRevision: { type: "integer", minimum: 1 },
+        payload: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            confirmationId: IdSchema,
+            decision: { enum: ["approve", "reject"] },
+          },
+          required: ["confirmationId", "decision"],
         },
       },
       required: ["id", "type", "actor", "expectedRevision", "payload"],
@@ -222,6 +266,51 @@ export const EventPayloadSchemas = {
     },
     required: ["runId", "question"],
   },
+  "task.questionAsked": {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      questionId: IdSchema,
+      runId: IdSchema,
+      revision: { type: "integer", minimum: 1 },
+      question: { type: "string", minLength: 1 },
+    },
+    required: ["questionId", "runId", "revision", "question"],
+  },
+  "task.questionAnswered": {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      questionId: IdSchema,
+      runId: IdSchema,
+      revision: { type: "integer", minimum: 1 },
+      answer: { type: "string", minLength: 1 },
+    },
+    required: ["questionId", "runId", "revision", "answer"],
+  },
+  "coder.sessionBound": {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      sessionId: { type: "string", minLength: 1 },
+      sessionFile: { type: "string", minLength: 1 },
+      runId: IdSchema,
+    },
+    required: ["sessionId", "sessionFile", "runId"],
+  },
+  "coder.recoveryBoundary": {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      sessionId: {
+        oneOf: [{ type: "string", minLength: 1 }, { type: "null" }],
+      },
+      runId: IdSchema,
+      reason: { type: "string", minLength: 1 },
+      unknownToolCall: { type: "boolean" },
+    },
+    required: ["sessionId", "runId", "reason", "unknownToolCall"],
+  },
   "task.specRevised": {
     type: "object",
     additionalProperties: false,
@@ -281,6 +370,92 @@ export const EventPayloadSchemas = {
     },
     required: ["runId", "reason"],
   },
+  "artifact.created": {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      artifactId: IdSchema,
+      runId: IdSchema,
+      kind: { type: "string", enum: ["tool_result", "file_change", "verification"] },
+      summary: { type: "string", minLength: 1 },
+      successful: { type: "boolean" },
+    },
+    required: ["artifactId", "runId", "kind", "summary", "successful"],
+  },
+  "workspace.conflictDetected": {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      runId: IdSchema,
+      paths: {
+        type: "array",
+        items: { type: "string", minLength: 1 },
+        minItems: 1,
+        uniqueItems: true,
+      },
+      reason: { type: "string", minLength: 1 },
+    },
+    required: ["runId", "paths", "reason"],
+  },
+  "workspace.conflictResolved": {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      paths: {
+        type: "array",
+        items: { type: "string", minLength: 1 },
+        minItems: 1,
+        uniqueItems: true,
+      },
+      resolution: { const: "accepted_external_changes" },
+    },
+    required: ["paths", "resolution"],
+  },
+  "policy.decisionRecorded": {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      decision: { enum: ["automatic", "confirmation_required", "rejected"] },
+      category: { type: "string", minLength: 1 },
+      summary: { type: "string", minLength: 1 },
+      effectFingerprint: EffectFingerprintSchema,
+      toolName: { type: "string", minLength: 1 },
+    },
+    required: ["decision", "category", "summary", "effectFingerprint", "toolName"],
+  },
+  "approval.requested": {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      confirmationId: IdSchema,
+      revision: { type: "integer", minimum: 1 },
+      category: { type: "string", minLength: 1 },
+      summary: { type: "string", minLength: 1 },
+      effectFingerprint: EffectFingerprintSchema,
+      toolName: { type: "string", minLength: 1 },
+    },
+    required: ["confirmationId", "revision", "category", "summary", "effectFingerprint", "toolName"],
+  },
+  "approval.resolved": {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      confirmationId: IdSchema,
+      revision: { type: "integer", minimum: 1 },
+      decision: { enum: ["approve", "reject"] },
+    },
+    required: ["confirmationId", "revision", "decision"],
+  },
+  "approval.consumed": {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      confirmationId: IdSchema,
+      revision: { type: "integer", minimum: 1 },
+      effectFingerprint: EffectFingerprintSchema,
+    },
+    required: ["confirmationId", "revision", "effectFingerprint"],
+  },
   "queue.reordered": {
     type: "object",
     additionalProperties: false,
@@ -302,12 +477,23 @@ export interface EventPayloadByType {
   "task.pauseRequested": FromSchema<(typeof EventPayloadSchemas)["task.pauseRequested"]>;
   "task.paused": FromSchema<(typeof EventPayloadSchemas)["task.paused"]>;
   "task.awaitingUser": FromSchema<(typeof EventPayloadSchemas)["task.awaitingUser"]>;
+  "task.questionAsked": FromSchema<(typeof EventPayloadSchemas)["task.questionAsked"]>;
+  "task.questionAnswered": FromSchema<(typeof EventPayloadSchemas)["task.questionAnswered"]>;
+  "coder.sessionBound": FromSchema<(typeof EventPayloadSchemas)["coder.sessionBound"]>;
+  "coder.recoveryBoundary": FromSchema<(typeof EventPayloadSchemas)["coder.recoveryBoundary"]>;
   "task.specRevised": FromSchema<(typeof EventPayloadSchemas)["task.specRevised"]>;
   "task.resumed": FromSchema<(typeof EventPayloadSchemas)["task.resumed"]>;
   "task.completed": FromSchema<(typeof EventPayloadSchemas)["task.completed"]>;
   "task.failed": FromSchema<(typeof EventPayloadSchemas)["task.failed"]>;
+  "artifact.created": FromSchema<(typeof EventPayloadSchemas)["artifact.created"]>;
+  "workspace.conflictDetected": FromSchema<(typeof EventPayloadSchemas)["workspace.conflictDetected"]>;
+  "workspace.conflictResolved": FromSchema<(typeof EventPayloadSchemas)["workspace.conflictResolved"]>;
   "task.cancelled": FromSchema<(typeof EventPayloadSchemas)["task.cancelled"]>;
   "run.interrupted": FromSchema<(typeof EventPayloadSchemas)["run.interrupted"]>;
+  "policy.decisionRecorded": FromSchema<(typeof EventPayloadSchemas)["policy.decisionRecorded"]>;
+  "approval.requested": FromSchema<(typeof EventPayloadSchemas)["approval.requested"]>;
+  "approval.resolved": FromSchema<(typeof EventPayloadSchemas)["approval.resolved"]>;
+  "approval.consumed": FromSchema<(typeof EventPayloadSchemas)["approval.consumed"]>;
   "queue.reordered": FromSchema<(typeof EventPayloadSchemas)["queue.reordered"]>;
 }
 

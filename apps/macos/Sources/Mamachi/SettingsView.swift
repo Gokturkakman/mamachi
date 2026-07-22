@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var diagnostics: DiagnosticsService
     @State private var apiKey = ""
     @State private var primaryModel: String
     @State private var fastModel: String
@@ -20,8 +21,9 @@ struct SettingsView: View {
         ("max", "Maximum"),
     ]
 
-    init(model: AppModel) {
+    init(model: AppModel, diagnostics: DiagnosticsService) {
         self.model = model
+        self.diagnostics = diagnostics
         _primaryModel = State(initialValue: model.primaryCodingModel)
         _fastModel = State(initialValue: model.fastCodingModel)
         _thinkingLevel = State(initialValue: model.codingThinkingLevel)
@@ -116,6 +118,16 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Overlay") {
+                HStack {
+                    Text("Drag the orb to move it; drag any edge to resize either surface.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Reset Position & Size") { model.resetOverlayFrame() }
+                }
+            }
+
             Section("Session") {
                 HStack {
                     Text("Realtime status")
@@ -140,6 +152,10 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Privacy & Diagnostics") {
+                PrivacySettingsView(model: model, diagnostics: diagnostics)
+            }
+
             if let error = model.errorMessage {
                 Section("Needs attention") {
                     Text(error).foregroundStyle(.red)
@@ -147,7 +163,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 560, height: 620)
+        .frame(width: 600, height: 760)
         .padding(8)
     }
 

@@ -1,8 +1,13 @@
 import { TaskController } from "./controller.ts";
 import { EventStore } from "./event-store.ts";
+import { ArtifactStore } from "./artifact-store.ts";
 
 const store = new EventStore();
-const controller = new TaskController(store);
+const artifacts = new ArtifactStore();
+const controller = new TaskController(store, {
+  validateEvidence: (taskId, runId, evidenceIds) =>
+    artifacts.validateCompletion(taskId, runId, evidenceIds),
+});
 
 const initialSpec = {
   repositoryId: "repo_demo",
@@ -76,11 +81,24 @@ controller.handle({
   expectedRevision: 2,
   payload: { taskId: firstTaskId },
 });
+const activeRunId = controller.snapshot().tasks.find((task) => task.id === firstTaskId)?.activeRunId;
+if (!activeRunId) throw new Error("The resumed demo task has no active run");
+const evidence = artifacts.recordToolEvidence({
+  taskId: firstTaskId,
+  runId: activeRunId,
+  repository: initialSpec.repositoryId,
+  toolCallId: Bun.randomUUIDv7(),
+  toolName: "read",
+  input: { path: "package.json" },
+  result: { observed: "Demo verification result" },
+  isError: false,
+});
+controller.recordArtifact(evidence.id, firstTaskId, evidence);
 controller.completeTask(
   Bun.randomUUIDv7(),
   firstTaskId,
   "The revised task run completed",
-  [],
+  [evidence.id],
 );
 
 const snapshot = controller.snapshot();
@@ -108,4 +126,5 @@ console.log(
   ),
 );
 
+artifacts.close();
 store.close();

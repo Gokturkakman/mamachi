@@ -24,9 +24,14 @@ function task(objective: string, codingProfileId: string | null = null): TaskRec
     revision: 1,
     activeRunId: Bun.randomUUIDv7(),
     runIds: [],
+    evidenceIds: [],
     createdAt: new Date(0).toISOString(),
     updatedAt: new Date(0).toISOString(),
     terminalSummary: null,
+    workspaceConflict: null,
+    ompSession: null,
+    pendingQuestion: null,
+    specHistory: [{ revision: 1, objective, revisedAt: new Date(0).toISOString() }],
   };
 }
 

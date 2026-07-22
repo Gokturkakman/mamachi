@@ -24,6 +24,15 @@ struct MenuBarView: View {
                 Label("Open Silent Chat", systemImage: "text.bubble")
             }
 
+            if model.pendingBrief != nil {
+                Button {
+                    showOverlay()
+                    model.toggleEngagement()
+                } label: {
+                    Label("Listen to Waiting Update", systemImage: "bell.badge")
+                }
+            }
+
             Button("Show Overlay", action: showOverlay)
             Button("Hide Overlay", action: hideOverlay)
 

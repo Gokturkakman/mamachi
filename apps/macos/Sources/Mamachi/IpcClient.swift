@@ -1,5 +1,19 @@
 import Foundation
 
+struct VoicePlaybackPosition {
+    let itemId: String
+    let contentIndex: Int
+    let audioEndMs: Int
+
+    var payload: [String: Any] {
+        [
+            "itemId": itemId,
+            "contentIndex": contentIndex,
+            "audioEndMs": audioEndMs,
+        ]
+    }
+}
+
 @MainActor
 final class IpcClient {
     var onEvent: (([String: Any]) -> Void)?
@@ -52,7 +66,7 @@ final class IpcClient {
     func sendRequest(type: String, payload: [String: Any]) {
         guard let socket else { return }
         let envelope: [String: Any] = [
-            "version": 1,
+            "version": MamachiProtocol.envelopeVersion,
             "id": UUID().uuidString.lowercased(),
             "type": type,
             "payload": payload,
@@ -67,6 +81,23 @@ final class IpcClient {
         } catch {
             onDisconnect?(error)
         }
+    }
+
+    func reportVoiceEngagement(_ engaged: Bool, playback: VoicePlaybackPosition?) {
+        sendRequest(
+            type: "voice.engagement",
+            payload: [
+                "engaged": engaged,
+                "playback": playback?.payload ?? NSNull(),
+            ]
+        )
+    }
+
+    func interruptVoice(playback: VoicePlaybackPosition?) {
+        sendRequest(
+            type: "voice.interrupt",
+            payload: ["playback": playback?.payload ?? NSNull()]
+        )
     }
 
     func sendAudio(_ data: Data) {

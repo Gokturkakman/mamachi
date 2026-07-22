@@ -3,6 +3,7 @@ import {
   type ActionResult,
   type Command,
   type EventPayload,
+  type EventActor,
   type EventType,
   type NewDomainEvent,
   type TaskSpec,
@@ -16,22 +17,47 @@ import {
   type TaskRecord,
 } from "./domain.ts";
 import { EventStore, type CommandDecision } from "./event-store.ts";
+import { assessToolCall, type ToolPolicyAssessment } from "./policy.ts";
+import type {
+  CompletionEvidenceValidation,
+  EvidenceArtifact,
+} from "./artifact-store.ts";
+
+export type ToolPolicyAssessor = (toolName: string, input: unknown, repository: string) => ToolPolicyAssessment;
+export type CompletionEvidenceValidator = (
+  taskId: string,
+  runId: string,
+  evidenceIds: readonly string[],
+) => CompletionEvidenceValidation;
 
 export interface ControllerOptions {
   createId?: () => string;
   now?: () => string;
+  assessTool?: ToolPolicyAssessor;
+  validateEvidence?: CompletionEvidenceValidator;
 }
 
 export class TaskController {
   readonly #store: EventStore;
   readonly #createId: () => string;
   readonly #now: () => string;
+  readonly #assessTool: ToolPolicyAssessor;
+  readonly #validateEvidence: CompletionEvidenceValidator;
   #state: ControllerState;
 
   constructor(store: EventStore, options: ControllerOptions = {}) {
     this.#store = store;
     this.#createId = options.createId ?? (() => Bun.randomUUIDv7());
     this.#now = options.now ?? (() => new Date().toISOString());
+    this.#assessTool = options.assessTool ?? assessToolCall;
+    this.#validateEvidence =
+      options.validateEvidence ??
+      (() => ({
+        valid: false,
+        implementationComplete: false,
+        verificationComplete: false,
+        explanation: "No persisted evidence validator is configured",
+      }));
     this.#state = replayEvents(store.readAfter());
   }
 
@@ -84,14 +110,14 @@ export class TaskController {
     return execution.result;
   }
 
-  awaitUserInput(signalId: string, taskId: string, question: string): ActionResult {
+  awaitUserInput(questionId: string, taskId: string, question: string): ActionResult {
     const execution = this.#store.executeCommand(
       {
-        id: signalId,
-        type: "internal.task.awaitingUser",
+        id: questionId,
+        type: "internal.task.questionAsked",
         actor: "coder",
         expectedRevision: null,
-        payload: { taskId, question },
+        payload: { taskId, questionId, question },
         createdAt: this.#now(),
       },
       () => {
@@ -100,14 +126,290 @@ export class TaskController {
         if (task.id !== this.#state.activeTaskId || task.state !== "running" || !task.activeRunId) {
           return this.#reject("invalid_state", `Task ${taskId} is not running`);
         }
+        const duplicateOpenQuestion = [...this.#state.questions.values()].some(
+          (candidate) => candidate.taskId === task.id && candidate.state === "open",
+        );
+        if (duplicateOpenQuestion) {
+          return this.#reject("question_pending", `Task ${taskId} already has an open question`);
+        }
         const event = this.#event(
-          "task.awaitingUser",
-          { runId: task.activeRunId, question },
-          signalId,
+          "task.questionAsked",
+          {
+            questionId,
+            runId: task.activeRunId,
+            revision: task.revision,
+            question,
+          },
+          questionId,
           task,
           task.activeRunId,
+          "coder",
         );
         return this.#accept([event], task.id);
+      },
+    );
+    for (const event of execution.events) applyEvent(this.#state, event);
+    return execution.result;
+  }
+
+  recordCoderSession(
+    signalId: string,
+    taskId: string,
+    runId: string,
+    sessionId: string,
+    sessionFile: string,
+  ): ActionResult {
+    const execution = this.#store.executeCommand(
+      {
+        id: signalId,
+        type: "internal.coder.sessionBound",
+        actor: "coder",
+        expectedRevision: null,
+        payload: { taskId, runId, sessionId, sessionFile },
+        createdAt: this.#now(),
+      },
+      () => {
+        const task = this.#state.tasks.get(taskId);
+        if (!task) return this.#reject("task_not_found", `Task ${taskId} does not exist`);
+        if (task.id !== this.#state.activeTaskId || task.activeRunId !== runId) {
+          return this.#reject("stale_run", `Run ${runId} is not active for task ${taskId}`);
+        }
+        const event = this.#event(
+          "coder.sessionBound",
+          { sessionId, sessionFile, runId },
+          signalId,
+          task,
+          runId,
+          "coder",
+        );
+        return this.#accept([event], task.id);
+      },
+    );
+    for (const event of execution.events) applyEvent(this.#state, event);
+    return execution.result;
+  }
+
+  authorizeToolCall(signalId: string, taskId: string, toolName: string, input: unknown): ActionResult {
+    const task = this.#state.tasks.get(taskId);
+    if (!task) return { status: "rejected", code: "task_not_found", explanation: `Task ${taskId} does not exist` };
+    const assessment = this.#assessTool(toolName, input, task.repositoryId);
+    const policyEventPayload = {
+      category: assessment.category,
+      summary: assessment.summary,
+      effectFingerprint: assessment.effectFingerprint,
+      toolName: assessment.toolName,
+    };
+    const execution = this.#store.executeCommand(
+      {
+        id: signalId,
+        type: "internal.policy.authorizeTool",
+        actor: "coder",
+        expectedRevision: task.revision,
+        payload: assessment,
+        createdAt: this.#now(),
+      },
+      () => {
+        const current = this.#state.tasks.get(taskId);
+        if (!current) return this.#reject("task_not_found", `Task ${taskId} does not exist`);
+        if (current.id !== this.#state.activeTaskId || current.state !== "running" || !current.activeRunId) {
+          return this.#reject("invalid_state", `Task ${taskId} is not running`);
+        }
+
+        const approved = [...this.#state.confirmations.values()].find(
+          (confirmation) =>
+            confirmation.taskId === taskId &&
+            confirmation.taskRevision === current.revision &&
+            confirmation.effectFingerprint === assessment.effectFingerprint &&
+            confirmation.state === "approved",
+        );
+        if (approved) {
+          const policyEvent = this.#event(
+            "policy.decisionRecorded",
+            { ...policyEventPayload, decision: "automatic" },
+            signalId,
+            current,
+            current.activeRunId,
+            "policy",
+          );
+          const consumed = this.#event(
+            "approval.consumed",
+            {
+              confirmationId: approved.id,
+              revision: current.revision,
+              effectFingerprint: assessment.effectFingerprint,
+            },
+            signalId,
+            current,
+            current.activeRunId,
+            "policy",
+          );
+          return this.#accept([policyEvent, consumed], taskId);
+        }
+
+        if (assessment.tier === "automatic") {
+          const event = this.#event(
+            "policy.decisionRecorded",
+            { ...policyEventPayload, decision: "automatic" },
+            signalId,
+            current,
+            current.activeRunId,
+            "policy",
+          );
+          return this.#accept([event], taskId);
+        }
+        if (assessment.tier === "reject") {
+          const event = this.#event(
+            "policy.decisionRecorded",
+            { ...policyEventPayload, decision: "rejected" },
+            signalId,
+            current,
+            current.activeRunId,
+            "policy",
+          );
+          return {
+            result: { status: "rejected", code: "policy_violation", explanation: assessment.summary },
+            events: [event],
+          };
+        }
+
+        const pending = [...this.#state.confirmations.values()].find(
+          (confirmation) =>
+            confirmation.taskId === taskId &&
+            confirmation.taskRevision === current.revision &&
+            confirmation.effectFingerprint === assessment.effectFingerprint &&
+            confirmation.state === "pending",
+        );
+        if (pending) {
+          return {
+            result: {
+              status: "confirmation_required",
+              confirmationId: pending.id,
+              summary: pending.summary,
+            },
+            events: [],
+          };
+        }
+
+        const confirmationId = this.#createId();
+        const policyEvent = this.#event(
+          "policy.decisionRecorded",
+          { ...policyEventPayload, decision: "confirmation_required" },
+          signalId,
+          current,
+          current.activeRunId,
+          "policy",
+        );
+        const requested = this.#event(
+          "approval.requested",
+          {
+            confirmationId,
+            revision: current.revision,
+            category: assessment.category,
+            summary: assessment.summary,
+            effectFingerprint: assessment.effectFingerprint,
+            toolName,
+          },
+          signalId,
+          current,
+          current.activeRunId,
+          "policy",
+        );
+        const awaiting = this.#event(
+          "task.awaitingUser",
+          { runId: current.activeRunId, question: assessment.summary },
+          signalId,
+          current,
+          current.activeRunId,
+        );
+        return {
+          result: { status: "confirmation_required", confirmationId, summary: assessment.summary },
+          events: [policyEvent, requested, awaiting],
+        };
+      },
+    );
+    for (const event of execution.events) applyEvent(this.#state, event);
+    return execution.result;
+  }
+
+  recordArtifact(signalId: string, taskId: string, artifact: EvidenceArtifact): ActionResult {
+    const execution = this.#store.executeCommand(
+      {
+        id: signalId,
+        type: "internal.artifact.recorded",
+        actor: "coder",
+        expectedRevision: null,
+        payload: { taskId, artifactId: artifact.id },
+        createdAt: this.#now(),
+      },
+      () => {
+        const task = this.#state.tasks.get(taskId);
+        if (!task) return this.#reject("task_not_found", `Task ${taskId} does not exist`);
+        if (task.id !== this.#state.activeTaskId || task.activeRunId !== artifact.runId) {
+          return this.#reject("stale_run", `Artifact ${artifact.id} does not belong to the active task run`);
+        }
+        const event = this.#event(
+          "artifact.created",
+          {
+            artifactId: artifact.id,
+            runId: artifact.runId,
+            kind: artifact.kind,
+            summary: artifact.summary,
+            successful: artifact.successful,
+          },
+          signalId,
+          task,
+          artifact.runId,
+        );
+        return this.#accept([event], task.id);
+      },
+    );
+    for (const event of execution.events) applyEvent(this.#state, event);
+    return execution.result;
+  }
+
+  reportWorkspaceConflict(
+    signalId: string,
+    taskId: string,
+    paths: string[],
+    reason: string,
+  ): ActionResult {
+    const uniquePaths = [...new Set(paths.map((path) => path.trim()).filter(Boolean))].sort();
+    if (uniquePaths.length === 0) {
+      return { status: "rejected", code: "invalid_conflict", explanation: "A workspace conflict requires a path" };
+    }
+    const execution = this.#store.executeCommand(
+      {
+        id: signalId,
+        type: "internal.workspace.conflict",
+        actor: "coder",
+        expectedRevision: null,
+        payload: { taskId, paths: uniquePaths, reason },
+        createdAt: this.#now(),
+      },
+      () => {
+        const task = this.#state.tasks.get(taskId);
+        if (!task) return this.#reject("task_not_found", `Task ${taskId} does not exist`);
+        if (task.id !== this.#state.activeTaskId || !task.activeRunId || task.state !== "running") {
+          return this.#reject("stale_run", `Task ${taskId} has no running slot for a workspace conflict`);
+        }
+        const runId = task.activeRunId;
+        const conflict = this.#event(
+          "workspace.conflictDetected",
+          { runId, paths: uniquePaths, reason },
+          signalId,
+          task,
+          runId,
+          "coder",
+        );
+        const question = `I paused before overwriting user changes in ${uniquePaths.join(", ")}. Review those changes, then resume to reconcile them.`;
+        const awaiting = this.#event(
+          "task.awaitingUser",
+          { runId, question },
+          signalId,
+          task,
+          runId,
+        );
+        return this.#accept([conflict, awaiting], task.id);
       },
     );
     for (const event of execution.events) applyEvent(this.#state, event);
@@ -148,6 +450,21 @@ export class TaskController {
           task,
           runId,
         );
+        const recoveryBoundary = task.ompSession
+          ? this.#event(
+              "coder.recoveryBoundary",
+              {
+                sessionId: task.ompSession.id,
+                runId,
+                reason: "Daemon recovery stopped at an unknown in-flight tool boundary; no tool call was replayed",
+                unknownToolCall: true,
+              },
+              recoveryId,
+              task,
+              runId,
+              "coder",
+            )
+          : null;
         const paused = this.#event(
           "task.paused",
           { runId, reason: "recovery requires explicit resume" },
@@ -155,6 +472,7 @@ export class TaskController {
           task,
           runId,
         );
+        if (recoveryBoundary) return this.#accept([interrupted, recoveryBoundary, paused], task.id);
         return this.#accept([interrupted, paused], task.id);
       },
     );
@@ -181,10 +499,14 @@ export class TaskController {
         return this.#revise(command);
       case "task.resume":
         return this.#resume(command);
+      case "task.answerQuestion":
+        return this.#answerQuestion(command);
       case "task.cancel":
         return this.#cancel(command);
       case "queue.move":
         return this.#moveQueue(command);
+      case "approval.resolve":
+        return this.#resolveApproval(command);
     }
   }
 
@@ -273,15 +595,92 @@ export class TaskController {
       return this.#reject("invalid_state", `Task ${task.id} does not own a resumable active slot`);
     }
 
+    const openQuestion = [...this.#state.questions.values()].find(
+      (question) => question.taskId === task.id && question.state === "open",
+    );
+    if (openQuestion) {
+      return this.#reject(
+        "question_pending",
+        `Question ${openQuestion.id} must be answered with task.answerQuestion`,
+      );
+    }
+    const pendingApproval = [...this.#state.confirmations.values()].some(
+      (confirmation) =>
+        confirmation.taskId === task.id &&
+        confirmation.taskRevision === task.revision &&
+        confirmation.state === "pending",
+    );
+    if (pendingApproval) {
+      return this.#reject("confirmation_pending", "Resolve the pending permission card before resuming this task");
+    }
+
     const runId = this.#createId();
-    const event = this.#event(
+    const events: NewDomainEvent[] = [];
+    if (task.workspaceConflict) {
+      events.push(
+        this.#event(
+          "workspace.conflictResolved",
+          { paths: task.workspaceConflict.paths, resolution: "accepted_external_changes" },
+          command.id,
+          task,
+        ),
+      );
+    }
+    events.push(
+      this.#event(
+        "task.resumed",
+        { runId, revision: task.revision },
+        command.id,
+        task,
+        runId,
+      ),
+    );
+    return this.#accept(events, task.id);
+  }
+
+  #answerQuestion(command: Extract<Command, { type: "task.answerQuestion" }>): CommandDecision {
+    const task = this.#state.tasks.get(command.payload.taskId);
+    if (!task) return this.#reject("task_not_found", `Task ${command.payload.taskId} does not exist`);
+    const revisionConflict = this.#checkRevision(task, command.expectedRevision);
+    if (revisionConflict) return revisionConflict;
+    const question = this.#state.questions.get(command.payload.questionId);
+    if (!question || question.taskId !== task.id) {
+      return this.#reject(
+        "question_not_found",
+        `Question ${command.payload.questionId} does not belong to task ${task.id}`,
+      );
+    }
+    if (
+      question.state !== "open" ||
+      question.taskRevision !== task.revision ||
+      task.state !== "awaiting_user" ||
+      task.id !== this.#state.activeTaskId
+    ) {
+      return this.#reject("stale_question", "This question is stale or was already answered");
+    }
+
+    const runId = this.#createId();
+    const answered = this.#event(
+      "task.questionAnswered",
+      {
+        questionId: question.id,
+        runId: question.runId,
+        revision: question.taskRevision,
+        answer: command.payload.answer,
+      },
+      command.id,
+      task,
+      question.runId,
+      command.actor === "user" ? "ui" : command.actor,
+    );
+    const resumed = this.#event(
       "task.resumed",
       { runId, revision: task.revision },
       command.id,
       task,
       runId,
     );
-    return this.#accept([event], task.id);
+    return this.#accept([answered, resumed], task.id);
   }
 
   #cancel(command: Extract<Command, { type: "task.cancel" }>): CommandDecision {
@@ -337,6 +736,54 @@ export class TaskController {
     return this.#accept([event], task.id);
   }
 
+  #resolveApproval(command: Extract<Command, { type: "approval.resolve" }>): CommandDecision {
+    const confirmation = this.#state.confirmations.get(command.payload.confirmationId);
+    if (!confirmation) {
+      return this.#reject("confirmation_not_found", `Confirmation ${command.payload.confirmationId} does not exist`);
+    }
+    const task = this.#state.tasks.get(confirmation.taskId);
+    if (!task) return this.#reject("task_not_found", `Task ${confirmation.taskId} does not exist`);
+    const revisionConflict = this.#checkRevision(task, command.expectedRevision);
+    if (revisionConflict) return revisionConflict;
+    if (confirmation.taskRevision !== task.revision || confirmation.state !== "pending") {
+      return this.#reject("stale_confirmation", "This confirmation is stale or was already resolved");
+    }
+    if (task.state !== "awaiting_user" || task.id !== this.#state.activeTaskId) {
+      return this.#reject("invalid_state", `Task ${task.id} is not awaiting this approval`);
+    }
+
+    const resolved = this.#event(
+      "approval.resolved",
+      { confirmationId: confirmation.id, revision: task.revision, decision: command.payload.decision },
+      command.id,
+      task,
+      undefined,
+      "policy",
+    );
+    if (command.payload.decision === "approve") {
+      const runId = this.#createId();
+      const resumed = this.#event(
+        "task.resumed",
+        { runId, revision: task.revision },
+        command.id,
+        task,
+        runId,
+      );
+      return this.#accept([resolved, resumed], task.id);
+    }
+
+    const lastRunId = task.runIds.at(-1);
+    if (!lastRunId) return this.#reject("invalid_state", `Task ${task.id} has no run to pause`);
+    const paused = this.#event(
+      "task.paused",
+      { runId: lastRunId, reason: "User rejected the requested effect" },
+      command.id,
+      task,
+      lastRunId,
+    );
+    return this.#accept([resolved, paused], task.id);
+  }
+
   #finishTask(
     signalId: string,
     taskId: string,
@@ -374,6 +821,10 @@ export class TaskController {
                 runId,
               )
             : this.#event("task.failed", { runId, error: detail }, signalId, task, runId);
+        if (outcome === "completed") {
+          const validation = this.#validateEvidence(task.id, runId, evidenceIds);
+          if (!validation.valid) return this.#reject("verification_incomplete", validation.explanation);
+        }
         const events: NewDomainEvent[] = [finished];
         const startNext = this.#startNextEvent(signalId);
         if (startNext) events.push(startNext);
@@ -423,13 +874,14 @@ export class TaskController {
     correlationId: string,
     task: Pick<TaskRecord, "id" | "repositoryId">,
     runId?: string,
+    actor: EventActor = "controller",
   ): NewDomainEvent<T> {
     return {
       version: 1,
       id: this.#createId(),
       at: this.#now(),
       type,
-      actor: "controller",
+      actor,
       projectId: task.repositoryId,
       taskId: task.id,
       ...(runId ? { runId } : {}),

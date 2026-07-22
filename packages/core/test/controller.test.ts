@@ -30,7 +30,14 @@ describe("TaskController", () => {
   test("runs one task and atomically starts the next queued task", () => {
     const store = new EventStore();
     try {
-      const controller = new TaskController(store);
+      const controller = new TaskController(store, {
+        validateEvidence: () => ({
+          valid: true,
+          implementationComplete: true,
+          verificationComplete: true,
+          explanation: "test evidence accepted",
+        }),
+      });
       const firstTaskId = submit(controller);
       const secondTaskId = submit(controller);
 
@@ -42,7 +49,7 @@ describe("TaskController", () => {
         Bun.randomUUIDv7(),
         firstTaskId,
         "The requested behavior was verified",
-        [],
+        [Bun.randomUUIDv7()],
       );
       expect(completion.status).toBe("accepted");
 
@@ -194,6 +201,17 @@ describe("TaskController", () => {
       const firstStore = new EventStore(databasePath);
       const firstController = new TaskController(firstStore);
       const taskId = submit(firstController);
+      const runId = firstController.snapshot().tasks[0]?.activeRunId;
+      if (!runId) throw new Error("Submitted task did not start");
+      expect(
+        firstController.recordCoderSession(
+          Bun.randomUUIDv7(),
+          taskId,
+          runId,
+          "omp-session-1",
+          "/tmp/omp-session-1.jsonl",
+        ).status,
+      ).toBe("accepted");
       firstStore.close();
 
       const recoveryStore = new EventStore(databasePath);
@@ -205,6 +223,19 @@ describe("TaskController", () => {
       expect(snapshot.activeTaskId).toBe(taskId);
       expect(snapshot.tasks[0]?.state).toBe("paused");
       expect(snapshot.runs[0]?.state).toBe("interrupted");
+      expect(snapshot.tasks[0]?.ompSession).toMatchObject({
+        id: "omp-session-1",
+        file: "/tmp/omp-session-1.jsonl",
+        recoveryBoundary: {
+          runId,
+          unknownToolCall: true,
+        },
+      });
+      expect(recoveryController.eventsAfter().slice(-3).map((event) => event.type)).toEqual([
+        "run.interrupted",
+        "coder.recoveryBoundary",
+        "task.paused",
+      ]);
       recoveryStore.close();
 
       const replayStore = new EventStore(databasePath);
@@ -212,6 +243,7 @@ describe("TaskController", () => {
       snapshot = replayController.snapshot();
       expect(snapshot.tasks[0]?.state).toBe("paused");
       expect(snapshot.runs[0]?.state).toBe("interrupted");
+      expect(snapshot.tasks[0]?.ompSession?.recoveryBoundary?.unknownToolCall).toBe(true);
       expect(replayController.recoverAfterRestart(Bun.randomUUIDv7()).status).toBe("rejected");
       replayStore.close();
     } finally {
@@ -247,22 +279,203 @@ describe("TaskController", () => {
     }
   });
 
-  test("reacts to a coder question with a resumable awaiting-user state", () => {
+  test("binds a coder question to its task revision and run, then accepts one exact answer", () => {
     const store = new EventStore();
     try {
       const controller = new TaskController(store);
       const taskId = submit(controller);
+      const questionId = Bun.randomUUIDv7();
+      const originalRunId = controller.snapshot().tasks[0]?.activeRunId;
       const awaiting = controller.awaitUserInput(
-        Bun.randomUUIDv7(),
+        questionId,
         taskId,
         "Which deployment target should I use?",
       );
       expect(awaiting.status).toBe("accepted");
       let snapshot = controller.snapshot();
       expect(snapshot.activeTaskId).toBe(taskId);
-      expect(snapshot.tasks[0]?.state).toBe("awaiting_user");
+      expect(snapshot.tasks[0]).toMatchObject({
+        state: "awaiting_user",
+        pendingQuestion: "Which deployment target should I use?",
+      });
       expect(snapshot.runs[0]?.state).toBe("paused");
-      expect(controller.eventsAfter().at(-1)?.type).toBe("task.awaitingUser");
+      expect(snapshot.questions?.[0]).toMatchObject({
+        id: questionId,
+        taskId,
+        taskRevision: 1,
+        runId: originalRunId,
+        state: "open",
+      });
+      expect(controller.eventsAfter().at(-1)?.type).toBe("task.questionAsked");
+
+      const genericResume = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.resume",
+        actor: "ui",
+        expectedRevision: 1,
+        payload: { taskId },
+      });
+      expect(genericResume).toMatchObject({ status: "rejected", code: "question_pending" });
+
+      const answer = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.answerQuestion",
+        actor: "ui",
+        expectedRevision: 1,
+        payload: { taskId, questionId, answer: "Deploy to staging." },
+      });
+      expect(answer.status).toBe("accepted");
+      snapshot = controller.snapshot();
+      expect(snapshot.tasks[0]).toMatchObject({ state: "running", pendingQuestion: null });
+      expect(snapshot.runs).toHaveLength(2);
+      expect(snapshot.questions?.[0]).toMatchObject({
+        id: questionId,
+        state: "resolved",
+        resolution: "answered",
+        answer: "Deploy to staging.",
+      });
+      expect(controller.eventsAfter().slice(-2).map((event) => event.type)).toEqual([
+        "task.questionAnswered",
+        "task.resumed",
+      ]);
+
+      const duplicate = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.answerQuestion",
+        actor: "ui",
+        expectedRevision: 1,
+        payload: { taskId, questionId, answer: "Deploy to production instead." },
+      });
+      expect(duplicate).toMatchObject({ status: "rejected", code: "stale_question" });
+    } finally {
+      store.close();
+    }
+  });
+
+  test("rejects an answer after a consequential task revision supersedes its question", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const taskId = submit(controller);
+      const questionId = Bun.randomUUIDv7();
+      expect(
+        controller.awaitUserInput(questionId, taskId, "Should this alter the public API?").status,
+      ).toBe("accepted");
+      expect(
+        controller.handle({
+          id: Bun.randomUUIDv7(),
+          type: "task.revise",
+          actor: "ui",
+          expectedRevision: 1,
+          payload: {
+            taskId,
+            spec: { ...spec, objective: "Change the behavior without altering the public API" },
+          },
+        }).status,
+      ).toBe("accepted");
+
+      const stale = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.answerQuestion",
+        actor: "ui",
+        expectedRevision: 2,
+        payload: { taskId, questionId, answer: "Yes." },
+      });
+      expect(stale).toMatchObject({ status: "rejected", code: "stale_question" });
+      expect(controller.snapshot().questions?.[0]).toMatchObject({
+        state: "resolved",
+        resolution: "superseded",
+        answer: null,
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  test("requires revision-bound single-use approval for risky tool effects", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const taskId = submit(controller);
+      const proposed = controller.authorizeToolCall(
+        Bun.randomUUIDv7(),
+        taskId,
+        "bash",
+        { command: "git push origin main" },
+      );
+      if (proposed.status !== "confirmation_required") throw new Error("Risky action was not held for approval");
+
+      let snapshot = controller.snapshot();
+      expect(snapshot.tasks[0]?.state).toBe("awaiting_user");
+      expect(snapshot.confirmations[0]).toMatchObject({
+        id: proposed.confirmationId,
+        taskId,
+        taskRevision: 1,
+        state: "pending",
+      });
+
+      const bypass = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.resume",
+        actor: "ui",
+        expectedRevision: 1,
+        payload: { taskId },
+      });
+      expect(bypass).toMatchObject({ status: "rejected", code: "confirmation_pending" });
+
+      const approved = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "approval.resolve",
+        actor: "ui",
+        expectedRevision: 1,
+        payload: { confirmationId: proposed.confirmationId, decision: "approve" },
+      });
+      expect(approved.status).toBe("accepted");
+
+      const consumed = controller.authorizeToolCall(
+        Bun.randomUUIDv7(),
+        taskId,
+        "bash",
+        { command: "git push origin main" },
+      );
+      expect(consumed.status).toBe("accepted");
+      snapshot = controller.snapshot();
+      expect(snapshot.confirmations[0]?.state).toBe("consumed");
+
+      const repeated = controller.authorizeToolCall(
+        Bun.randomUUIDv7(),
+        taskId,
+        "bash",
+        { command: "git push origin main" },
+      );
+      expect(repeated.status).toBe("confirmation_required");
+      expect(controller.snapshot().confirmations).toHaveLength(2);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("pauses on a workspace conflict and records explicit reconciliation before resuming", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const taskId = submit(controller);
+      const originalRunId = controller.snapshot().tasks[0]?.activeRunId;
+      const conflict = controller.reportWorkspaceConflict(
+        Bun.randomUUIDv7(),
+        taskId,
+        ["src/feature.ts"],
+        "The user changed a target file",
+      );
+      expect(conflict.status).toBe("accepted");
+      expect(controller.snapshot().tasks[0]).toMatchObject({
+        state: "awaiting_user",
+        activeRunId: null,
+        workspaceConflict: {
+          paths: ["src/feature.ts"],
+          reason: "The user changed a target file",
+        },
+      });
 
       const resumed = controller.handle({
         id: Bun.randomUUIDv7(),
@@ -272,11 +485,75 @@ describe("TaskController", () => {
         payload: { taskId },
       });
       expect(resumed.status).toBe("accepted");
-      snapshot = controller.snapshot();
-      expect(snapshot.tasks[0]?.state).toBe("running");
-      expect(snapshot.runs).toHaveLength(2);
+      const task = controller.snapshot().tasks[0];
+      expect(task).toMatchObject({
+        state: "running",
+        workspaceConflict: null,
+      });
+      expect(task?.activeRunId).not.toBe(originalRunId);
+      expect(controller.eventsAfter().map((event) => event.type).slice(-2)).toEqual([
+        "workspace.conflictResolved",
+        "task.resumed",
+      ]);
     } finally {
       store.close();
+    }
+  });
+
+  test("tracks the pending question and spec history through revision and replay", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mamachi-spec-history-"));
+    const databasePath = join(directory, "events.sqlite");
+    try {
+      const store = new EventStore(databasePath);
+      const controller = new TaskController(store);
+      const taskId = submit(controller);
+      let task = controller.snapshot().tasks[0];
+      expect(task?.pendingQuestion).toBeNull();
+      expect(task?.specHistory).toEqual([
+        { revision: 1, objective: spec.objective, revisedAt: task?.createdAt ?? "" },
+      ]);
+
+      const question = "Should the new endpoint be versioned?";
+      expect(controller.awaitUserInput(Bun.randomUUIDv7(), taskId, question).status).toBe("accepted");
+      task = controller.snapshot().tasks[0];
+      expect(task?.state).toBe("awaiting_user");
+      expect(task?.pendingQuestion).toBe(question);
+
+      const revisedObjective = "Change an observable behavior and record telemetry";
+      const revised = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.revise",
+        actor: "voice",
+        expectedRevision: 1,
+        payload: { taskId, spec: { ...spec, objective: revisedObjective } },
+      });
+      expect(revised.status).toBe("accepted");
+      task = controller.snapshot().tasks[0];
+      expect(task?.revision).toBe(2);
+      expect(task?.pendingQuestion).toBeNull();
+      expect(task?.specHistory.map((entry) => [entry.revision, entry.objective])).toEqual([
+        [1, spec.objective],
+        [2, revisedObjective],
+      ]);
+
+      const resumed = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.resume",
+        actor: "ui",
+        expectedRevision: 2,
+        payload: { taskId },
+      });
+      expect(resumed.status).toBe("accepted");
+      expect(controller.snapshot().tasks[0]?.pendingQuestion).toBeNull();
+
+      const live = controller.snapshot();
+      store.close();
+      const replayStore = new EventStore(databasePath);
+      const replayed = new TaskController(replayStore).snapshot();
+      expect(replayed.tasks).toEqual(live.tasks);
+      replayStore.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 });

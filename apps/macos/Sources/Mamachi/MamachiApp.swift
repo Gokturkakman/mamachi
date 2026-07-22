@@ -18,7 +18,7 @@ struct MamachiApp: App {
         .menuBarExtraStyle(.menu)
 
         Settings {
-            SettingsView(model: appDelegate.model)
+            SettingsView(model: appDelegate.model, diagnostics: appDelegate.diagnostics)
         }
     }
 }
@@ -26,16 +26,42 @@ struct MamachiApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = AppModel()
+    let diagnostics = DiagnosticsService()
     private var overlay: OverlayPanelController?
     private var settingsPanel: SettingsPanelController?
+    private var onboardingPanel: OnboardingPanelController?
     private var hotKey: GlobalHotKey?
+    private var launchStartedAt = Date()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+        launchStartedAt = Date()
         overlay = OverlayPanelController(model: model)
-        settingsPanel = SettingsPanelController(model: model)
+        settingsPanel = SettingsPanelController(model: model, diagnostics: diagnostics)
         model.onOpenSettings = { [weak self] in self?.showSettings() }
         model.onShowOverlay = { [weak self] in self?.showOverlay() }
+        model.onResetOverlayFrame = { [weak self] in self?.overlay?.resetFrame() }
+        model.onAdjustCompactOrbSize = { [weak self] points in
+            self?.overlay?.adjustCompactOrbSize(by: points)
+        }
+        do {
+            try ApplicationEncryptionService().prepareKey()
+        } catch {
+            model.errorMessage = error.localizedDescription
+            diagnostics.recordFailure(component: .application, error: error)
+        }
+
+        if OnboardingModel.isComplete {
+            startOperationalApp()
+        } else {
+            onboardingPanel = OnboardingPanelController(model: model) { [weak self] in
+                self?.startOperationalApp()
+            }
+            onboardingPanel?.show()
+        }
+    }
+
+    private func startOperationalApp() {
+        NSApp.setActivationPolicy(.accessory)
         do {
             hotKey = try GlobalHotKey { [weak self] in
                 guard let self else { return }
@@ -44,8 +70,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         } catch {
             model.errorMessage = error.localizedDescription
+            diagnostics.recordFailure(component: .application, error: error)
         }
         model.start()
+        diagnostics.recordTransition(
+            component: .application,
+            from: .starting,
+            to: .ready,
+            elapsedMilliseconds: Int(Date().timeIntervalSince(launchStartedAt) * 1_000)
+        )
         showOverlay()
     }
 

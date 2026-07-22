@@ -1,9 +1,21 @@
 import WebSocket, { type RawData } from "ws";
 import type { ActionResult, DomainEvent } from "@mamachi/protocol";
 import type { ControllerSnapshot, TaskRecord } from "./domain.ts";
-import type { CapturedContext } from "./artifact-store.ts";
+import type { CapturedContext, ContextKind, EvidenceArtifact } from "./artifact-store.ts";
 import { computerActions, type ComputerAction, type ComputerControlResult } from "./computer-control.ts";
+import type { TaskFacts } from "./fact-projector.ts";
+import type { MemoryScope } from "./memory-store.ts";
+import type { VoiceBrief, VoiceBriefKind } from "./voice-brief-store.ts";
 export type RealtimeResponseMode = "voice" | "text";
+
+export interface RealtimePlaybackCursor {
+  itemId: string;
+  contentIndex: number;
+  audioEndMs: number;
+}
+
+type QueuedBrief = VoiceBrief;
+type QueuedBriefKind = VoiceBriefKind;
 
 interface RealtimeBridgeOptions {
   apiKey?: string;
@@ -11,11 +23,33 @@ interface RealtimeBridgeOptions {
   voice?: string;
   endpoint?: string;
   getWorkspace: () => string;
+  getAvailableWorkspaces?: () => readonly string[];
+  getCodingProfiles?: () => readonly string[];
   getSnapshot: () => ControllerSnapshot;
+  getTaskFacts?: (taskId: string) => TaskFacts | undefined;
+  getTaskArtifact?: (taskId: string, artifactId: string) => EvidenceArtifact | null;
   executeCommand: (command: unknown) => Promise<ActionResult>;
+  captureEditorContext?: (kinds: readonly ContextKind[]) => Promise<{
+    artifacts: Array<{ id: string; kind: ContextKind; summary: string }>;
+    errors: Array<{ kind: ContextKind; error: string }>;
+  }>;
+  askCoder?: (taskId: string, question: string) => Promise<boolean>;
+  steerCoder?: (taskId: string, clarification: string) => Promise<boolean>;
+  followUpCoder?: (taskId: string, addition: string) => Promise<boolean>;
+  rememberFact?: (scope: MemoryScope, projectId: string | null, fact: string) => {
+    id: string;
+    scope: MemoryScope;
+    projectId: string | null;
+    fact: string;
+  };
+  forgetFact?: (memoryId: string) => boolean;
+  initialBriefs?: readonly VoiceBrief[];
+  onBriefQueued?: (brief: VoiceBrief) => void;
+  onBriefDelivered?: (taskIds: readonly string[]) => void;
   controlComputer?: (action: ComputerAction) => Promise<ComputerControlResult>;
   emit: (type: string, payload: unknown) => void;
-  emitAudio: (pcm: Uint8Array) => void;
+  emitAudio: (pcm: Uint8Array, playback: { itemId: string; contentIndex: number }) => void;
+  initiallyEngaged?: boolean;
 }
 
 interface FunctionCall {
@@ -41,6 +75,17 @@ function requireStringArray(value: unknown, name: string, allowEmpty: boolean): 
   return value.map((item) => item.trim());
 }
 
+function assertOnlyKeys(input: Record<string, unknown>, keys: readonly string[], tool: string): void {
+  const allowed = new Set(keys);
+  const unexpected = Object.keys(input).find((key) => !allowed.has(key));
+  if (unexpected) throw new Error(`${tool} does not accept ${unexpected}`);
+}
+
+function requireNullableString(value: unknown, name: string): string | null {
+  if (value === null) return null;
+  return requireString(value, name);
+}
+
 export class RealtimeBridge {
   readonly #options: RealtimeBridgeOptions;
   readonly #model: string;
@@ -48,6 +93,10 @@ export class RealtimeBridge {
   readonly #endpoint: string;
   readonly #recentActivity = new Map<string, { type: string; summary: string; at: string }>();
   readonly #pendingContext = new Map<string, CapturedContext>();
+  #engaged: boolean;
+  readonly #queuedBriefs = new Map<string, QueuedBrief>();
+  #activeAssistantAudio: { itemId: string; contentIndex: number } | null = null;
+  #lastTruncation: RealtimePlaybackCursor | null = null;
   #apiKey: string | undefined;
   #socket: WebSocket | null = null;
   #manualClose = false;
@@ -66,6 +115,8 @@ export class RealtimeBridge {
     this.#model = options.model ?? "gpt-realtime-2.1";
     this.#voice = options.voice ?? "marin";
     this.#endpoint = options.endpoint ?? "wss://api.openai.com/v1/realtime";
+    this.#engaged = options.initiallyEngaged ?? true;
+    for (const brief of options.initialBriefs ?? []) this.#queuedBriefs.set(brief.taskId, brief);
   }
 
   async connect(apiKey?: string): Promise<void> {
@@ -81,6 +132,8 @@ export class RealtimeBridge {
     this.#suppressAudio = false;
     this.#cancellationRequested = false;
     this.#toolChainDepth = 0;
+    this.#activeAssistantAudio = null;
+    this.#lastTruncation = null;
     this.#options.emit("voice.state", { state: "connecting" });
     const separator = this.#endpoint.includes("?") ? "&" : "?";
     const socket = new WebSocket(`${this.#endpoint}${separator}model=${encodeURIComponent(this.#model)}`, {
@@ -96,6 +149,8 @@ export class RealtimeBridge {
       this.#inputActive = false;
       this.#suppressAudio = false;
       this.#cancellationRequested = false;
+      this.#activeAssistantAudio = null;
+      this.#lastTruncation = null;
       if (!this.#manualClose) {
         this.#options.emit("voice.state", { state: "disconnected", reason: "provider_connection_closed" });
       }
@@ -140,6 +195,7 @@ export class RealtimeBridge {
     });
     await promise;
     for (const context of this.#pendingContext.values()) this.#injectContext(context);
+    this.#flushBriefs();
   }
 
   async disconnect(): Promise<void> {
@@ -152,6 +208,8 @@ export class RealtimeBridge {
     this.#suppressAudio = false;
     this.#cancellationRequested = false;
     this.#toolChainDepth = 0;
+    this.#activeAssistantAudio = null;
+    this.#lastTruncation = null;
     this.#socket = null;
     if (socket.readyState === WebSocket.CLOSED) return;
     const { promise, resolve } = Promise.withResolvers<void>();
@@ -166,16 +224,41 @@ export class RealtimeBridge {
   }
 
   appendAudio(pcm: Uint8Array): void {
-    if (pcm.byteLength === 0 || this.#socket?.readyState !== WebSocket.OPEN) return;
+    if (!this.#engaged || pcm.byteLength === 0 || this.#socket?.readyState !== WebSocket.OPEN) return;
     const audio = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength).toString("base64");
     this.#send({ type: "input_audio_buffer.append", audio });
   }
 
-  interrupt(): void {
+  setEngaged(engaged: boolean, playback: RealtimePlaybackCursor | null = null): void {
+    if (this.#engaged === engaged) {
+      if (!engaged && playback) this.#truncatePlayback(playback);
+      return;
+    }
+    this.#engaged = engaged;
+    this.#options.emit(engaged ? "voice.engaged" : "voice.disengaged", {
+      pendingBrief: this.#queuedBriefs.size > 0,
+    });
+    if (engaged) {
+      this.#flushBriefs();
+      return;
+    }
+    this.#inputActive = false;
+    this.#suppressAudio = true;
+    this.#toolChainDepth = 0;
+    if (playback) this.#truncatePlayback(playback);
+    if (this.#responseActive && !this.#cancellationRequested) {
+      this.#cancellationRequested = true;
+      this.#send({ type: "response.cancel" });
+    }
+    this.#options.emit("voice.state", { state: "idle" });
+  }
+
+  interrupt(playback: RealtimePlaybackCursor | null = null): void {
     if (this.#socket?.readyState !== WebSocket.OPEN) return;
     this.#toolChainDepth = 0;
     this.#suppressAudio = true;
-    if (this.#responseActive) {
+    if (playback) this.#truncatePlayback(playback);
+    if (this.#responseActive && !this.#cancellationRequested) {
       this.#cancellationRequested = true;
       this.#send({ type: "response.cancel" });
     }
@@ -214,9 +297,13 @@ export class RealtimeBridge {
     if (this.#socket?.readyState === WebSocket.OPEN) this.#injectContext(context);
   }
 
+  discardContext(id: string): void {
+    this.#pendingContext.delete(id);
+  }
+
 
   handleTaskEvents(events: readonly DomainEvent[]): void {
-    if (events.length === 0 || this.#socket?.readyState !== WebSocket.OPEN) return;
+    if (events.length === 0) return;
     const relevant = events.filter((event) =>
       [
         "task.started",
@@ -228,12 +315,26 @@ export class RealtimeBridge {
         "task.completed",
         "task.failed",
         "task.cancelled",
+        "workspace.conflictDetected",
+        "workspace.conflictResolved",
       ].includes(event.type),
     );
     if (relevant.length === 0) return;
-    const announce = relevant.some((event) =>
-      event.type === "task.awaitingUser" || event.type === "task.completed" || event.type === "task.failed",
+    const announcements = relevant.filter((event) =>
+      event.type === "task.awaitingUser" ||
+      event.type === "task.completed" ||
+      event.type === "task.failed" ||
+      event.type === "workspace.conflictDetected"
     );
+    if (this.#socket?.readyState !== WebSocket.OPEN || (this.#responseMode === "voice" && !this.#engaged)) {
+      for (const event of announcements) this.#queueBrief(event);
+      return;
+    }
+    this.#injectTaskUpdate(relevant, announcements.length > 0);
+    if (announcements.length > 0) this.#requestResponse();
+  }
+
+  #injectTaskUpdate(events: readonly DomainEvent[], announce: boolean): void {
     const snapshot = this.#options.getSnapshot();
     this.#send({
       type: "conversation.item.create",
@@ -251,18 +352,110 @@ export class RealtimeBridge {
                 workspace: this.#options.getWorkspace(),
                 activeTaskId: snapshot.activeTaskId,
                 queue: snapshot.queue,
-                events: relevant.map((event) => ({
+                events: events.map((event) => ({
                   type: event.type,
                   taskId: event.taskId ?? null,
                   payload: event.payload,
                 })),
+                facts: [
+                  ...new Set(events.flatMap((event) => event.taskId ? [event.taskId] : [])),
+                ].flatMap((taskId) => {
+                  const facts = this.#options.getTaskFacts?.(taskId);
+                  return facts ? [facts] : [];
+                }),
               }),
             ].join("\n"),
           },
         ],
       },
     });
-    if (announce) this.#requestResponse();
+  }
+
+  #queueBrief(event: DomainEvent): void {
+    const brief = this.#briefFor(event);
+    if (!brief) return;
+    this.#queuedBriefs.set(brief.taskId, brief);
+    this.#options.onBriefQueued?.(brief);
+    this.#options.emit("brief.queued", {
+      taskId: brief.taskId,
+      kind: brief.kind,
+      summary: brief.summary,
+      pending: this.#queuedBriefs.size,
+    });
+    if (!this.#engaged) {
+      this.#options.emit("voice.notification", {
+        eventId: event.id,
+        taskId: brief.taskId,
+        ...brief.notification,
+      });
+    }
+  }
+
+  #briefFor(event: DomainEvent): QueuedBrief | null {
+    if (!event.taskId) return null;
+    const payload: Record<string, unknown> = isObject(event.payload) ? event.payload : {};
+    const detail =
+      typeof payload["question"] === "string" ? payload["question"] :
+      typeof payload["summary"] === "string" ? payload["summary"] :
+      typeof payload["error"] === "string" ? payload["error"] :
+      typeof payload["reason"] === "string" ? payload["reason"] :
+      event.type;
+    const kind: QueuedBriefKind =
+      event.type === "task.completed" ? "completed" :
+      event.type === "task.failed" ? "failed" :
+      "awaiting_user";
+    const notificationKind =
+      kind === "completed" ? "completion" :
+      kind === "failed" ? "failure" :
+      "attention";
+    const title =
+      notificationKind === "attention" ? "Coder needs your attention" :
+      notificationKind === "failure" ? "Coding task failed" :
+      "Coding task finished";
+    const summary = detail.trim().slice(0, 1_200);
+    return {
+      taskId: event.taskId,
+      kind,
+      summary,
+      queuedAt: new Date().toISOString(),
+      notification: {
+        title,
+        body: summary.slice(0, 220),
+        kind: notificationKind,
+      },
+    };
+  }
+
+  #flushBriefs(): void {
+    if (this.#queuedBriefs.size === 0 || this.#socket?.readyState !== WebSocket.OPEN) return;
+    if (this.#responseMode === "voice" && !this.#engaged) return;
+    const briefs = [...this.#queuedBriefs.values()];
+    this.#send({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "system",
+        content: [{
+          type: "input_text",
+          text: [
+            "Mamachi resumed after sleeping. Give exactly one short spoken brief covering every queued authoritative coding update below. Do not call get_task_status first.",
+            JSON.stringify({
+              briefs: briefs.map((brief) => ({
+                taskId: brief.taskId,
+                kind: brief.kind,
+                summary: brief.summary,
+                queuedAt: brief.queuedAt,
+                facts: this.#options.getTaskFacts?.(brief.taskId) ?? null,
+              })),
+            }).slice(0, 16_000),
+          ].join("\n"),
+        }],
+      },
+    });
+    this.#requestResponse();
+    for (const brief of briefs) this.#queuedBriefs.delete(brief.taskId);
+    this.#options.onBriefDelivered?.(briefs.map((brief) => brief.taskId));
+    this.#options.emit("brief.delivered", { count: briefs.length });
   }
 
   noteHarnessEvent(type: string, payload: unknown): void {
@@ -367,8 +560,11 @@ For an explicit request to open Google Chrome, open System Settings, or play or 
 # Microphone control
 When the user says "mute", "go to sleep", "stop listening", or otherwise explicitly asks Mamachi to stop listening, call mute_mamachi immediately and silently. Do not acknowledge afterward because the microphone will be disengaged. The user can resume with the hotkey or orb.
 
+# Approvals
+When a permission card is pending, resolve it only after an explicit user decision. Call resolve_confirmation with the exact confirmation ID and never reuse an earlier approval.
+
 # Course correction
-A clarification or changed requirement must use revise_task. Before calling it, summarize the revised objective and obtain explicit confirmation. The tool safely pauses, versions the task, and resumes it. Never describe a revision as applied before the tool succeeds.
+A changed requirement must use propose_task_change. Summarize consequential changes before applying them. The tool pauses at a safe boundary, versions the accepted specification, and resumes it; never claim success before its result.
 
 # Control
 Use control_task only for an explicit pause, resume, or cancel request. A barge-in does not imply cancellation.
@@ -385,33 +581,142 @@ ${this.#options.getWorkspace()}
   }
 
   #tools(): unknown[] {
+    const emptyParameters = { type: "object", additionalProperties: false, properties: {}, required: [] };
     return [
       {
         type: "function",
-        name: "submit_task",
-        description: "Start or queue a sufficiently specified coding task in the selected workspace.",
+        name: "wait_for_user",
+        description: "End the turn silently when audio is not addressed to Mamachi or needs no response.",
+        parameters: emptyParameters,
+      },
+      {
+        type: "function",
+        name: "get_workspace",
+        description: "Read the active workspace or available repository choices.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: { view: { type: "string", enum: ["active", "available"] } },
+          required: ["view"],
+        },
+      },
+      {
+        type: "function",
+        name: "list_coding_profiles",
+        description: "List coding profiles accepted by submit_task.",
+        parameters: emptyParameters,
+      },
+      {
+        type: "function",
+        name: "capture_editor_context",
+        description: "Explicitly request selected editor context kinds from a connected VS Code client.",
         parameters: {
           type: "object",
           additionalProperties: false,
           properties: {
+            kinds: {
+              type: "array",
+              items: { type: "string", enum: ["active_file", "selection", "diagnostics", "terminal_excerpt"] },
+              minItems: 1,
+              maxItems: 4,
+              uniqueItems: true,
+            },
+          },
+          required: ["kinds"],
+        },
+      },
+      {
+        type: "function",
+        name: "submit_task",
+        description: "Start or queue a fully specified coding task in a selected repository.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            repositoryId: { type: "string", minLength: 1 },
             objective: { type: "string", minLength: 1 },
             acceptanceCriteria: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1 },
             constraints: { type: "array", items: { type: "string", minLength: 1 } },
+            attachmentIds: { type: "array", items: { type: "string", minLength: 1 } },
+            codingProfileId: { type: ["string", "null"] },
           },
-          required: ["objective", "acceptanceCriteria", "constraints"],
+          required: ["repositoryId", "objective", "acceptanceCriteria", "constraints", "attachmentIds", "codingProfileId"],
         },
       },
       {
         type: "function",
         name: "get_task_status",
-        description: "Silently read authoritative status for the active or specified task. Call immediately with no spoken preamble.",
+        description: "Read one authoritative view of a task or the active task.",
         parameters: {
           type: "object",
           additionalProperties: false,
           properties: {
             taskId: { type: ["string", "null"] },
+            view: {
+              type: "string",
+              enum: ["brief", "current_step", "plan", "queue", "changes", "verification", "decisions"],
+            },
           },
-          required: ["taskId"],
+          required: ["taskId", "view"],
+        },
+      },
+      {
+        type: "function",
+        name: "get_task_artifact",
+        description: "Read owned task evidence as metadata or a bounded excerpt.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            taskId: { type: "string", minLength: 1 },
+            artifactId: { type: "string", minLength: 1 },
+            view: { type: "string", enum: ["summary", "bounded_excerpt"] },
+          },
+          required: ["taskId", "artifactId", "view"],
+        },
+      },
+      {
+        type: "function",
+        name: "answer_task_question",
+        description: "Answer one exact open coder question by its request ID.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            requestId: { type: "string", minLength: 1 },
+            answer: { type: "string", minLength: 1 },
+          },
+          required: ["requestId", "answer"],
+        },
+      },
+      {
+        type: "function",
+        name: "ask_coder",
+        description: "Ask the live coding agent a read-only question about its current repository context.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            taskId: { type: "string", minLength: 1 },
+            question: { type: "string", minLength: 1 },
+          },
+          required: ["taskId", "question"],
+        },
+      },
+      {
+        type: "function",
+        name: "propose_task_change",
+        description: "Conservatively pause, version, and resume a changed accepted task specification.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            taskId: { type: "string", minLength: 1 },
+            change: { type: "string", minLength: 1 },
+            desiredOutcome: { type: ["string", "null"] },
+            addedConstraints: { type: "array", items: { type: "string", minLength: 1 } },
+          },
+          required: ["taskId", "change", "desiredOutcome", "addedConstraints"],
         },
       },
       {
@@ -422,7 +727,7 @@ ${this.#options.getWorkspace()}
           type: "object",
           additionalProperties: false,
           properties: {
-            taskId: { type: ["string", "null"] },
+            taskId: { type: "string", minLength: 1 },
             action: { type: "string", enum: ["pause", "resume", "cancel"] },
           },
           required: ["taskId", "action"],
@@ -430,24 +735,63 @@ ${this.#options.getWorkspace()}
       },
       {
         type: "function",
-        name: "revise_task",
-        description: "After explicit confirmation, safely pause the active task, apply a new specification revision, and resume it.",
+        name: "manage_queue",
+        description: "Reorder one queued task relative to the queue or another queued task.",
         parameters: {
           type: "object",
           additionalProperties: false,
           properties: {
-            taskId: { type: ["string", "null"] },
-            objective: { type: "string", minLength: 1 },
-            acceptanceCriteria: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1 },
-            constraints: { type: "array", items: { type: "string", minLength: 1 } },
+            taskId: { type: "string", minLength: 1 },
+            operation: { type: "string", enum: ["move_first", "move_last", "move_before", "move_after"] },
+            anchorTaskId: { type: ["string", "null"] },
           },
-          required: ["taskId", "objective", "acceptanceCriteria", "constraints"],
+          required: ["taskId", "operation", "anchorTaskId"],
+        },
+      },
+      {
+        type: "function",
+        name: "resolve_confirmation",
+        description: "Approve or reject one exact pending visual confirmation after an explicit user decision.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            confirmationId: { type: "string", minLength: 1 },
+            decision: { type: "string", enum: ["approve", "reject"] },
+          },
+          required: ["confirmationId", "decision"],
+        },
+      },
+      {
+        type: "function",
+        name: "remember_fact",
+        description: "Persist one explicit user-approved fact globally or for the active project.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            scope: { type: "string", enum: ["global", "project"] },
+            projectId: { type: ["string", "null"] },
+            fact: { type: "string", minLength: 1 },
+          },
+          required: ["scope", "projectId", "fact"],
+        },
+      },
+      {
+        type: "function",
+        name: "forget_fact",
+        description: "Delete one exact explicit memory by ID.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: { memoryId: { type: "string", minLength: 1 } },
+          required: ["memoryId"],
         },
       },
       {
         type: "function",
         name: "inspect_workspace",
-        description: "Delegate a read-only question about current repository state to the coding agent. Always use for commits, branches, files, code, tests, diagnostics, dependencies, or logs.",
+        description: "Delegate a read-only question about current repository state to the coding agent.",
         parameters: {
           type: "object",
           additionalProperties: false,
@@ -475,46 +819,30 @@ ${this.#options.getWorkspace()}
       {
         type: "function",
         name: "set_overlay",
-        description: "Silently expand or collapse the Mamachi orb. Use immediately when the user says expand, open, show conversation, collapse, or minimize.",
+        description: "Silently expand or collapse the Mamachi interface.",
         parameters: {
           type: "object",
           additionalProperties: false,
-          properties: {
-            action: { type: "string", enum: ["expand", "collapse"] },
-          },
+          properties: { action: { type: "string", enum: ["expand", "collapse"] } },
           required: ["action"],
         },
       },
       {
         type: "function",
         name: "control_computer",
-        description: "Perform one explicit, allowlisted macOS action: open Chrome, open System Settings, or toggle Spotify/Music playback.",
+        description: "Perform one explicit allowlisted macOS action.",
         parameters: {
           type: "object",
           additionalProperties: false,
-          properties: {
-            action: { type: "string", enum: computerActions },
-          },
+          properties: { action: { type: "string", enum: computerActions } },
           required: ["action"],
         },
       },
       {
         type: "function",
         name: "mute_mamachi",
-        description: "Immediately and silently stop Mamachi from listening until the user resumes with the hotkey or orb.",
-        parameters: { type: "object", additionalProperties: false, properties: {}, required: [] },
-      },
-      {
-        type: "function",
-        name: "get_workspace",
-        description: "Return the selected workspace path.",
-        parameters: { type: "object", additionalProperties: false, properties: {}, required: [] },
-      },
-      {
-        type: "function",
-        name: "wait_for_user",
-        description: "End the turn silently when audio is not addressed to Mamachi or needs no response.",
-        parameters: { type: "object", additionalProperties: false, properties: {}, required: [] },
+        description: "Immediately and silently stop listening until the user resumes.",
+        parameters: emptyParameters,
       },
     ];
   }
@@ -536,43 +864,63 @@ ${this.#options.getWorkspace()}
     if (type === "session.updated") {
       this.#options.emit("voice.state", { state: "connected", model: this.#model, voice: this.#voice });
     } else if (type === "input_audio_buffer.speech_started") {
+      if (!this.#engaged) return;
       this.#inputActive = true;
       this.#toolChainDepth = 0;
       if (this.#responseActive) this.#suppressAudio = true;
       this.#options.emit("voice.interrupt", {});
       this.#options.emit("voice.state", { state: "listening" });
     } else if (type === "input_audio_buffer.speech_stopped") {
+      if (!this.#engaged) return;
       this.#inputActive = false;
       this.#options.emit("voice.state", { state: "thinking" });
       this.#requestResponse();
     } else if (type === "conversation.item.input_audio_transcription.delta") {
-      if (typeof event["delta"] === "string") {
+      if (this.#engaged && typeof event["delta"] === "string") {
         this.#options.emit("voice.transcript.user_delta", { text: event["delta"] });
       }
     } else if (type === "conversation.item.input_audio_transcription.completed") {
-      if (typeof event["transcript"] === "string") {
+      if (this.#engaged && typeof event["transcript"] === "string") {
         this.#options.emit("voice.transcript.user", { text: event["transcript"] });
       }
     } else if (type === "response.output_audio.delta") {
-      if (typeof event["delta"] === "string" && !this.#suppressAudio) {
+      if (
+        this.#engaged &&
+        typeof event["delta"] === "string" &&
+        typeof event["item_id"] === "string" &&
+        Number.isInteger(event["content_index"]) &&
+        !this.#suppressAudio
+      ) {
+        const playback = {
+          itemId: event["item_id"],
+          contentIndex: event["content_index"] as number,
+        };
+        if (
+          this.#activeAssistantAudio?.itemId !== playback.itemId ||
+          this.#activeAssistantAudio.contentIndex !== playback.contentIndex
+        ) {
+          this.#lastTruncation = null;
+        }
+        this.#activeAssistantAudio = playback;
         const audio = Buffer.from(event["delta"], "base64");
-        this.#options.emitAudio(new Uint8Array(audio.buffer, audio.byteOffset, audio.byteLength));
+        this.#options.emit("voice.audio", playback);
+        this.#options.emitAudio(new Uint8Array(audio.buffer, audio.byteOffset, audio.byteLength), playback);
         this.#options.emit("voice.state", { state: "speaking" });
       }
     } else if (type === "response.output_audio_transcript.delta") {
-      if (typeof event["delta"] === "string") {
+      if (!this.#suppressAudio && typeof event["delta"] === "string") {
         this.#options.emit("voice.transcript.assistant_delta", { text: event["delta"] });
       }
     } else if (type === "response.output_audio_transcript.done") {
-      if (typeof event["transcript"] === "string") {
+      if (!this.#suppressAudio && typeof event["transcript"] === "string") {
         this.#options.emit("voice.transcript.assistant", { text: event["transcript"] });
       }
     } else if (type === "response.output_text.delta") {
-      if (typeof event["delta"] === "string") {
+      if (!this.#suppressAudio && typeof event["delta"] === "string") {
         this.#options.emit("voice.transcript.assistant_delta", { text: event["delta"] });
       }
     } else if (type === "response.output_text.done") {
-      if (typeof event["text"] === "string") {
+      if (!this.#suppressAudio && typeof event["text"] === "string") {
         this.#options.emit("voice.transcript.assistant", { text: event["text"] });
       }
     } else if (type === "response.done") {
@@ -594,13 +942,13 @@ ${this.#options.getWorkspace()}
           this.#responsePending = false;
           this.#requestResponse();
         } else {
-          this.#options.emit("voice.state", { state: "listening" });
+          this.#options.emit("voice.state", { state: this.#engaged ? "listening" : "idle" });
         }
         return;
       }
       this.#responseActive = false;
       this.#responsePending = false;
-      this.#suppressAudio = false;
+      this.#suppressAudio = !this.#engaged;
       this.#cancellationRequested = false;
       this.#options.emit("voice.error", { error: message });
     }
@@ -686,44 +1034,269 @@ ${this.#options.getWorkspace()}
   async #executeTool(name: string, input: unknown): Promise<unknown> {
     if (!isObject(input)) throw new Error(`${name} arguments must be an object`);
     switch (name) {
+      case "wait_for_user":
+        assertOnlyKeys(input, [], name);
+        return { status: "waiting" };
+      case "get_workspace": {
+        assertOnlyKeys(input, ["view"], name);
+        const view = input["view"];
+        if (!(view === "active" || view === "available")) throw new Error("view must be active or available");
+        const active = this.#options.getWorkspace();
+        return view === "active"
+          ? { repositoryId: active, path: active }
+          : { repositories: [...new Set(this.#options.getAvailableWorkspaces?.() ?? [active])] };
+      }
+      case "list_coding_profiles":
+        assertOnlyKeys(input, [], name);
+        return { profiles: [...new Set(this.#options.getCodingProfiles?.() ?? ["auto", "primary", "fast"])] };
+      case "capture_editor_context": {
+        assertOnlyKeys(input, ["kinds"], name);
+        const kinds = requireStringArray(input["kinds"], "kinds", false);
+        const allowedKinds = new Set<ContextKind>(["active_file", "selection", "diagnostics", "terminal_excerpt"]);
+        if (new Set(kinds).size !== kinds.length || kinds.some((kind) => !allowedKinds.has(kind as ContextKind))) {
+          throw new Error("kinds must contain unique supported editor context kinds");
+        }
+        if (!this.#options.captureEditorContext) {
+          return {
+            status: "rejected",
+            code: "editor_context_unavailable",
+            explanation: "No VS Code editor context bridge is available",
+          };
+        }
+        try {
+          const result = await this.#options.captureEditorContext(kinds as ContextKind[]);
+          return {
+            status: "accepted",
+            artifactIds: result.artifacts.map((artifact) => artifact.id),
+            artifacts: result.artifacts,
+            errors: result.errors,
+          };
+        } catch (error) {
+          return {
+            status: "rejected",
+            code: /timed out/i.test(error instanceof Error ? error.message : String(error))
+              ? "editor_context_timeout"
+              : "editor_context_unavailable",
+            explanation: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }
       case "submit_task": {
+        assertOnlyKeys(
+          input,
+          ["repositoryId", "objective", "acceptanceCriteria", "constraints", "attachmentIds", "codingProfileId"],
+          name,
+        );
+        const repositoryId = requireString(input["repositoryId"], "repositoryId");
         const objective = requireString(input["objective"], "objective");
         const acceptanceCriteria = requireStringArray(input["acceptanceCriteria"], "acceptanceCriteria", false);
         const constraints = requireStringArray(input["constraints"], "constraints", true);
-        if (/\b(deploy|publish|release|delete repository|force[- ]push|reset --hard)\b/i.test(objective)) {
-          return {
-            status: "rejected",
-            code: "visual_approval_required",
-            explanation: "This high-impact request requires a visual approval card",
-          };
-        }
-        const attachmentIds = [...this.#pendingContext.keys()];
+        const attachmentIds = requireStringArray(input["attachmentIds"], "attachmentIds", true);
+        const codingProfileId = requireNullableString(input["codingProfileId"], "codingProfileId");
         const result = await this.#options.executeCommand({
           id: Bun.randomUUIDv7(),
           type: "task.submit",
           actor: "voice",
           expectedRevision: null,
-          payload: {
-            repositoryId: this.#options.getWorkspace(),
-            objective,
-            acceptanceCriteria,
-            constraints,
-            attachmentIds,
-            codingProfileId: null,
-          },
+          payload: { repositoryId, objective, acceptanceCriteria, constraints, attachmentIds, codingProfileId },
         });
         if (result.status === "accepted") {
           for (const id of attachmentIds) this.#pendingContext.delete(id);
           if (attachmentIds.length > 0) {
-            this.#options.emit("context.consumed", {
-              ids: attachmentIds,
-              taskId: result.taskId ?? null,
-            });
+            this.#options.emit("context.consumed", { ids: attachmentIds, taskId: result.taskId ?? null });
           }
         }
-        return { ...result, attachmentIds };
+        return result;
+      }
+      case "get_task_status": {
+        assertOnlyKeys(input, ["taskId", "view"], name);
+        const view = input["view"];
+        const views = new Set(["brief", "current_step", "plan", "queue", "changes", "verification", "decisions"]);
+        if (typeof view !== "string" || !views.has(view)) throw new Error("get_task_status view is invalid");
+        const task = this.#resolveTask(input["taskId"]);
+        if (!task) return { status: "idle", queue: this.#options.getSnapshot().queue };
+        return this.#status(task, view);
+      }
+      case "get_task_artifact": {
+        assertOnlyKeys(input, ["taskId", "artifactId", "view"], name);
+        const taskId = requireString(input["taskId"], "taskId");
+        const artifactId = requireString(input["artifactId"], "artifactId");
+        const view = input["view"];
+        if (!(view === "summary" || view === "bounded_excerpt")) {
+          throw new Error("view must be summary or bounded_excerpt");
+        }
+        const artifact = this.#options.getTaskArtifact?.(taskId, artifactId);
+        if (!artifact) {
+          return {
+            status: "rejected",
+            code: "artifact_not_found",
+            explanation: "The artifact does not exist or does not belong to this task",
+          };
+        }
+        const summary = {
+          id: artifact.id,
+          taskId: artifact.taskId,
+          runId: artifact.runId,
+          toolName: artifact.toolName,
+          kind: artifact.kind,
+          summary: artifact.summary.slice(0, 2_000),
+          successful: artifact.successful,
+          createdAt: artifact.createdAt,
+        };
+        if (view === "summary") return summary;
+        const resultExcerpt = typeof artifact.payload["resultExcerpt"] === "string"
+          ? artifact.payload["resultExcerpt"].slice(0, 6_000)
+          : "";
+        const changedFiles = Array.isArray(artifact.payload["changedFiles"])
+          ? artifact.payload["changedFiles"].filter((value): value is string => typeof value === "string").slice(0, 100)
+          : [];
+        return { ...summary, excerpt: resultExcerpt, changedFiles, truncated: resultExcerpt.length === 6_000 };
+      }
+      case "answer_task_question": {
+        assertOnlyKeys(input, ["requestId", "answer"], name);
+        const requestId = requireString(input["requestId"], "requestId");
+        const answer = requireString(input["answer"], "answer");
+        const snapshot = this.#options.getSnapshot();
+        const question = snapshot.questions?.find((candidate) => candidate.id === requestId);
+        if (!question || question.state !== "open") {
+          return {
+            status: "rejected",
+            code: "question_not_open",
+            explanation: "The question request is stale or no longer open",
+          };
+        }
+        const task = snapshot.tasks.find((candidate) => candidate.id === question.taskId);
+        if (!task || task.revision !== question.taskRevision) {
+          return {
+            status: "conflict",
+            currentRevision: task?.revision ?? question.taskRevision,
+            explanation: "The question belongs to an older task revision",
+          };
+        }
+        return this.#options.executeCommand({
+          id: Bun.randomUUIDv7(),
+          type: "task.answerQuestion",
+          actor: "voice",
+          expectedRevision: task.revision,
+          payload: { taskId: task.id, questionId: question.id, answer },
+        });
+      }
+      case "ask_coder": {
+        assertOnlyKeys(input, ["taskId", "question"], name);
+        const taskId = requireString(input["taskId"], "taskId");
+        const question = requireString(input["question"], "question");
+        if (!this.#options.getSnapshot().tasks.some((task) => task.id === taskId)) {
+          return { status: "rejected", code: "task_not_found", explanation: "No matching task exists" };
+        }
+        if (!this.#options.askCoder || !(await this.#options.askCoder(taskId, question))) {
+          return {
+            status: "rejected",
+            code: "coder_unavailable",
+            explanation: "The live coding agent is unavailable for this task",
+          };
+        }
+        return { status: "accepted", eventId: Bun.randomUUIDv7(), taskId };
+      }
+      case "propose_task_change":
+        assertOnlyKeys(input, ["taskId", "change", "desiredOutcome", "addedConstraints"], name);
+        return this.#proposeTaskChange(input);
+      case "control_task": {
+        assertOnlyKeys(input, ["taskId", "action"], name);
+        const task = this.#resolveTask(requireString(input["taskId"], "taskId"));
+        if (!task) return { status: "rejected", code: "task_not_found", explanation: "No matching task exists" };
+        const action = input["action"];
+        if (!(action === "pause" || action === "resume" || action === "cancel")) {
+          throw new Error("action must be pause, resume, or cancel");
+        }
+        const type = action === "pause" ? "task.requestPause" : action === "resume" ? "task.resume" : "task.cancel";
+        return this.#options.executeCommand({
+          id: Bun.randomUUIDv7(),
+          type,
+          actor: "voice",
+          expectedRevision: task.revision,
+          payload:
+            action === "pause"
+              ? { taskId: task.id, reason: "User requested a voice pause" }
+              : action === "cancel"
+                ? { taskId: task.id, reason: "User cancelled by voice" }
+                : { taskId: task.id },
+        });
+      }
+      case "manage_queue": {
+        assertOnlyKeys(input, ["taskId", "operation", "anchorTaskId"], name);
+        const taskId = requireString(input["taskId"], "taskId");
+        const operation = input["operation"];
+        if (!["move_first", "move_last", "move_before", "move_after"].includes(String(operation))) {
+          throw new Error("manage_queue operation is invalid");
+        }
+        const anchorTaskId = requireNullableString(input["anchorTaskId"], "anchorTaskId");
+        return this.#options.executeCommand({
+          id: Bun.randomUUIDv7(),
+          type: "queue.move",
+          actor: "voice",
+          expectedRevision: null,
+          payload: { taskId, operation, anchorTaskId },
+        });
+      }
+      case "resolve_confirmation": {
+        assertOnlyKeys(input, ["confirmationId", "decision"], name);
+        const confirmationId = requireString(input["confirmationId"], "confirmationId");
+        const decision = input["decision"];
+        if (!(decision === "approve" || decision === "reject")) throw new Error("decision must be approve or reject");
+        const snapshot = this.#options.getSnapshot();
+        const confirmation = snapshot.confirmations.find((candidate) => candidate.id === confirmationId);
+        if (!confirmation || confirmation.state !== "pending") {
+          return {
+            status: "rejected",
+            code: "confirmation_not_pending",
+            explanation: "No matching pending confirmation exists",
+          };
+        }
+        const task = snapshot.tasks.find((candidate) => candidate.id === confirmation.taskId);
+        if (!task) return { status: "rejected", code: "task_not_found", explanation: "The confirmation task no longer exists" };
+        return this.#options.executeCommand({
+          id: Bun.randomUUIDv7(),
+          type: "approval.resolve",
+          actor: "voice",
+          expectedRevision: task.revision,
+          payload: { confirmationId, decision },
+        });
+      }
+      case "remember_fact": {
+        assertOnlyKeys(input, ["scope", "projectId", "fact"], name);
+        const scope = input["scope"];
+        if (!(scope === "global" || scope === "project")) throw new Error("scope must be global or project");
+        const projectId = requireNullableString(input["projectId"], "projectId");
+        if ((scope === "global" && projectId !== null) || (scope === "project" && projectId !== this.#options.getWorkspace())) {
+          return {
+            status: "rejected",
+            code: "memory_scope_mismatch",
+            explanation: "Global facts require projectId null; project facts require the active repository ID",
+          };
+        }
+        if (!this.#options.rememberFact) {
+          return { status: "rejected", code: "memory_unavailable", explanation: "Durable memory is unavailable" };
+        }
+        const memory = this.#options.rememberFact(scope, projectId, requireString(input["fact"], "fact"));
+        return { status: "accepted", eventId: memory.id, memoryId: memory.id, scope: memory.scope, projectId: memory.projectId };
+      }
+      case "forget_fact": {
+        assertOnlyKeys(input, ["memoryId"], name);
+        const memoryId = requireString(input["memoryId"], "memoryId");
+        if (!this.#options.forgetFact) {
+          return { status: "rejected", code: "memory_unavailable", explanation: "Durable memory is unavailable" };
+        }
+        if (!this.#options.forgetFact(memoryId)) {
+          return {
+            status: "rejected",
+            code: "memory_not_found",
+            explanation: "The memory does not exist or is outside the active project scope",
+          };
+        }
+        return { status: "accepted", eventId: Bun.randomUUIDv7(), memoryId };
       }
       case "inspect_workspace": {
+        assertOnlyKeys(input, ["question", "deliverable"], name);
         const question = requireString(input["question"], "question");
         const deliverable = requireString(input["deliverable"], "deliverable");
         return this.#options.executeCommand({
@@ -749,6 +1322,7 @@ ${this.#options.getWorkspace()}
         });
       }
       case "research_web": {
+        assertOnlyKeys(input, ["query", "deliverable"], name);
         const query = requireString(input["query"], "query");
         const deliverable = requireString(input["deliverable"], "deliverable");
         return this.#options.executeCommand({
@@ -773,29 +1347,21 @@ ${this.#options.getWorkspace()}
           },
         });
       }
-      case "get_task_status": {
-        const task = this.#resolveTask(input["taskId"]);
-        if (!task) return { status: "idle", queue: this.#options.getSnapshot().queue };
-        return this.#status(task);
-      }
       case "set_overlay": {
+        assertOnlyKeys(input, ["action"], name);
         const action = requireString(input["action"], "action");
-        if (!(action === "expand" || action === "collapse")) {
-          throw new Error("action must be expand or collapse");
-        }
+        if (!(action === "expand" || action === "collapse")) throw new Error("action must be expand or collapse");
         const expanded = action === "expand";
         this.#options.emit("ui.overlay", { expanded });
         return { status: "ok", expanded };
       }
       case "control_computer": {
+        assertOnlyKeys(input, ["action"], name);
         const action = requireString(input["action"], "action");
-        if (!computerActions.includes(action as ComputerAction)) {
-          throw new Error(`Unsupported computer action: ${action}`);
-        }
+        if (!computerActions.includes(action as ComputerAction)) throw new Error(`Unsupported computer action: ${action}`);
         if (!this.#options.controlComputer) {
           return {
             status: "rejected",
-            action,
             code: "computer_control_unavailable",
             explanation: "Computer control is unavailable in this Mamachi runtime",
           };
@@ -805,47 +1371,20 @@ ${this.#options.getWorkspace()}
         return result;
       }
       case "mute_mamachi":
-        if (Object.keys(input).length !== 0) throw new Error("mute_mamachi does not accept arguments");
+        assertOnlyKeys(input, [], name);
         this.#options.emit("ui.mute", {});
         return { status: "ok", muted: true };
-      case "control_task": {
-        const task = this.#resolveTask(input["taskId"]);
-        if (!task) throw new Error("No matching task exists");
-        const action = input["action"];
-        if (!(action === "pause" || action === "resume" || action === "cancel")) {
-          throw new Error("action must be pause, resume, or cancel");
-        }
-        const type = action === "pause" ? "task.requestPause" : action === "resume" ? "task.resume" : "task.cancel";
-        return this.#options.executeCommand({
-          id: Bun.randomUUIDv7(),
-          type,
-          actor: "voice",
-          expectedRevision: task.revision,
-          payload:
-            action === "pause"
-              ? { taskId: task.id, reason: "User requested a voice pause" }
-              : action === "cancel"
-                ? { taskId: task.id, reason: "User cancelled by voice" }
-                : { taskId: task.id },
-        });
-      }
-      case "revise_task":
-        return this.#reviseTask(input);
-      case "get_workspace":
-        return { workspace: this.#options.getWorkspace() };
-      case "wait_for_user":
-        return { status: "waiting" };
       default:
         throw new Error(`Unknown voice tool: ${name}`);
     }
   }
 
-  async #reviseTask(input: Record<string, unknown>): Promise<unknown> {
-    let task = this.#resolveTask(input["taskId"]);
-    if (!task) throw new Error("No matching task exists");
-    const objective = requireString(input["objective"], "objective");
-    const acceptanceCriteria = requireStringArray(input["acceptanceCriteria"], "acceptanceCriteria", false);
-    const constraints = requireStringArray(input["constraints"], "constraints", true);
+  async #proposeTaskChange(input: Record<string, unknown>): Promise<unknown> {
+    let task = this.#resolveTask(requireString(input["taskId"], "taskId"));
+    if (!task) return { status: "rejected", code: "task_not_found", explanation: "No matching task exists" };
+    const change = requireString(input["change"], "change");
+    const desiredOutcome = requireNullableString(input["desiredOutcome"], "desiredOutcome");
+    const addedConstraints = requireStringArray(input["addedConstraints"], "addedConstraints", true);
 
     if (task.state === "running") {
       const pause = await this.#options.executeCommand({
@@ -853,7 +1392,7 @@ ${this.#options.getWorkspace()}
         type: "task.requestPause",
         actor: "voice",
         expectedRevision: task.revision,
-        payload: { taskId: task.id, reason: "Applying a confirmed voice amendment" },
+        payload: { taskId: task.id, reason: "Applying a proposed voice task change at a safe boundary" },
       });
       if (pause.status !== "accepted") return pause;
     }
@@ -861,9 +1400,18 @@ ${this.#options.getWorkspace()}
       task = await this.#waitForTaskState(task.id, "paused", 60_000);
     }
     if (!(task.state === "paused" || task.state === "awaiting_user")) {
-      throw new Error(`Task cannot be revised from ${task.state}`);
+      return {
+        status: "rejected",
+        code: "invalid_state",
+        explanation: `Task cannot be revised from ${task.state}`,
+      };
     }
 
+    const changeConstraint = `Requested change: ${change}`;
+    const constraints = [...new Set([...task.spec.constraints, changeConstraint, ...addedConstraints])];
+    const acceptanceCriteria = desiredOutcome
+      ? [...new Set([...task.spec.acceptanceCriteria, desiredOutcome])]
+      : [...task.spec.acceptanceCriteria];
     const revised = await this.#options.executeCommand({
       id: Bun.randomUUIDv7(),
       type: "task.revise",
@@ -873,7 +1421,6 @@ ${this.#options.getWorkspace()}
         taskId: task.id,
         spec: {
           ...task.spec,
-          objective,
           acceptanceCriteria,
           constraints,
         },
@@ -890,12 +1437,7 @@ ${this.#options.getWorkspace()}
       expectedRevision: latest.revision,
       payload: { taskId: latest.id },
     });
-    return {
-      status: resumed.status,
-      taskId: latest.id,
-      revision: latest.revision,
-      resumed,
-    };
+    return resumed.status === "accepted" ? { ...resumed, revision: latest.revision } : resumed;
   }
 
   async #waitForTaskState(taskId: string, state: TaskRecord["state"], timeoutMs: number): Promise<TaskRecord> {
@@ -918,21 +1460,64 @@ ${this.#options.getWorkspace()}
     return snapshot.tasks.at(-1);
   }
 
-  #status(task: TaskRecord): unknown {
-    return {
+  #status(task: TaskRecord, view: string): unknown {
+    const snapshot = this.#options.getSnapshot();
+    const facts = this.#options.getTaskFacts?.(task.id) ?? null;
+    const brief = {
       id: task.id,
       state: task.state,
       revision: task.revision,
       objective: task.spec.objective,
-      repository: task.repositoryId,
-      runs: task.runIds.length,
+      repositoryId: task.repositoryId,
       summary: task.terminalSummary,
-      recentActivity: this.#recentActivity.get(task.id) ?? null,
-      queuePosition: this.#options.getSnapshot().queue.indexOf(task.id),
+      queuePosition: snapshot.queue.indexOf(task.id),
+    };
+    if (view === "brief") return brief;
+    if (view === "current_step") {
+      return { ...brief, currentStep: facts?.currentStep ?? null, recentActivity: this.#recentActivity.get(task.id) ?? null };
+    }
+    if (view === "plan") {
+      return {
+        ...brief,
+        acceptanceCriteria: task.spec.acceptanceCriteria,
+        constraints: task.spec.constraints,
+        codingProfileId: task.spec.codingProfileId,
+      };
+    }
+    if (view === "queue") {
+      return {
+        ...brief,
+        queue: snapshot.queue.map((taskId, position) => {
+          const queued = snapshot.tasks.find((candidate) => candidate.id === taskId);
+          return { taskId, position, objective: queued?.spec.objective ?? null };
+        }),
+      };
+    }
+    if (view === "changes") {
+      return { ...brief, changedFiles: facts?.changedFiles ?? [], recentActivity: facts?.recentActivity ?? [] };
+    }
+    if (view === "verification") {
+      return {
+        ...brief,
+        verificationState: facts?.verificationState ?? "pending",
+        verificationSummaries: facts?.verificationSummaries ?? [],
+      };
+    }
+    return {
+      ...brief,
+      specHistory: task.specHistory,
+      pendingQuestion: snapshot.questions?.find((question) => question.taskId === task.id && question.state === "open") ?? null,
+      pendingConfirmations: snapshot.confirmations.filter(
+        (confirmation) => confirmation.taskId === task.id && confirmation.state === "pending",
+      ),
     };
   }
 
   #requestResponse(): void {
+    if (!this.#engaged && this.#responseMode === "voice") {
+      this.#responsePending = false;
+      return;
+    }
     if (this.#responseActive || this.#inputActive) {
       this.#responsePending = true;
       return;
@@ -942,6 +1527,31 @@ ${this.#options.getWorkspace()}
     this.#suppressAudio = false;
     this.#options.emit("voice.state", { state: "thinking" });
     this.#send({ type: "response.create" });
+  }
+
+  #truncatePlayback(playback: RealtimePlaybackCursor): void {
+    if (
+      !this.#activeAssistantAudio ||
+      playback.itemId !== this.#activeAssistantAudio.itemId ||
+      playback.contentIndex !== this.#activeAssistantAudio.contentIndex ||
+      !Number.isInteger(playback.audioEndMs) ||
+      playback.audioEndMs < 0 ||
+      (this.#lastTruncation?.itemId === playback.itemId &&
+        this.#lastTruncation.contentIndex === playback.contentIndex)
+    ) {
+      return;
+    }
+    const normalized = {
+      ...playback,
+      audioEndMs: Math.max(0, playback.audioEndMs),
+    };
+    this.#lastTruncation = normalized;
+    this.#send({
+      type: "conversation.item.truncate",
+      item_id: normalized.itemId,
+      content_index: normalized.contentIndex,
+      audio_end_ms: normalized.audioEndMs,
+    });
   }
 
   #send(event: unknown): void {

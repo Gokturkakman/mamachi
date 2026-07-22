@@ -4,8 +4,12 @@ struct TranscriptStore {
     private let fileURL: URL
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
+    private let encryption: ApplicationEncryptionService
 
-    init(fileManager: FileManager = .default) throws {
+    init(
+        fileManager: FileManager = .default,
+        encryption: ApplicationEncryptionService = ApplicationEncryptionService()
+    ) throws {
         let support = try fileManager.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
@@ -14,8 +18,15 @@ struct TranscriptStore {
         )
         let directory = support.appending(path: "Mamachi", directoryHint: .isDirectory)
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-        fileURL = directory.appending(path: "transcripts.json")
+        try self.init(
+            fileURL: directory.appending(path: "transcripts.json"),
+            encryption: encryption
+        )
+    }
 
+    init(fileURL: URL, encryption: ApplicationEncryptionService) throws {
+        self.fileURL = fileURL
+        self.encryption = encryption
         encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -25,11 +36,20 @@ struct TranscriptStore {
 
     func load() throws -> [TranscriptEntry] {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
-        return try decoder.decode([TranscriptEntry].self, from: Data(contentsOf: fileURL))
+        let stored = try Data(contentsOf: fileURL)
+        let wasEncrypted = encryption.isEncryptedEnvelope(stored)
+        let plaintext = try wasEncrypted ? encryption.decrypt(stored) : stored
+        let entries = try decoder.decode([TranscriptEntry].self, from: plaintext)
+        if !wasEncrypted {
+            try save(entries)
+        }
+        return entries
     }
 
     func save(_ entries: [TranscriptEntry]) throws {
-        try encoder.encode(entries).write(to: fileURL, options: [.atomic, .completeFileProtection])
+        let plaintext = try encoder.encode(entries)
+        let envelope = try encryption.encrypt(plaintext)
+        try envelope.write(to: fileURL, options: [.atomic, .completeFileProtection])
     }
 
     func clear() throws {

@@ -15,16 +15,20 @@ final class DaemonProcess {
 
     func start(workspace: String) async throws -> DaemonReady {
         if process?.isRunning == true { throw DaemonLaunchError.alreadyRunning }
-        let projectRoot = try Self.projectRoot()
-        let bun = try Self.discoverBun()
+        let daemon = try Self.daemonExecutable()
         let statePath = try Self.statePath()
         let token = UUID().uuidString.lowercased()
 
         let process = Process()
-        process.executableURL = bun
-        process.arguments = ["run", "daemon"]
-        process.currentDirectoryURL = projectRoot
+        process.executableURL = daemon
+        process.currentDirectoryURL = URL(filePath: workspace, directoryHint: .isDirectory)
         var environment = ProcessInfo.processInfo.environment
+        let keychain = KeychainStore()
+        for (name, credential) in try keychain.codingCredentialEnvironment() {
+            environment[name] = credential
+        }
+        environment["MAMACHI_ENCRYPTION_KEY"] =
+            try keychain.loadOrCreateApplicationEncryptionKey().base64EncodedString()
         environment["MAMACHI_TOKEN"] = token
         environment["MAMACHI_PORT"] = "0"
         environment["MAMACHI_STATE_PATH"] = statePath.path
@@ -145,25 +149,28 @@ final class DaemonProcess {
         throw DaemonLaunchError.projectRootNotFound
     }
 
-    private static func discoverBun() throws -> URL {
-        let environment = ProcessInfo.processInfo.environment
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let candidates = [
-            environment["BUN_PATH"],
-            home.appending(path: ".bun/bin/bun").path,
-            "/opt/homebrew/bin/bun",
-            "/usr/local/bin/bun",
-        ].compactMap { $0 }
-        if let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
-            return URL(filePath: path)
+    static func daemonExecutable(bundle: Bundle = .main) throws -> URL {
+        if let configured = ProcessInfo.processInfo.environment["MAMACHI_DAEMON_PATH"], !configured.isEmpty {
+            guard FileManager.default.isExecutableFile(atPath: configured) else {
+                throw DaemonLaunchError.daemonNotExecutable(configured)
+            }
+            return URL(filePath: configured)
         }
-        throw DaemonLaunchError.bunNotFound
+        guard let resources = bundle.resourceURL else {
+            throw DaemonLaunchError.bundledDaemonMissing
+        }
+        let daemon = resources.appending(path: "runtime/mamachi-daemon")
+        guard FileManager.default.isExecutableFile(atPath: daemon.path) else {
+            throw DaemonLaunchError.bundledDaemonMissing
+        }
+        return daemon
     }
 }
 
 enum DaemonLaunchError: LocalizedError {
     case alreadyRunning
-    case bunNotFound
+    case bundledDaemonMissing
+    case daemonNotExecutable(String)
     case projectRootNotFound
     case exited(code: Int32, detail: String)
 
@@ -171,8 +178,10 @@ enum DaemonLaunchError: LocalizedError {
         switch self {
         case .alreadyRunning:
             "Mamachi daemon is already running."
-        case .bunNotFound:
-            "Bun was not found. Install Bun or set BUN_PATH."
+        case .bundledDaemonMissing:
+            "The bundled Mamachi daemon is missing. Reinstall Mamachi."
+        case .daemonNotExecutable(let path):
+            "The configured Mamachi daemon is not executable: \(path)"
         case .projectRootNotFound:
             "Mamachi project root was not found. Set MAMACHI_PROJECT_ROOT."
         case .exited(let code, let detail):

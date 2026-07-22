@@ -12,6 +12,32 @@ export type TaskState =
 
 export type RunState = "running" | "paused" | "completed" | "failed" | "cancelled" | "interrupted";
 
+export interface WorkspaceConflictRecord {
+  paths: string[];
+  reason: string;
+  detectedAt: string;
+}
+
+export interface OmpRecoveryBoundary {
+  runId: string;
+  reason: string;
+  unknownToolCall: boolean;
+  recordedAt: string;
+}
+
+export interface OmpSessionRecord {
+  id: string;
+  file: string;
+  boundRunId: string;
+  recoveryBoundary: OmpRecoveryBoundary | null;
+}
+
+export interface SpecHistoryEntry {
+  revision: number;
+  objective: string;
+  revisedAt: string;
+}
+
 export interface TaskRecord {
   id: string;
   repositoryId: string;
@@ -20,9 +46,14 @@ export interface TaskRecord {
   revision: number;
   activeRunId: string | null;
   runIds: string[];
+  evidenceIds: string[];
   createdAt: string;
   updatedAt: string;
   terminalSummary: string | null;
+  workspaceConflict: WorkspaceConflictRecord | null;
+  ompSession?: OmpSessionRecord | null;
+  pendingQuestion: string | null;
+  specHistory: SpecHistoryEntry[];
 }
 
 export interface RunRecord {
@@ -34,12 +65,43 @@ export interface RunRecord {
   endedAt: string | null;
 }
 
+export interface QuestionRecord {
+  id: string;
+  taskId: string;
+  taskRevision: number;
+  runId: string;
+  question: string;
+  state: "open" | "resolved";
+  resolution: "answered" | "superseded" | null;
+  answer: string | null;
+  askedAt: string;
+  resolvedAt: string | null;
+}
+
+export type ConfirmationState = "pending" | "approved" | "rejected" | "consumed";
+
+export interface ConfirmationRecord {
+  id: string;
+  taskId: string;
+  taskRevision: number;
+  category: string;
+  summary: string;
+  effectFingerprint: string;
+  toolName: string;
+  state: ConfirmationState;
+  createdAt: string;
+  resolvedAt: string | null;
+  consumedAt: string | null;
+}
+
 export interface ControllerState {
   seq: number;
   activeTaskId: string | null;
   queue: string[];
   tasks: Map<string, TaskRecord>;
   runs: Map<string, RunRecord>;
+  confirmations: Map<string, ConfirmationRecord>;
+  questions: Map<string, QuestionRecord>;
 }
 
 export interface ControllerSnapshot {
@@ -48,6 +110,8 @@ export interface ControllerSnapshot {
   queue: string[];
   tasks: TaskRecord[];
   runs: RunRecord[];
+  confirmations: ConfirmationRecord[];
+  questions?: QuestionRecord[];
 }
 
 export function createEmptyState(): ControllerState {
@@ -57,6 +121,8 @@ export function createEmptyState(): ControllerState {
     queue: [],
     tasks: new Map(),
     runs: new Map(),
+    confirmations: new Map(),
+    questions: new Map(),
   };
 }
 
@@ -70,6 +136,18 @@ function requiredRun(state: ControllerState, runId: string): RunRecord {
   const run = state.runs.get(runId);
   if (!run) throw new Error(`Event references missing run ${runId}`);
   return run;
+}
+
+function requiredConfirmation(state: ControllerState, confirmationId: string): ConfirmationRecord {
+  const confirmation = state.confirmations.get(confirmationId);
+  if (!confirmation) throw new Error(`Event references missing confirmation ${confirmationId}`);
+  return confirmation;
+}
+
+function requiredQuestion(state: ControllerState, questionId: string): QuestionRecord {
+  const question = state.questions.get(questionId);
+  if (!question) throw new Error(`Event references missing question ${questionId}`);
+  return question;
 }
 
 function requireTaskId(event: DomainEvent): string {
@@ -99,9 +177,20 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
         revision: event.payload.revision,
         activeRunId: null,
         runIds: [],
+        evidenceIds: [],
         createdAt: event.at,
         updatedAt: event.at,
+        workspaceConflict: null,
         terminalSummary: null,
+        ompSession: null,
+        pendingQuestion: null,
+        specHistory: [
+          {
+            revision: event.payload.revision,
+            objective: event.payload.spec.objective,
+            revisedAt: event.at,
+          },
+        ],
       });
       break;
     }
@@ -126,6 +215,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       if (state.runs.has(runId)) throw new Error(`Run ${runId} already exists`);
       removeFromQueue(state, taskId);
       task.state = "running";
+      task.pendingQuestion = null;
       task.activeRunId = runId;
       task.runIds.push(runId);
       task.updatedAt = event.at;
@@ -162,7 +252,67 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       run.state = "paused";
       run.endedAt = event.at;
       task.state = "awaiting_user";
+      task.pendingQuestion = event.payload.question;
       task.activeRunId = null;
+      task.updatedAt = event.at;
+      break;
+    }
+    case "task.questionAsked": {
+      const taskId = requireTaskId(event);
+      const task = requiredTask(state, taskId);
+      const run = requiredRun(state, event.payload.runId);
+      if (state.questions.has(event.payload.questionId)) {
+        throw new Error(`Question ${event.payload.questionId} already exists`);
+      }
+      state.questions.set(event.payload.questionId, {
+        id: event.payload.questionId,
+        taskId,
+        taskRevision: event.payload.revision,
+        runId: event.payload.runId,
+        question: event.payload.question,
+        state: "open",
+        resolution: null,
+        answer: null,
+        askedAt: event.at,
+        resolvedAt: null,
+      });
+      run.state = "paused";
+      run.endedAt = event.at;
+      task.state = "awaiting_user";
+      task.pendingQuestion = event.payload.question;
+      task.activeRunId = null;
+      task.updatedAt = event.at;
+      break;
+    }
+    case "task.questionAnswered": {
+      const question = requiredQuestion(state, event.payload.questionId);
+      question.state = "resolved";
+      question.resolution = "answered";
+      question.answer = event.payload.answer;
+      question.resolvedAt = event.at;
+      break;
+    }
+    case "coder.sessionBound": {
+      const task = requiredTask(state, requireTaskId(event));
+      task.ompSession = {
+        id: event.payload.sessionId,
+        file: event.payload.sessionFile,
+        boundRunId: event.payload.runId,
+        recoveryBoundary: null,
+      };
+      task.updatedAt = event.at;
+      break;
+    }
+    case "coder.recoveryBoundary": {
+      const task = requiredTask(state, requireTaskId(event));
+      if (task.ompSession && event.payload.sessionId === task.ompSession.id) {
+        task.ompSession.recoveryBoundary = {
+          runId: event.payload.runId,
+          reason: event.payload.reason,
+          unknownToolCall: event.payload.unknownToolCall,
+          recordedAt: event.at,
+        };
+      }
       task.updatedAt = event.at;
       break;
     }
@@ -170,7 +320,20 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       const task = requiredTask(state, requireTaskId(event));
       task.spec = event.payload.spec;
       task.revision = event.payload.revision;
+      task.specHistory.push({
+        revision: event.payload.revision,
+        objective: event.payload.spec.objective,
+        revisedAt: event.at,
+      });
+      task.pendingQuestion = null;
       task.updatedAt = event.at;
+      for (const question of state.questions.values()) {
+        if (question.taskId === task.id && question.state === "open") {
+          question.state = "resolved";
+          question.resolution = "superseded";
+          question.resolvedAt = event.at;
+        }
+      }
       break;
     }
     case "task.completed": {
@@ -183,6 +346,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       task.activeRunId = null;
       task.updatedAt = event.at;
       task.terminalSummary = event.payload.summary;
+      task.pendingQuestion = null;
       removeFromQueue(state, taskId);
       if (state.activeTaskId === taskId) state.activeTaskId = null;
       break;
@@ -197,6 +361,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       task.activeRunId = null;
       task.updatedAt = event.at;
       task.terminalSummary = event.payload.error;
+      task.pendingQuestion = null;
       removeFromQueue(state, taskId);
       if (state.activeTaskId === taskId) state.activeTaskId = null;
       break;
@@ -213,6 +378,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       task.activeRunId = null;
       task.updatedAt = event.at;
       task.terminalSummary = event.payload.reason;
+      task.pendingQuestion = null;
       removeFromQueue(state, taskId);
       if (state.activeTaskId === taskId) state.activeTaskId = null;
       break;
@@ -221,6 +387,64 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       const run = requiredRun(state, event.payload.runId);
       run.state = "interrupted";
       run.endedAt = event.at;
+      break;
+    }
+    case "policy.decisionRecorded":
+      break;
+    case "artifact.created": {
+      const task = requiredTask(state, requireTaskId(event));
+      if (!task.evidenceIds.includes(event.payload.artifactId)) {
+        task.evidenceIds.push(event.payload.artifactId);
+      }
+      task.updatedAt = event.at;
+      break;
+    }
+    case "workspace.conflictDetected": {
+      const task = requiredTask(state, requireTaskId(event));
+      task.workspaceConflict = {
+        paths: [...event.payload.paths],
+        reason: event.payload.reason,
+        detectedAt: event.at,
+      };
+      task.updatedAt = event.at;
+      break;
+    }
+    case "workspace.conflictResolved": {
+      const task = requiredTask(state, requireTaskId(event));
+      task.workspaceConflict = null;
+      task.updatedAt = event.at;
+      break;
+    }
+    case "approval.requested": {
+      const taskId = requireTaskId(event);
+      if (state.confirmations.has(event.payload.confirmationId)) {
+        throw new Error(`Confirmation ${event.payload.confirmationId} already exists`);
+      }
+      state.confirmations.set(event.payload.confirmationId, {
+        id: event.payload.confirmationId,
+        taskId,
+        taskRevision: event.payload.revision,
+        category: event.payload.category,
+        summary: event.payload.summary,
+        effectFingerprint: event.payload.effectFingerprint,
+        toolName: event.payload.toolName,
+        state: "pending",
+        createdAt: event.at,
+        resolvedAt: null,
+        consumedAt: null,
+      });
+      break;
+    }
+    case "approval.resolved": {
+      const confirmation = requiredConfirmation(state, event.payload.confirmationId);
+      confirmation.state = event.payload.decision === "approve" ? "approved" : "rejected";
+      confirmation.resolvedAt = event.at;
+      break;
+    }
+    case "approval.consumed": {
+      const confirmation = requiredConfirmation(state, event.payload.confirmationId);
+      confirmation.state = "consumed";
+      confirmation.consumedAt = event.at;
       break;
     }
     case "queue.reordered": {
@@ -246,6 +470,8 @@ export function snapshotState(state: ControllerState): ControllerSnapshot {
     queue: [...state.queue],
     tasks: [...state.tasks.values()].map((task) => structuredClone(task)),
     runs: [...state.runs.values()].map((run) => structuredClone(run)),
+    confirmations: [...state.confirmations.values()].map((confirmation) => structuredClone(confirmation)),
+    questions: [...state.questions.values()].map((question) => structuredClone(question)),
   };
 }
 
@@ -279,6 +505,18 @@ export function assertStateInvariants(state: ControllerState): void {
       if (run.state === "interrupted" && !(task.state === "running" || task.state === "pause_requested")) {
         throw new Error(`Interrupted run ${run.id} is attached to task state ${task.state}`);
       }
+    }
+    const openQuestions = [...state.questions.values()].filter(
+      (question) => question.taskId === task.id && question.state === "open",
+    );
+    if (openQuestions.length > 1) {
+      throw new Error(`Task ${task.id} has multiple open questions`);
+    }
+    if (openQuestions.length === 1 && task.state !== "awaiting_user") {
+      throw new Error(`Task ${task.id} has an open question while ${task.state}`);
+    }
+    if (task.specHistory.at(-1)?.revision !== task.revision) {
+      throw new Error(`Task ${task.id} spec history is out of sync with revision ${task.revision}`);
     }
   }
 }

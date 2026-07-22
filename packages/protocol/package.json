@@ -4,7 +4,12 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./generated": "./generated/typescript/protocol.generated.ts"
+  },
+  "scripts": {
+    "bindings:generate": "bun scripts/generate-bindings.ts",
+    "bindings:check": "bun scripts/generate-bindings.ts --check"
   },
   "dependencies": {
     "ajv": "^8.17.1",

@@ -69,4 +69,100 @@ describe("canonical protocol validation", () => {
       }).type,
     ).toBe("task.started");
   });
+
+  test("accepts exact approval decisions and rejects model-supplied scope", () => {
+    const confirmationId = Bun.randomUUIDv7();
+    const command = {
+      id: Bun.randomUUIDv7(),
+      type: "approval.resolve",
+      actor: "ui",
+      expectedRevision: 3,
+      payload: { confirmationId, decision: "approve" },
+    };
+
+    expect(parseCommand(command).type).toBe("approval.resolve");
+    expect(() =>
+      parseCommand({
+        ...command,
+        payload: { confirmationId, decision: "approve", appliesTo: "all future actions" },
+      }),
+    ).toThrow(ProtocolValidationError);
+  });
+
+  test("binds question answers to one task, revision, run, and question ID", () => {
+    const taskId = Bun.randomUUIDv7();
+    const questionId = Bun.randomUUIDv7();
+    const runId = Bun.randomUUIDv7();
+    const command = {
+      id: Bun.randomUUIDv7(),
+      type: "task.answerQuestion",
+      actor: "ui",
+      expectedRevision: 4,
+      payload: { taskId, questionId, answer: "Use the staging target." },
+    };
+    expect(parseCommand(command).type).toBe("task.answerQuestion");
+    expect(() =>
+      parseCommand({ ...command, payload: { taskId, answer: "An unbound answer" } }),
+    ).toThrow(ProtocolValidationError);
+
+    const correlationId = Bun.randomUUIDv7();
+    const asked = {
+      version: 1,
+      id: Bun.randomUUIDv7(),
+      seq: 2,
+      at: new Date().toISOString(),
+      type: "task.questionAsked",
+      actor: "coder",
+      projectId: "repo_alpha",
+      taskId,
+      runId,
+      correlationId,
+      causedBy: correlationId,
+      payload: {
+        questionId,
+        runId,
+        revision: 4,
+        question: "Which deployment target should I use?",
+      },
+    };
+    expect(parseDomainEvent(asked).type).toBe("task.questionAsked");
+    expect(() =>
+      parseDomainEvent({
+        ...asked,
+        payload: { questionId, revision: 4, question: "Missing the bound run" },
+      }),
+    ).toThrow(ProtocolValidationError);
+  });
+
+  test("validates bounded workspace conflict events", () => {
+    const taskId = Bun.randomUUIDv7();
+    const runId = Bun.randomUUIDv7();
+    const correlationId = Bun.randomUUIDv7();
+    const event = {
+      version: 1,
+      id: Bun.randomUUIDv7(),
+      seq: 9,
+      at: new Date().toISOString(),
+      type: "workspace.conflictDetected",
+      actor: "coder",
+      projectId: "repo_alpha",
+      taskId,
+      runId,
+      correlationId,
+      causedBy: correlationId,
+      payload: {
+        runId,
+        paths: ["src/feature.ts"],
+        reason: "The user changed a target file",
+      },
+    };
+
+    expect(parseDomainEvent(event).type).toBe("workspace.conflictDetected");
+    expect(() =>
+      parseDomainEvent({
+        ...event,
+        payload: { ...event.payload, content: "source must not enter conflict events" },
+      }),
+    ).toThrow(ProtocolValidationError);
+  });
 });

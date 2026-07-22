@@ -20,8 +20,20 @@ final class AudioService {
     private var capturing = false
     private var playbackGeneration = 0
     private var pendingPlaybackBuffers = 0
+    private var scheduledPlaybackFrames: AVAudioFramePosition = 0
+    private var playbackOriginFrame: AVAudioFramePosition = 0
     var isPlaying: Bool { player.isPlaying }
     var hasPendingPlayback: Bool { pendingPlaybackBuffers > 0 }
+    var playbackPositionMilliseconds: Int {
+        guard
+            let renderTime = player.lastRenderTime,
+            let playbackTime = player.playerTime(forNodeTime: renderTime),
+            playbackTime.sampleRate > 0
+        else { return 0 }
+        let playedFrames = max(0, playbackTime.sampleTime - playbackOriginFrame)
+        let milliseconds = Double(playedFrames) * 1_000 / playbackTime.sampleRate
+        return max(0, Int(milliseconds.rounded(.down)))
+    }
 
     init() {
         player.volume = 0.62
@@ -60,6 +72,10 @@ final class AudioService {
         onLevel?(0)
     }
 
+    func beginPlaybackItem() {
+        playbackOriginFrame = scheduledPlaybackFrames
+    }
+
     func play(pcm data: Data) {
         guard !data.isEmpty, data.count.isMultiple(of: 2) else { return }
         do {
@@ -76,6 +92,7 @@ final class AudioService {
             buffer.mutableAudioBufferList.pointee.mBuffers.mDataByteSize = UInt32(data.count)
             let generation = playbackGeneration
             pendingPlaybackBuffers += 1
+            scheduledPlaybackFrames += AVAudioFramePosition(frameCount)
             player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
                 Task { @MainActor in self?.didFinishPlaybackBuffer(generation: generation) }
             }
@@ -89,6 +106,8 @@ final class AudioService {
     func clearPlayback() {
         playbackGeneration += 1
         pendingPlaybackBuffers = 0
+        scheduledPlaybackFrames = 0
+        playbackOriginFrame = 0
         player.stop()
         player.reset()
     }

@@ -12,6 +12,7 @@ final class AppModel: ObservableObject {
     @Published var activeTaskId: String?
     @Published var queue: [String] = []
     @Published var tasks: [TaskViewState] = []
+    @Published var confirmations: [ConfirmationViewState] = []
     @Published var pendingContexts: [CapturedContextViewState] = []
     @Published var transcripts: [TranscriptEntry] = []
     @Published var liveUserTranscript = ""
@@ -29,8 +30,13 @@ final class AppModel: ObservableObject {
     @Published var notifyOnCompletion: Bool
     @Published var reactionSoundsEnabled: Bool
     @Published var attentionMessage: String?
+    @Published var pendingBrief: PendingBriefViewState?
+    @Published var lastTaskCompletionAt: Date?
+    @Published private(set) var coderFeed: [String: [CoderFeedEntry]] = [:]
     var onOpenSettings: (() -> Void)?
     var onShowOverlay: (() -> Void)?
+    var onResetOverlayFrame: (() -> Void)?
+    var onAdjustCompactOrbSize: ((CGFloat) -> Void)?
 
     private let daemon = DaemonProcess()
     private let ipc = IpcClient()
@@ -44,10 +50,29 @@ final class AppModel: ObservableObject {
     private var playbackStartedAt: TimeInterval?
     private var playbackMicrophoneBaseline = 0.0
     private var bargeInFrames = 0
+    private var playbackItemId: String?
+    private var playbackContentIndex: Int?
+    private var errorDismissTask: Task<Void, Never>?
 
     var activeTask: TaskViewState? {
         guard let activeTaskId else { return nil }
         return tasks.first(where: { $0.id == activeTaskId })
+    }
+
+    var pendingConfirmation: ConfirmationViewState? {
+        confirmations.first(where: { $0.taskId == activeTaskId && $0.state == "pending" })
+    }
+
+    var pendingConfirmations: [ConfirmationViewState] {
+        confirmations.filter { $0.state == "pending" }
+    }
+
+    var queuedTasks: [TaskViewState] {
+        queue.compactMap { id in tasks.first(where: { $0.id == id }) }
+    }
+
+    var recentTasks: [TaskViewState] {
+        Array(tasks.filter(\.isTerminal).suffix(6).reversed())
     }
 
     init() {
@@ -130,9 +155,12 @@ final class AppModel: ObservableObject {
         interactionMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: "interactionMode")
         if mode == .text {
+            let playback = currentPlaybackPosition()
             isEngaged = false
             audio.stopCapture()
-            if voiceState == .listening { voiceState = .connected }
+            audio.clearPlayback()
+            ipc.reportVoiceEngagement(false, playback: playback)
+            if voiceState == .listening || voiceState == .speaking { voiceState = .connected }
         }
         if daemonConnected {
             ipc.sendRequest(type: "voice.mode", payload: ["mode": mode.rawValue])
@@ -180,6 +208,7 @@ final class AppModel: ObservableObject {
         }
         isEngaged = true
         errorMessage = nil
+        if daemonConnected { ipc.reportVoiceEngagement(true, playback: nil) }
         if voiceState == .connected || voiceState == .listening || voiceState == .thinking || voiceState == .speaking {
             startMicrophone()
         } else {
@@ -188,11 +217,13 @@ final class AppModel: ObservableObject {
     }
 
     func muteMicrophone() {
+        let playback = currentPlaybackPosition()
         isEngaged = false
         audio.stopCapture()
         microphoneLevel = 0
         audio.clearPlayback()
         resetBargeInDetection()
+        if daemonConnected { ipc.reportVoiceEngagement(false, playback: playback) }
         if voiceState != .disconnected && voiceState != .error {
             voiceState = .connected
         }
@@ -208,6 +239,7 @@ final class AppModel: ObservableObject {
             guard let apiKey = try keychain.loadAPIKey(), !apiKey.isEmpty else {
                 resumeEngagementAfterKey = isEngaged
                 isEngaged = false
+                ipc.reportVoiceEngagement(false, playback: nil)
                 needsAPIKey = true
                 errorMessage = "Add an OpenAI API key to connect."
                 openSettings()
@@ -215,17 +247,21 @@ final class AppModel: ObservableObject {
             }
             needsAPIKey = false
             voiceState = .connecting
+            ipc.reportVoiceEngagement(isEngaged, playback: nil)
             ipc.sendRequest(type: "voice.connect", payload: ["apiKey": apiKey])
         } catch {
             isEngaged = false
+            ipc.reportVoiceEngagement(false, playback: nil)
             errorMessage = error.localizedDescription
         }
     }
 
     func disconnectVoice() {
+        let playback = currentPlaybackPosition()
         isEngaged = false
         audio.stopCapture()
         audio.clearPlayback()
+        ipc.reportVoiceEngagement(false, playback: playback)
         ipc.sendRequest(type: "voice.disconnect", payload: [:])
         voiceState = .disconnected
     }
@@ -279,21 +315,72 @@ final class AppModel: ObservableObject {
 
     func controlActiveTask(_ action: String) {
         guard let task = activeTask else { return }
-        let type: String
-        let payload: [String: Any]
         switch action {
         case "pause":
-            type = "task.requestPause"
-            payload = ["taskId": task.id, "reason": "Paused from the Mamachi task drawer"]
+            sendCommand(
+                type: "task.requestPause",
+                expectedRevision: task.revision,
+                payload: ["taskId": task.id, "reason": "Paused from the Mamachi task drawer"]
+            )
         case "resume":
-            type = "task.resume"
-            payload = ["taskId": task.id]
+            sendCommand(type: "task.resume", expectedRevision: task.revision, payload: ["taskId": task.id])
         case "cancel":
-            type = "task.cancel"
-            payload = ["taskId": task.id, "reason": "Cancelled from the Mamachi task drawer"]
+            sendCommand(
+                type: "task.cancel",
+                expectedRevision: task.revision,
+                payload: ["taskId": task.id, "reason": "Cancelled from the Mamachi task drawer"]
+            )
         default:
             return
         }
+    }
+
+    func resolveConfirmation(_ confirmation: ConfirmationViewState, decision: String) {
+        guard decision == "approve" || decision == "reject" else { return }
+        sendCommand(
+            type: "approval.resolve",
+            expectedRevision: confirmation.taskRevision,
+            payload: ["confirmationId": confirmation.id, "decision": decision]
+        )
+    }
+
+    func moveQueuedTask(_ taskId: String, up: Bool) {
+        guard let index = queue.firstIndex(of: taskId) else { return }
+        let target = up ? index - 1 : index + 1
+        guard queue.indices.contains(target) else { return }
+        sendCommand(
+            type: "queue.move",
+            expectedRevision: nil,
+            payload: [
+                "taskId": taskId,
+                "operation": up ? "move_before" : "move_after",
+                "anchorTaskId": queue[target],
+            ]
+        )
+    }
+
+    func cancelQueuedTask(_ task: TaskViewState) {
+        sendCommand(
+            type: "task.cancel",
+            expectedRevision: task.revision,
+            payload: ["taskId": task.id, "reason": "Removed from the queue in the Mamachi drawer"]
+        )
+    }
+
+    func removeContext(_ id: String) {
+        pendingContexts.removeAll(where: { $0.id == id })
+        ipc.sendRequest(type: "context.remove", payload: ["id": id])
+    }
+
+    func resetOverlayFrame() {
+        onResetOverlayFrame?()
+    }
+
+    func adjustCompactOrbSize(by points: CGFloat) {
+        onAdjustCompactOrbSize?(points)
+    }
+
+    private func sendCommand(type: String, expectedRevision: Int?, payload: [String: Any]) {
         ipc.sendRequest(
             type: "command.execute",
             payload: [
@@ -301,7 +388,7 @@ final class AppModel: ObservableObject {
                     "id": ProtocolID.makeV7(),
                     "type": type,
                     "actor": "ui",
-                    "expectedRevision": task.revision,
+                    "expectedRevision": expectedRevision.map { $0 as Any } ?? NSNull(),
                     "payload": payload,
                 ],
             ]
@@ -315,11 +402,25 @@ final class AppModel: ObservableObject {
             liveUserTranscript = ""
             liveAssistantTranscript = ""
         } catch {
-            errorMessage = error.localizedDescription
+            presentError(error.localizedDescription)
+        }
+    }
+
+    func presentError(_ message: String, sticky: Bool = false) {
+        errorMessage = message
+        errorDismissTask?.cancel()
+        errorDismissTask = nil
+        guard !sticky else { return }
+        errorDismissTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(7))
+            guard !Task.isCancelled else { return }
+            self?.errorMessage = nil
         }
     }
 
     func dismissError() {
+        errorDismissTask?.cancel()
+        errorDismissTask = nil
         errorMessage = nil
     }
     func openSettings() {
@@ -328,6 +429,7 @@ final class AppModel: ObservableObject {
 
 
     private func handleAudioOutput(_ data: Data) {
+        guard isEngaged, playbackItemId != nil, playbackContentIndex != nil else { return }
         if playbackStartedAt == nil {
             playbackStartedAt = ProcessInfo.processInfo.systemUptime
             playbackMicrophoneBaseline = 0
@@ -368,15 +470,30 @@ final class AppModel: ObservableObject {
         bargeInFrames = 0
     }
 
+    private func currentPlaybackPosition() -> VoicePlaybackPosition? {
+        guard
+            voiceState == .speaking,
+            let playbackItemId,
+            let playbackContentIndex,
+            audio.hasPendingPlayback || audio.isPlaying
+        else { return nil }
+        return VoicePlaybackPosition(
+            itemId: playbackItemId,
+            contentIndex: playbackContentIndex,
+            audioEndMs: audio.playbackPositionMilliseconds
+        )
+    }
+
     private func resumeMicrophoneIfReady() {
         guard isEngaged, voiceState == .connected, !audio.hasPendingPlayback else { return }
         startMicrophone()
     }
 
     private func bargeIn() {
+        let playback = currentPlaybackPosition()
         resetBargeInDetection()
         audio.clearPlayback()
-        ipc.sendRequest(type: "voice.interrupt", payload: [:])
+        ipc.interruptVoice(playback: playback)
         voiceState = .listening
         startMicrophone()
     }
@@ -388,6 +505,7 @@ final class AppModel: ObservableObject {
                 if isEngaged { voiceState = .listening }
             } catch {
                 isEngaged = false
+                ipc.reportVoiceEngagement(false, playback: nil)
                 errorMessage = error.localizedDescription
             }
         }
@@ -400,19 +518,23 @@ final class AppModel: ObservableObject {
         case "server.ready":
             daemonConnected = true
             syncRuntimeSettings()
+            ipc.reportVoiceEngagement(isEngaged, playback: nil)
             applySnapshot(payload["snapshot"] as? [String: Any])
+            applyFacts(payload["facts"] as? [String: Any])
         case "response":
             if payload["ok"] as? Bool == false {
                 errorMessage = payload["error"] as? String ?? "Mamachi request failed."
                 if voiceState == .connecting {
                     voiceState = .error
                     isEngaged = false
+                    ipc.reportVoiceEngagement(false, playback: nil)
                 }
             }
         case "domain.event":
             handleDomainEvent(payload)
         case "state.snapshot":
             applySnapshot(payload["snapshot"] as? [String: Any])
+            applyFacts(payload["facts"] as? [String: Any])
         case "workspace.changed":
             if let path = payload["path"] as? String { workspace = path }
         case "context.captured":
@@ -424,9 +546,27 @@ final class AppModel: ObservableObject {
             {
                 pendingContexts.append(CapturedContextViewState(id: id, kind: kind, summary: summary))
             }
-        case "context.consumed":
+        case "context.consumed", "context.removed":
             if let ids = payload["ids"] as? [String] {
                 pendingContexts.removeAll(where: { ids.contains($0.id) })
+            }
+        case "brief.queued":
+            pendingBrief = PendingBriefViewState(
+                count: payload["pending"] as? Int ?? ((pendingBrief?.count ?? 0) + 1),
+                latestSummary: payload["summary"] as? String ?? ""
+            )
+        case "brief.delivered":
+            pendingBrief = nil
+        case "voice.audio":
+            if
+                let itemId = payload["itemId"] as? String,
+                let contentIndex = payload["contentIndex"] as? Int
+            {
+                if playbackItemId != itemId || playbackContentIndex != contentIndex {
+                    audio.beginPlaybackItem()
+                }
+                playbackItemId = itemId
+                playbackContentIndex = contentIndex
             }
         case "voice.state":
             applyVoiceState(payload["state"] as? String)
@@ -445,7 +585,7 @@ final class AppModel: ObservableObject {
             audio.clearPlayback()
         case "voice.error":
             voiceState = .error
-            errorMessage = payload["error"] as? String ?? "OpenAI Realtime returned an error."
+            presentError(payload["error"] as? String ?? "OpenAI Realtime returned an error.")
         case "voice.transcript.user_delta":
             if let text = payload["text"] as? String { liveUserTranscript += text }
         case "voice.transcript.user":
@@ -499,6 +639,7 @@ final class AppModel: ObservableObject {
             )
         case "task.completed":
             attentionMessage = nil
+            lastTaskCompletionAt = Date()
             let summary = detail["summary"] as? String ?? objective
             reactions.notify(
                 id: "completed-\(taskId ?? ProtocolID.makeV7())",
@@ -519,6 +660,15 @@ final class AppModel: ObservableObject {
             )
         case "task.resumed", "task.cancelled":
             attentionMessage = nil
+        case "approval.requested":
+            let summary = detail["summary"] as? String ?? "A consequential action needs your approval"
+            reactions.notify(
+                id: "approval-\(taskId ?? ProtocolID.makeV7())",
+                title: "Approval needed",
+                body: String(summary.prefix(220)),
+                notificationsEnabled: notifyOnAttention,
+                soundEnabled: reactionSoundsEnabled
+            )
         default:
             break
         }
@@ -550,7 +700,8 @@ final class AppModel: ObservableObject {
         activeTaskId = rawSnapshot["activeTaskId"] as? String
         queue = rawSnapshot["queue"] as? [String] ?? []
         guard let rawTasks = rawSnapshot["tasks"] as? [[String: Any]] else { return }
-        let activityByID = Dictionary(uniqueKeysWithValues: tasks.map { ($0.id, $0.recentActivity) })
+        let previousByID = Dictionary(uniqueKeysWithValues: tasks.map { ($0.id, $0) })
+        let rawRuns = rawSnapshot["runs"] as? [[String: Any]] ?? []
         tasks = rawTasks.compactMap { rawTask in
             guard
                 let id = rawTask["id"] as? String,
@@ -559,15 +710,152 @@ final class AppModel: ObservableObject {
                 let spec = rawTask["spec"] as? [String: Any],
                 let objective = spec["objective"] as? String
             else { return nil }
-            return TaskViewState(
+            let previous = previousByID[id]
+            var task = TaskViewState(
                 id: id,
                 state: state,
                 revision: revision,
                 objective: objective,
                 terminalSummary: rawTask["terminalSummary"] as? String,
-                recentActivity: activityByID[id] ?? nil
+                recentActivity: previous?.recentActivity
+            )
+            task.pendingQuestion = rawTask["pendingQuestion"] as? String
+            task.createdAt = Self.parseDate(rawTask["createdAt"])
+            task.specHistory = (rawTask["specHistory"] as? [[String: Any]] ?? []).compactMap { entry in
+                guard
+                    let revision = entry["revision"] as? Int,
+                    let objective = entry["objective"] as? String
+                else { return nil }
+                return SpecRevisionViewState(
+                    revision: revision,
+                    objective: objective,
+                    revisedAt: Self.parseDate(entry["revisedAt"])
+                )
+            }
+            if
+                let conflict = rawTask["workspaceConflict"] as? [String: Any],
+                let reason = conflict["reason"] as? String
+            {
+                let paths = conflict["paths"] as? [String] ?? []
+                task.blockers = [
+                    BlockerViewState(
+                        id: "conflict-\(id)",
+                        summary: paths.isEmpty ? reason : "\(reason): \(paths.joined(separator: ", "))",
+                        kind: "conflict"
+                    ),
+                ]
+            }
+            task.runBoundaries = rawRuns
+                .filter { $0["taskId"] as? String == id }
+                .enumerated()
+                .compactMap { index, run in
+                    guard
+                        let runId = run["id"] as? String,
+                        let runState = run["state"] as? String
+                    else { return nil }
+                    return RunBoundaryViewState(
+                        id: runId,
+                        label: "Run \(index + 1) · \(runState.replacingOccurrences(of: "_", with: " ").capitalized)",
+                        kind: runState == "interrupted" ? "recovery" : "run",
+                        at: Self.parseDate(run["startedAt"])
+                    )
+                }
+            // Grounded facts arrive in a sibling `facts` payload; carry the last
+            // projection so the card never blanks between snapshots.
+            task.phase = previous?.phase
+            task.currentStep = previous?.currentStep
+            task.progress = previous?.progress
+            task.verificationState = previous?.verificationState
+            task.changedFiles = previous?.changedFiles ?? []
+            task.evidence = previous?.evidence ?? []
+            task.observerSummary = previous?.observerSummary
+            task.observerRisks = previous?.observerRisks ?? []
+            task.observerNextStep = previous?.observerNextStep
+            return task
+        }
+        let rawConfirmations = rawSnapshot["confirmations"] as? [[String: Any]] ?? []
+        confirmations = rawConfirmations.compactMap { rawConfirmation in
+            guard
+                let id = rawConfirmation["id"] as? String,
+                let taskId = rawConfirmation["taskId"] as? String,
+                let taskRevision = rawConfirmation["taskRevision"] as? Int,
+                let category = rawConfirmation["category"] as? String,
+                let summary = rawConfirmation["summary"] as? String,
+                let toolName = rawConfirmation["toolName"] as? String,
+                let state = rawConfirmation["state"] as? String
+            else { return nil }
+            return ConfirmationViewState(
+                id: id,
+                taskId: taskId,
+                taskRevision: taskRevision,
+                category: category,
+                summary: summary,
+                toolName: toolName,
+                state: state
             )
         }
+    }
+
+    /// Applies the daemon's evidence-grounded fact projection onto task rows.
+    private func applyFacts(_ rawFacts: [String: Any]?) {
+        guard let rawFacts, let rawTasks = rawFacts["tasks"] as? [[String: Any]] else { return }
+        for rawTask in rawTasks {
+            guard
+                let taskId = rawTask["taskId"] as? String,
+                let index = tasks.firstIndex(where: { $0.id == taskId })
+            else { continue }
+            tasks[index].phase = rawTask["phase"] as? String
+            tasks[index].currentStep = rawTask["currentStep"] as? String
+            if let progress = rawTask["progress"] as? Double {
+                tasks[index].progress = min(100, max(0, progress))
+            }
+            tasks[index].verificationState = rawTask["verificationState"] as? String
+            tasks[index].changedFiles = (rawTask["changedFiles"] as? [String] ?? [])
+                .map { ChangedFileViewState(path: $0) }
+            let activities = rawTask["recentActivity"] as? [[String: Any]] ?? []
+            var evidence: [EvidenceViewState] = activities.compactMap { activity in
+                guard
+                    activity["kind"] as? String == "verification",
+                    let id = activity["artifactId"] as? String,
+                    let summary = activity["summary"] as? String
+                else { return nil }
+                return EvidenceViewState(
+                    id: id,
+                    summary: summary,
+                    kind: "check",
+                    passed: activity["successful"] as? Bool
+                )
+            }
+            if evidence.isEmpty {
+                let passed = rawTask["verificationState"] as? String == "passed"
+                evidence = (rawTask["verificationSummaries"] as? [String] ?? []).enumerated().map { offset, summary in
+                    EvidenceViewState(id: "\(taskId)-verification-\(offset)", summary: summary, kind: "check", passed: passed)
+                }
+            }
+            tasks[index].evidence = evidence
+            if let observer = rawTask["observerInterpretation"] as? [String: Any] {
+                tasks[index].observerSummary = observer["summary"] as? String
+                tasks[index].observerRisks = observer["risks"] as? [String] ?? []
+                tasks[index].observerNextStep = observer["nextStep"] as? String
+            }
+        }
+    }
+
+    private static let isoDateParser: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let isoDateFallbackParser: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    private static func parseDate(_ value: Any?) -> Date? {
+        guard let string = value as? String else { return nil }
+        return isoDateParser.date(from: string) ?? isoDateFallbackParser.date(from: string)
     }
 
     private func applyCoderActivity(type: String, payload: [String: Any]) {
@@ -592,6 +880,16 @@ final class AppModel: ObservableObject {
             summary = type.replacingOccurrences(of: "coder.", with: "").replacingOccurrences(of: "_", with: " ").capitalized
         }
         tasks[index].recentActivity = String(summary.prefix(500))
+        appendCoderFeed(taskId: taskId, text: summary)
+    }
+
+    private func appendCoderFeed(taskId: String, text: String) {
+        let line = String(text.prefix(200))
+        var feed = coderFeed[taskId] ?? []
+        if feed.last?.text == line { return }
+        feed.append(CoderFeedEntry(text: line, at: Date()))
+        if feed.count > 14 { feed.removeFirst(feed.count - 14) }
+        coderFeed[taskId] = feed
     }
 
     private func appendTranscript(speaker: TranscriptEntry.Speaker, text: String) {

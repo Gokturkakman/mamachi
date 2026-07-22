@@ -6,6 +6,8 @@ import {
   type DomainEvent,
   type NewDomainEvent,
 } from "@mamachi/protocol";
+import { migrateStorage } from "./storage-schema.ts";
+import { SensitiveFieldCodec, type SensitiveFieldKey } from "./sensitive-field-codec.ts";
 
 interface EventRow {
   seq: number;
@@ -45,55 +47,22 @@ export interface CommandExecution {
   replayed: boolean;
 }
 
+export interface EventStoreOptions {
+  encryptionKey?: SensitiveFieldKey;
+}
+
 export class EventStore {
   readonly #db: Database;
+  readonly #codec: SensitiveFieldCodec;
 
-  constructor(path = ":memory:") {
+  constructor(path = ":memory:", options: EventStoreOptions = {}) {
     this.#db = new Database(path, { create: true, strict: true });
-    this.#db.run("PRAGMA foreign_keys = ON");
+    this.#codec = new SensitiveFieldCodec(options.encryptionKey ?? null);
     if (path !== ":memory:") this.#db.run("PRAGMA journal_mode = WAL");
-    this.#migrate();
+    migrateStorage(this.#db);
+    this.#encryptLegacyPayloads();
   }
 
-  #migrate(): void {
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        version INTEGER PRIMARY KEY,
-        applied_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS commands (
-        id TEXT PRIMARY KEY,
-        type TEXT NOT NULL,
-        actor TEXT NOT NULL,
-        expected_revision INTEGER,
-        payload_json TEXT NOT NULL,
-        result_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS events (
-        seq INTEGER PRIMARY KEY AUTOINCREMENT,
-        id TEXT NOT NULL UNIQUE,
-        at TEXT NOT NULL,
-        type TEXT NOT NULL,
-        actor TEXT NOT NULL,
-        project_id TEXT,
-        task_id TEXT,
-        run_id TEXT,
-        correlation_id TEXT NOT NULL,
-        caused_by TEXT,
-        payload_json TEXT NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS events_task_seq ON events(task_id, seq);
-      CREATE INDEX IF NOT EXISTS events_type_seq ON events(type, seq);
-    `);
-
-    this.#db
-      .query("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)")
-      .run(1, new Date().toISOString());
-  }
 
   executeCommand(command: CommandRecord, decide: () => CommandDecision): CommandExecution {
     const transaction = this.#db.transaction((): CommandExecution => {
@@ -102,7 +71,9 @@ export class EventStore {
         .get(command.id);
       if (existing) {
         return {
-          result: parseActionResult(JSON.parse(existing.result_json)),
+          result: parseActionResult(
+            JSON.parse(this.#codec.decode(existing.result_json, `commands.result_json:${command.id}`)),
+          ),
           events: [],
           replayed: true,
         };
@@ -128,7 +99,7 @@ export class EventStore {
           event.runId ?? null,
           event.correlationId,
           event.causedBy ?? null,
-          JSON.stringify(event.payload),
+          this.#codec.encode(JSON.stringify(event.payload), `events.payload_json:${event.id}`),
         );
         const seq = Number(inserted.lastInsertRowid);
         storedEvents.push(parseDomainEvent({ ...event, seq }));
@@ -145,8 +116,8 @@ export class EventStore {
           command.type,
           command.actor,
           command.expectedRevision,
-          JSON.stringify(command.payload),
-          JSON.stringify(decision.result),
+          this.#codec.encode(JSON.stringify(command.payload), `commands.payload_json:${command.id}`),
+          this.#codec.encode(JSON.stringify(decision.result), `commands.result_json:${command.id}`),
           command.createdAt,
         );
 
@@ -185,7 +156,7 @@ export class EventStore {
         ...(row.run_id ? { runId: row.run_id } : {}),
         correlationId: row.correlation_id,
         ...(row.caused_by ? { causedBy: row.caused_by } : {}),
-        payload: JSON.parse(row.payload_json),
+        payload: JSON.parse(this.#codec.decode(row.payload_json, `events.payload_json:${row.id}`)),
       }),
     );
   }
@@ -194,6 +165,44 @@ export class EventStore {
     const row = this.#db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM events").get();
     return row?.count ?? 0;
   }
+  #encryptLegacyPayloads(): void {
+    if (!this.#codec.enabled) return;
+    const transaction = this.#db.transaction(() => {
+      const events = this.#db
+        .query<{ id: string; payload_json: string }, []>("SELECT id, payload_json FROM events")
+        .all();
+      const updateEvent = this.#db.query("UPDATE events SET payload_json = ? WHERE id = ?");
+      for (const row of events) {
+        if (this.#codec.isEncrypted(row.payload_json)) continue;
+        updateEvent.run(
+          this.#codec.encode(row.payload_json, `events.payload_json:${row.id}`),
+          row.id,
+        );
+      }
+
+      const commands = this.#db
+        .query<{ id: string; payload_json: string; result_json: string }, []>(
+          "SELECT id, payload_json, result_json FROM commands",
+        )
+        .all();
+      const updateCommand = this.#db.query(
+        "UPDATE commands SET payload_json = ?, result_json = ? WHERE id = ?",
+      );
+      for (const row of commands) {
+        const payload = this.#codec.isEncrypted(row.payload_json)
+          ? row.payload_json
+          : this.#codec.encode(row.payload_json, `commands.payload_json:${row.id}`);
+        const result = this.#codec.isEncrypted(row.result_json)
+          ? row.result_json
+          : this.#codec.encode(row.result_json, `commands.result_json:${row.id}`);
+        if (payload !== row.payload_json || result !== row.result_json) {
+          updateCommand.run(payload, result, row.id);
+        }
+      }
+    });
+    transaction.immediate();
+  }
+
 
   close(): void {
     this.#db.close();
