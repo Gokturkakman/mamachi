@@ -133,6 +133,8 @@ describe("RealtimeBridge", () => {
       "inspect_workspace",
       "research_web",
       "set_overlay",
+      "control_computer",
+      "mute_mamachi",
       "get_workspace",
       "wait_for_user",
     ]);
@@ -846,6 +848,102 @@ describe("RealtimeBridge", () => {
     await followUpRequested.promise;
 
     expect(emitted).toContainEqual({ type: "ui.overlay", payload: { expanded: true } });
+    expect(responseCreates).toBe(2);
+    await bridge.disconnect();
+  });
+
+  test("runs an allowlisted computer action and then mutes without a spoken follow-up", async () => {
+    let responseCreates = 0;
+    let controlledAction = "";
+    const computerControlled = Promise.withResolvers<void>();
+    const muted = Promise.withResolvers<void>();
+    const idle = Promise.withResolvers<void>();
+    const emitted: Array<{ type: string; payload: unknown }> = [];
+    server = Bun.serve<MockClientData>({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request, bunServer) {
+        const upgraded = bunServer.upgrade(request, { data: { authenticated: true } });
+        return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
+      },
+      websocket: {
+        open() {},
+        message(socket, message) {
+          if (typeof message !== "string") return;
+          const event = JSON.parse(message) as Record<string, unknown>;
+          if (event["type"] === "session.update") {
+            socket.send(JSON.stringify({ type: "session.updated", session: { id: "session_controls" } }));
+          } else if (event["type"] === "response.create") {
+            responseCreates += 1;
+            if (responseCreates === 1) {
+              socket.send(
+                JSON.stringify({
+                  type: "response.done",
+                  response: {
+                    status: "completed",
+                    output: [{
+                      type: "function_call",
+                      call_id: "computer_call",
+                      name: "control_computer",
+                      arguments: JSON.stringify({ action: "open_system_settings" }),
+                    }],
+                  },
+                }),
+              );
+            } else if (responseCreates === 2) {
+              socket.send(
+                JSON.stringify({
+                  type: "response.done",
+                  response: {
+                    status: "completed",
+                    output: [{
+                      type: "function_call",
+                      call_id: "mute_call",
+                      name: "mute_mamachi",
+                      arguments: "{}",
+                    }],
+                  },
+                }),
+              );
+            }
+          }
+        },
+      },
+    });
+    const bridge = new RealtimeBridge({
+      apiKey: "test-realtime-key",
+      endpoint: `ws://127.0.0.1:${server.port}/realtime`,
+      getWorkspace: () => "/tmp/mamachi-workspace",
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      executeCommand: async () => {
+        throw new Error("computer and app controls must not execute a coding command");
+      },
+      controlComputer: async (action) => {
+        controlledAction = action;
+        return { status: "ok", action, target: "System Settings" };
+      },
+      emit: (type, payload) => {
+        emitted.push({ type, payload });
+        if (type === "computer.control") computerControlled.resolve();
+        if (type === "ui.mute") muted.resolve();
+        if (type === "voice.state" && isRecord(payload) && payload["state"] === "idle") idle.resolve();
+      },
+      emitAudio: () => {},
+    });
+
+    await bridge.connect();
+    bridge.sendText("Open System Settings, then mute.");
+    await computerControlled.promise;
+    await muted.promise;
+    await idle.promise;
+    await Bun.sleep(10);
+
+    expect(controlledAction).toBe("open_system_settings");
+    expect(emitted).toContainEqual({
+      type: "computer.control",
+      payload: { status: "ok", action: "open_system_settings", target: "System Settings" },
+    });
+    expect(emitted).toContainEqual({ type: "ui.mute", payload: {} });
     expect(responseCreates).toBe(2);
     await bridge.disconnect();
   });

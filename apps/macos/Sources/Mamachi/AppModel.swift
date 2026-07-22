@@ -175,9 +175,7 @@ final class AppModel: ObservableObject {
             return
         }
         if isEngaged {
-            isEngaged = false
-            audio.stopCapture()
-            if voiceState == .listening { voiceState = .connected }
+            muteMicrophone()
             return
         }
         isEngaged = true
@@ -186,6 +184,17 @@ final class AppModel: ObservableObject {
             startMicrophone()
         } else {
             connectVoice()
+        }
+    }
+
+    func muteMicrophone() {
+        isEngaged = false
+        audio.stopCapture()
+        microphoneLevel = 0
+        audio.clearPlayback()
+        resetBargeInDetection()
+        if voiceState != .disconnected && voiceState != .error {
+            voiceState = .connected
         }
     }
 
@@ -430,6 +439,8 @@ final class AppModel: ObservableObject {
                 drawerExpanded = expanded
                 if expanded { onShowOverlay?() }
             }
+        case "ui.mute":
+            muteMicrophone()
         case "voice.interrupt":
             audio.clearPlayback()
         case "voice.error":

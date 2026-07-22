@@ -2,6 +2,7 @@ import WebSocket, { type RawData } from "ws";
 import type { ActionResult, DomainEvent } from "@mamachi/protocol";
 import type { ControllerSnapshot, TaskRecord } from "./domain.ts";
 import type { CapturedContext } from "./artifact-store.ts";
+import { computerActions, type ComputerAction, type ComputerControlResult } from "./computer-control.ts";
 export type RealtimeResponseMode = "voice" | "text";
 
 interface RealtimeBridgeOptions {
@@ -12,6 +13,7 @@ interface RealtimeBridgeOptions {
   getWorkspace: () => string;
   getSnapshot: () => ControllerSnapshot;
   executeCommand: (command: unknown) => Promise<ActionResult>;
+  controlComputer?: (action: ComputerAction) => Promise<ComputerControlResult>;
   emit: (type: string, payload: unknown) => void;
   emitAudio: (pcm: Uint8Array) => void;
 }
@@ -359,6 +361,12 @@ Do not speak before any tool call. Status checks, interface controls, workspace 
 # Interface control
 When the user says "expand", asks to open the orb, or asks to show the conversation or current task, call set_overlay with action "expand". When the user asks to collapse, minimize, or return to the orb, call set_overlay with action "collapse".
 
+# Computer control
+For an explicit request to open Google Chrome, open System Settings, or play or pause a song in a running Spotify or Music app, call control_computer immediately and silently. These are the only computer actions available. Use media_play_pause for music playback, never control_task. Report a rejected result accurately.
+
+# Microphone control
+When the user says "mute", "go to sleep", "stop listening", or otherwise explicitly asks Mamachi to stop listening, call mute_mamachi immediately and silently. Do not acknowledge afterward because the microphone will be disengaged. The user can resume with the hotkey or orb.
+
 # Course correction
 A clarification or changed requirement must use revise_task. Before calling it, summarize the revised objective and obtain explicit confirmation. The tool safely pauses, versions the task, and resumes it. Never describe a revision as applied before the tool succeeds.
 
@@ -476,6 +484,25 @@ ${this.#options.getWorkspace()}
           },
           required: ["action"],
         },
+      },
+      {
+        type: "function",
+        name: "control_computer",
+        description: "Perform one explicit, allowlisted macOS action: open Chrome, open System Settings, or toggle Spotify/Music playback.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            action: { type: "string", enum: computerActions },
+          },
+          required: ["action"],
+        },
+      },
+      {
+        type: "function",
+        name: "mute_mamachi",
+        description: "Immediately and silently stop Mamachi from listening until the user resumes with the hotkey or orb.",
+        parameters: { type: "object", additionalProperties: false, properties: {}, required: [] },
       },
       {
         type: "function",
@@ -630,6 +657,12 @@ ${this.#options.getWorkspace()}
         },
       });
     }
+    if (calls.some((call) => call.name === "mute_mamachi")) {
+      this.#toolChainDepth = 0;
+      this.#responsePending = false;
+      this.#options.emit("voice.state", { state: "idle" });
+      return;
+    }
     if (calls.every((call) => call.name === "wait_for_user")) {
       this.#toolChainDepth = 0;
       if (this.#responsePending) {
@@ -754,6 +787,27 @@ ${this.#options.getWorkspace()}
         this.#options.emit("ui.overlay", { expanded });
         return { status: "ok", expanded };
       }
+      case "control_computer": {
+        const action = requireString(input["action"], "action");
+        if (!computerActions.includes(action as ComputerAction)) {
+          throw new Error(`Unsupported computer action: ${action}`);
+        }
+        if (!this.#options.controlComputer) {
+          return {
+            status: "rejected",
+            action,
+            code: "computer_control_unavailable",
+            explanation: "Computer control is unavailable in this Mamachi runtime",
+          };
+        }
+        const result = await this.#options.controlComputer(action as ComputerAction);
+        this.#options.emit("computer.control", result);
+        return result;
+      }
+      case "mute_mamachi":
+        if (Object.keys(input).length !== 0) throw new Error("mute_mamachi does not accept arguments");
+        this.#options.emit("ui.mute", {});
+        return { status: "ok", muted: true };
       case "control_task": {
         const task = this.#resolveTask(input["taskId"]);
         if (!task) throw new Error("No matching task exists");

@@ -4,6 +4,7 @@ import { MamachiIpcServer } from "./ipc-server.ts";
 import { OmpRunner } from "./omp-runner.ts";
 import { RealtimeBridge } from "./realtime-bridge.ts";
 import { defaultRuntimeSettings, type RuntimeSettings } from "./model-router.ts";
+import { controlMacComputer } from "./computer-control.ts";
 
 const token = process.env["MAMACHI_TOKEN"] ?? Bun.randomUUIDv7();
 const port = Number.parseInt(process.env["MAMACHI_PORT"] ?? "47821", 10);
@@ -49,6 +50,7 @@ realtime = new RealtimeBridge({
   getWorkspace: () => daemon.workspace,
   getSnapshot: () => daemon.snapshot(),
   executeCommand: (command) => daemon.executeCommand(command),
+  controlComputer: controlMacComputer,
   emit: (type, payload) => daemon.emit(type, payload),
   emitAudio: (pcm) => daemon.emitAudio(pcm),
 });
