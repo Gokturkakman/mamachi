@@ -156,6 +156,16 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       task.updatedAt = event.at;
       break;
     }
+    case "task.awaitingUser": {
+      const task = requiredTask(state, requireTaskId(event));
+      const run = requiredRun(state, event.payload.runId);
+      run.state = "paused";
+      run.endedAt = event.at;
+      task.state = "awaiting_user";
+      task.activeRunId = null;
+      task.updatedAt = event.at;
+      break;
+    }
     case "task.specRevised": {
       const task = requiredTask(state, requireTaskId(event));
       task.spec = event.payload.spec;

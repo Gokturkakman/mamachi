@@ -46,7 +46,7 @@ export type TaskSpec = FromSchema<typeof TaskSpecSchema>;
 
 const commandBaseProperties = {
   id: IdSchema,
-  actor: { enum: ["user", "voice", "ui", "vscode"] },
+  actor: { enum: ["user", "voice", "ui", "vscode", "coder"] },
 } as const;
 
 const taskIdentityPayloadProperties = {
@@ -213,6 +213,15 @@ export const EventPayloadSchemas = {
     },
     required: ["runId", "reason"],
   },
+  "task.awaitingUser": {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      runId: IdSchema,
+      question: { type: "string", minLength: 1 },
+    },
+    required: ["runId", "question"],
+  },
   "task.specRevised": {
     type: "object",
     additionalProperties: false,
@@ -292,6 +301,7 @@ export interface EventPayloadByType {
   "task.started": FromSchema<(typeof EventPayloadSchemas)["task.started"]>;
   "task.pauseRequested": FromSchema<(typeof EventPayloadSchemas)["task.pauseRequested"]>;
   "task.paused": FromSchema<(typeof EventPayloadSchemas)["task.paused"]>;
+  "task.awaitingUser": FromSchema<(typeof EventPayloadSchemas)["task.awaitingUser"]>;
   "task.specRevised": FromSchema<(typeof EventPayloadSchemas)["task.specRevised"]>;
   "task.resumed": FromSchema<(typeof EventPayloadSchemas)["task.resumed"]>;
   "task.completed": FromSchema<(typeof EventPayloadSchemas)["task.completed"]>;

@@ -6,6 +6,7 @@ import { parseCommand, type ActionResult, type DomainEvent } from "@mamachi/prot
 import { TaskController } from "./controller.ts";
 import { EventStore } from "./event-store.ts";
 import { ArtifactStore, type CapturedContext, type ContextKind } from "./artifact-store.ts";
+import { parseRuntimeSettings, type RuntimeSettings } from "./model-router.ts";
 
 interface ClientData {
   id: string;
@@ -22,10 +23,12 @@ interface RequestEnvelope {
     | "workspace.focus"
     | "context.capture"
     | "command.execute"
+    | "settings.update"
     | "voice.connect"
     | "voice.disconnect"
     | "voice.interrupt"
-    | "voice.text";
+    | "voice.text"
+    | "voice.mode";
   payload: unknown;
 }
 
@@ -33,10 +36,12 @@ export interface DaemonHooks {
   onAudioInput?: (pcm: Uint8Array) => void;
   onTaskEvents?: (events: DomainEvent[]) => void | Promise<void>;
   onContextCaptured?: (context: CapturedContext) => void;
+  onSettingsUpdate?: (settings: RuntimeSettings) => void;
   onVoiceConnect?: (apiKey?: string) => void | Promise<void>;
   onVoiceDisconnect?: () => void | Promise<void>;
   onVoiceInterrupt?: () => void;
   onVoiceText?: (text: string) => void | Promise<void>;
+  onVoiceMode?: (mode: "voice" | "text") => void;
 }
 
 export interface IpcServerOptions {
@@ -70,10 +75,12 @@ function parseRequest(input: unknown): RequestEnvelope {
     "workspace.focus",
     "context.capture",
     "command.execute",
+    "settings.update",
     "voice.connect",
     "voice.disconnect",
     "voice.interrupt",
     "voice.text",
+    "voice.mode",
   ]);
   if (!supported.has(input["type"])) throw new Error(`Unsupported IPC request type: ${input["type"]}`);
   return input as unknown as RequestEnvelope;
@@ -177,6 +184,13 @@ export class MamachiIpcServer {
   async pauseAtSafeBoundary(taskId: string, reason?: string): Promise<ActionResult> {
     const beforeSeq = this.#controller.snapshot().seq;
     const result = this.#controller.pauseAtSafeBoundary(Bun.randomUUIDv7(), taskId, reason);
+    await this.#publishControllerEvents(beforeSeq);
+    return result;
+  }
+
+  async awaitUserInput(taskId: string, question: string): Promise<ActionResult> {
+    const beforeSeq = this.#controller.snapshot().seq;
+    const result = this.#controller.awaitUserInput(Bun.randomUUIDv7(), taskId, question);
     await this.#publishControllerEvents(beforeSeq);
     return result;
   }
@@ -332,6 +346,12 @@ export class MamachiIpcServer {
         }
         return this.executeCommand(request.payload["command"]);
       }
+      case "settings.update": {
+        const settings = parseRuntimeSettings(request.payload);
+        this.#hooks.onSettingsUpdate?.(settings);
+        this.emit("settings.updated", settings);
+        return settings;
+      }
       case "voice.connect": {
         if (!isObject(request.payload) || !hasOnlyKeys(request.payload, ["apiKey"])) {
           throw new Error("voice.connect payload is invalid");
@@ -342,6 +362,17 @@ export class MamachiIpcServer {
         }
         await this.#hooks.onVoiceConnect?.(apiKey);
         return { connected: true };
+      }
+      case "voice.mode": {
+        if (
+          !isObject(request.payload) ||
+          !hasOnlyKeys(request.payload, ["mode"]) ||
+          !(request.payload["mode"] === "voice" || request.payload["mode"] === "text")
+        ) {
+          throw new Error("voice.mode requires mode voice or text");
+        }
+        this.#hooks.onVoiceMode?.(request.payload["mode"]);
+        return { mode: request.payload["mode"] };
       }
       case "voice.disconnect":
         this.#assertEmptyPayload(request.payload);

@@ -2,6 +2,7 @@ import WebSocket, { type RawData } from "ws";
 import type { ActionResult, DomainEvent } from "@mamachi/protocol";
 import type { ControllerSnapshot, TaskRecord } from "./domain.ts";
 import type { CapturedContext } from "./artifact-store.ts";
+export type RealtimeResponseMode = "voice" | "text";
 
 interface RealtimeBridgeOptions {
   apiKey?: string;
@@ -52,6 +53,8 @@ export class RealtimeBridge {
   #responsePending = false;
   #suppressAudio = false;
   #cancellationRequested = false;
+  #responseMode: RealtimeResponseMode = "voice";
+  #pendingResponseMode: RealtimeResponseMode | null = null;
   #toolChainDepth = 0;
 
   constructor(options: RealtimeBridgeOptions) {
@@ -174,6 +177,17 @@ export class RealtimeBridge {
     this.#options.emit("voice.state", { state: "listening" });
   }
 
+  setResponseMode(mode: RealtimeResponseMode): void {
+    if (this.#responseActive) {
+      this.#pendingResponseMode = mode;
+      return;
+    }
+    this.#responseMode = mode;
+    this.#pendingResponseMode = null;
+    if (this.#socket?.readyState === WebSocket.OPEN) this.#send(this.#sessionUpdate());
+    this.#options.emit("voice.mode", { mode });
+  }
+
   sendText(text: string): void {
     const normalized = text.trim();
     if (!normalized) return;
@@ -202,6 +216,7 @@ export class RealtimeBridge {
         "task.started",
         "task.pauseRequested",
         "task.paused",
+        "task.awaitingUser",
         "task.specRevised",
         "task.resumed",
         "task.completed",
@@ -280,7 +295,7 @@ export class RealtimeBridge {
       session: {
         type: "realtime",
         model: this.#model,
-        output_modalities: ["audio"],
+        output_modalities: [this.#responseMode === "voice" ? "audio" : "text"],
         instructions: this.#instructions(),
         reasoning: { effort: "low" },
         audio: {
@@ -321,6 +336,9 @@ Brainstorming, hypotheticals, examples, and side discussion are non-operative. F
 
 # Active work
 Coding continues after submit_task returns. Stay available for unrelated conversation. For status, use get_task_status. Do not narrate routine tools. Surface blockers, consequential changes, requested status, and completion.
+
+# Web research
+For current facts or web lookup, call research_web instead of answering from memory. Research runs through the coding agent and must return source URLs.
 
 # Course correction
 A clarification or changed requirement must use revise_task. Before calling it, summarize the revised objective and obtain explicit confirmation. The tool safely pauses, versions the task, and resumes it. Never describe a revision as applied before the tool succeeds.
@@ -401,6 +419,20 @@ ${this.#options.getWorkspace()}
       },
       {
         type: "function",
+        name: "research_web",
+        description: "Delegate a current-information or web-research request to the coding agent.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            query: { type: "string", minLength: 1 },
+            deliverable: { type: "string", minLength: 1 },
+          },
+          required: ["query", "deliverable"],
+        },
+      },
+      {
+        type: "function",
         name: "get_workspace",
         description: "Return the selected workspace path.",
         parameters: { type: "object", additionalProperties: false, properties: {}, required: [] },
@@ -460,9 +492,23 @@ ${this.#options.getWorkspace()}
       if (typeof event["transcript"] === "string") {
         this.#options.emit("voice.transcript.assistant", { text: event["transcript"] });
       }
+    } else if (type === "response.output_text.delta") {
+      if (typeof event["delta"] === "string") {
+        this.#options.emit("voice.transcript.assistant_delta", { text: event["delta"] });
+      }
+    } else if (type === "response.output_text.done") {
+      if (typeof event["text"] === "string") {
+        this.#options.emit("voice.transcript.assistant", { text: event["text"] });
+      }
     } else if (type === "response.done") {
       this.#responseActive = false;
       this.#cancellationRequested = false;
+      if (this.#pendingResponseMode) {
+        this.#responseMode = this.#pendingResponseMode;
+        this.#pendingResponseMode = null;
+        this.#send(this.#sessionUpdate());
+        this.#options.emit("voice.mode", { mode: this.#responseMode });
+      }
       await this.#handleResponseDone(event);
     } else if (type === "error") {
       const message = this.#errorMessage(event);
@@ -593,6 +639,31 @@ ${this.#options.getWorkspace()}
         }
         return { ...result, attachmentIds };
       }
+      case "research_web": {
+        const query = requireString(input["query"], "query");
+        const deliverable = requireString(input["deliverable"], "deliverable");
+        return this.#options.executeCommand({
+          id: Bun.randomUUIDv7(),
+          type: "task.submit",
+          actor: "voice",
+          expectedRevision: null,
+          payload: {
+            repositoryId: this.#options.getWorkspace(),
+            objective: `Research the web for: ${query}`,
+            acceptanceCriteria: [
+              deliverable,
+              "Use current authoritative sources and include their URLs.",
+              "Clearly distinguish confirmed facts from inference.",
+            ],
+            constraints: [
+              "Research only; do not modify workspace files.",
+              "Use the coding agent's web_search and read tools rather than relying on model memory.",
+            ],
+            attachmentIds: [],
+            codingProfileId: "fast",
+          },
+        });
+      }
       case "get_task_status": {
         const task = this.#resolveTask(input["taskId"]);
         if (!task) return { status: "idle", queue: this.#options.getSnapshot().queue };
@@ -650,7 +721,9 @@ ${this.#options.getWorkspace()}
     if (task.state === "running" || task.state === "pause_requested") {
       task = await this.#waitForTaskState(task.id, "paused", 60_000);
     }
-    if (task.state !== "paused") throw new Error(`Task cannot be revised from ${task.state}`);
+    if (!(task.state === "paused" || task.state === "awaiting_user")) {
+      throw new Error(`Task cannot be revised from ${task.state}`);
+    }
 
     const revised = await this.#options.executeCommand({
       id: Bun.randomUUIDv7(),

@@ -20,13 +20,24 @@ final class AppModel: ObservableObject {
     @Published var hasAPIKey = false
     @Published var needsAPIKey = false
     @Published var drawerExpanded = false
+    @Published var interactionMode: InteractionMode
+    @Published var primaryCodingModel: String
+    @Published var fastCodingModel: String
+    @Published var codingThinkingLevel: String
+    @Published var automaticModelRouting: Bool
+    @Published var notifyOnAttention: Bool
+    @Published var notifyOnCompletion: Bool
+    @Published var reactionSoundsEnabled: Bool
+    @Published var attentionMessage: String?
     var onOpenSettings: (() -> Void)?
+    var onShowOverlay: (() -> Void)?
 
     private let daemon = DaemonProcess()
     private let ipc = IpcClient()
     private let audio = AudioService()
     private let keychain = KeychainStore()
     private let transcriptStore: TranscriptStore?
+    private let reactions = ReactionService()
     private var started = false
     private var pendingText: String?
     private var resumeEngagementAfterKey = false
@@ -40,6 +51,24 @@ final class AppModel: ObservableObject {
     }
 
     init() {
+        let defaults = UserDefaults.standard
+        interactionMode = InteractionMode(rawValue: defaults.string(forKey: "interactionMode") ?? "") ?? .voice
+        primaryCodingModel = defaults.string(forKey: "primaryCodingModel") ?? ""
+        fastCodingModel = defaults.string(forKey: "fastCodingModel") ?? "openai-codex/gpt-5.4-mini"
+        codingThinkingLevel = defaults.string(forKey: "codingThinkingLevel") ?? "inherit"
+        automaticModelRouting = defaults.object(forKey: "automaticModelRouting") == nil
+            ? true
+            : defaults.bool(forKey: "automaticModelRouting")
+        notifyOnAttention = defaults.object(forKey: "notifyOnAttention") == nil
+            ? true
+            : defaults.bool(forKey: "notifyOnAttention")
+        notifyOnCompletion = defaults.object(forKey: "notifyOnCompletion") == nil
+            ? true
+            : defaults.bool(forKey: "notifyOnCompletion")
+        reactionSoundsEnabled = defaults.object(forKey: "reactionSoundsEnabled") == nil
+            ? true
+            : defaults.bool(forKey: "reactionSoundsEnabled")
+        attentionMessage = nil
         transcriptStore = try? TranscriptStore()
         transcripts = (try? transcriptStore?.load()) ?? []
         hasAPIKey = ((try? keychain.loadAPIKey()) ?? nil) != nil
@@ -68,6 +97,10 @@ final class AppModel: ObservableObject {
         audio.onLevel = { [weak self] level in self?.handleMicrophoneLevel(level) }
         audio.onError = { [weak self] error in self?.errorMessage = "Audio playback failed: \(error.localizedDescription)" }
         audio.onPlaybackDrained = { [weak self] in self?.resumeMicrophoneIfReady() }
+        reactions.onOpen = { [weak self] in
+            self?.drawerExpanded = true
+            self?.onShowOverlay?()
+        }
     }
 
     func start() {
@@ -82,6 +115,7 @@ final class AppModel: ObservableObject {
                 errorMessage = error.localizedDescription
             }
         }
+        if notifyOnAttention || notifyOnCompletion { reactions.requestAuthorization() }
     }
 
     func stop() {
@@ -92,7 +126,50 @@ final class AppModel: ObservableObject {
         daemon.stop()
     }
 
+    func setInteractionMode(_ mode: InteractionMode) {
+        interactionMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: "interactionMode")
+        if mode == .text {
+            isEngaged = false
+            audio.stopCapture()
+            if voiceState == .listening { voiceState = .connected }
+        }
+        if daemonConnected {
+            ipc.sendRequest(type: "voice.mode", payload: ["mode": mode.rawValue])
+        }
+    }
+
+    func updateRuntimeSettings(
+        primaryModel: String,
+        fastModel: String,
+        thinkingLevel: String,
+        automaticRouting: Bool
+    ) {
+        primaryCodingModel = primaryModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        fastCodingModel = fastModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        codingThinkingLevel = thinkingLevel
+        automaticModelRouting = automaticRouting
+        let defaults = UserDefaults.standard
+        defaults.set(primaryCodingModel, forKey: "primaryCodingModel")
+        defaults.set(fastCodingModel, forKey: "fastCodingModel")
+        defaults.set(codingThinkingLevel, forKey: "codingThinkingLevel")
+        defaults.set(automaticModelRouting, forKey: "automaticModelRouting")
+        syncRuntimeSettings()
+    }
+
+    func updateReactionSettings(attention: Bool, completion: Bool, sounds: Bool) {
+        notifyOnAttention = attention
+        notifyOnCompletion = completion
+        reactionSoundsEnabled = sounds
+        let defaults = UserDefaults.standard
+        defaults.set(attention, forKey: "notifyOnAttention")
+        defaults.set(completion, forKey: "notifyOnCompletion")
+        defaults.set(sounds, forKey: "reactionSoundsEnabled")
+        if attention || completion { reactions.requestAuthorization() }
+    }
+
     func toggleEngagement() {
+        if interactionMode == .text { setInteractionMode(.voice) }
         if isEngaged && voiceState == .speaking {
             bargeIn()
             return
@@ -123,7 +200,7 @@ final class AppModel: ObservableObject {
                 resumeEngagementAfterKey = isEngaged
                 isEngaged = false
                 needsAPIKey = true
-                errorMessage = "Add an OpenAI API key to start voice."
+                errorMessage = "Add an OpenAI API key to connect."
                 openSettings()
                 return
             }
@@ -313,6 +390,7 @@ final class AppModel: ObservableObject {
         switch type {
         case "server.ready":
             daemonConnected = true
+            syncRuntimeSettings()
             applySnapshot(payload["snapshot"] as? [String: Any])
         case "response":
             if payload["ok"] as? Bool == false {
@@ -322,6 +400,8 @@ final class AppModel: ObservableObject {
                     isEngaged = false
                 }
             }
+        case "domain.event":
+            handleDomainEvent(payload)
         case "state.snapshot":
             applySnapshot(payload["snapshot"] as? [String: Any])
         case "workspace.changed":
@@ -341,6 +421,10 @@ final class AppModel: ObservableObject {
             }
         case "voice.state":
             applyVoiceState(payload["state"] as? String)
+        case "voice.mode":
+            if let mode = payload["mode"] as? String, let interactionMode = InteractionMode(rawValue: mode) {
+                self.interactionMode = interactionMode
+            }
         case "voice.interrupt":
             audio.clearPlayback()
         case "voice.error":
@@ -360,8 +444,65 @@ final class AppModel: ObservableObject {
                 liveAssistantTranscript = ""
                 appendTranscript(speaker: .mamachi, text: text)
             }
-        case "coder.initializing", "coder.ready", "coder.running", "coder.tool_started", "coder.tool_finished", "coder.message":
+        case "coder.initializing", "coder.routed", "coder.ready", "coder.running", "coder.tool_started", "coder.tool_finished", "coder.message", "coder.needs_attention":
             applyCoderActivity(type: type, payload: payload)
+        default:
+            break
+        }
+    }
+
+    private func syncRuntimeSettings() {
+        guard daemonConnected else { return }
+        ipc.sendRequest(
+            type: "settings.update",
+            payload: [
+                "primaryModel": primaryCodingModel,
+                "fastModel": fastCodingModel,
+                "thinkingLevel": codingThinkingLevel,
+                "automaticRouting": automaticModelRouting,
+            ]
+        )
+        ipc.sendRequest(type: "voice.mode", payload: ["mode": interactionMode.rawValue])
+    }
+
+    private func handleDomainEvent(_ event: [String: Any]) {
+        guard let type = event["type"] as? String else { return }
+        let taskId = event["taskId"] as? String
+        let detail = event["payload"] as? [String: Any] ?? [:]
+        let objective = taskId.flatMap { id in tasks.first(where: { $0.id == id })?.objective } ?? "Coding task"
+        switch type {
+        case "task.awaitingUser":
+            guard let question = detail["question"] as? String else { return }
+            attentionMessage = question
+            reactions.notify(
+                id: "attention-\(taskId ?? ProtocolID.makeV7())",
+                title: "Coder needs your input",
+                body: question,
+                notificationsEnabled: notifyOnAttention,
+                soundEnabled: reactionSoundsEnabled
+            )
+        case "task.completed":
+            attentionMessage = nil
+            let summary = detail["summary"] as? String ?? objective
+            reactions.notify(
+                id: "completed-\(taskId ?? ProtocolID.makeV7())",
+                title: "Coding task finished",
+                body: String(summary.prefix(220)),
+                notificationsEnabled: notifyOnCompletion,
+                soundEnabled: reactionSoundsEnabled
+            )
+        case "task.failed":
+            attentionMessage = nil
+            let error = detail["error"] as? String ?? objective
+            reactions.notify(
+                id: "failed-\(taskId ?? ProtocolID.makeV7())",
+                title: "Coding task failed",
+                body: String(error.prefix(220)),
+                notificationsEnabled: notifyOnCompletion,
+                soundEnabled: reactionSoundsEnabled
+            )
+        case "task.resumed", "task.cancelled":
+            attentionMessage = nil
         default:
             break
         }
@@ -416,6 +557,15 @@ final class AppModel: ObservableObject {
     private func applyCoderActivity(type: String, payload: [String: Any]) {
         guard let taskId = payload["taskId"] as? String, let index = tasks.firstIndex(where: { $0.id == taskId }) else { return }
         let summary: String
+        if let question = payload["question"] as? String {
+            tasks[index].recentActivity = "Needs input: \(String(question.prefix(450)))"
+            return
+        }
+        if let tier = payload["tier"] as? String {
+            let model = payload["model"] as? String ?? "OMP default"
+            tasks[index].recentActivity = "\(tier.capitalized) route · \(model)"
+            return
+        }
         if let toolName = payload["toolName"] as? String {
             summary = type == "coder.tool_started" ? "Running \(toolName)" : "Finished \(toolName)"
         } else if let text = payload["text"] as? String {

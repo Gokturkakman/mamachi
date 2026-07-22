@@ -84,6 +84,36 @@ export class TaskController {
     return execution.result;
   }
 
+  awaitUserInput(signalId: string, taskId: string, question: string): ActionResult {
+    const execution = this.#store.executeCommand(
+      {
+        id: signalId,
+        type: "internal.task.awaitingUser",
+        actor: "coder",
+        expectedRevision: null,
+        payload: { taskId, question },
+        createdAt: this.#now(),
+      },
+      () => {
+        const task = this.#state.tasks.get(taskId);
+        if (!task) return this.#reject("task_not_found", `Task ${taskId} does not exist`);
+        if (task.id !== this.#state.activeTaskId || task.state !== "running" || !task.activeRunId) {
+          return this.#reject("invalid_state", `Task ${taskId} is not running`);
+        }
+        const event = this.#event(
+          "task.awaitingUser",
+          { runId: task.activeRunId, question },
+          signalId,
+          task,
+          task.activeRunId,
+        );
+        return this.#accept([event], task.id);
+      },
+    );
+    for (const event of execution.events) applyEvent(this.#state, event);
+    return execution.result;
+  }
+
   completeTask(signalId: string, taskId: string, summary: string, evidenceIds: string[]): ActionResult {
     return this.#finishTask(signalId, taskId, "completed", summary, evidenceIds);
   }
@@ -213,8 +243,8 @@ export class TaskController {
     if (!task) return this.#reject("task_not_found", `Task ${command.payload.taskId} does not exist`);
     const revisionConflict = this.#checkRevision(task, command.expectedRevision);
     if (revisionConflict) return revisionConflict;
-    if (task.state !== "paused" || task.id !== this.#state.activeTaskId) {
-      return this.#reject("invalid_state", `Task ${task.id} must be paused before revision`);
+    if (!(task.state === "paused" || task.state === "awaiting_user") || task.id !== this.#state.activeTaskId) {
+      return this.#reject("invalid_state", `Task ${task.id} must be paused or awaiting input before revision`);
     }
     if (command.payload.spec.repositoryId !== task.repositoryId) {
       return this.#reject("repository_immutable", "A task revision cannot retarget its repository");
@@ -239,8 +269,8 @@ export class TaskController {
     if (!task) return this.#reject("task_not_found", `Task ${command.payload.taskId} does not exist`);
     const revisionConflict = this.#checkRevision(task, command.expectedRevision);
     if (revisionConflict) return revisionConflict;
-    if (task.state !== "paused" || task.id !== this.#state.activeTaskId) {
-      return this.#reject("invalid_state", `Task ${task.id} does not own a paused active slot`);
+    if (!(task.state === "paused" || task.state === "awaiting_user") || task.id !== this.#state.activeTaskId) {
+      return this.#reject("invalid_state", `Task ${task.id} does not own a resumable active slot`);
     }
 
     const runId = this.#createId();

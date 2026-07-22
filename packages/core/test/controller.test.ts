@@ -246,4 +246,37 @@ describe("TaskController", () => {
       store.close();
     }
   });
+
+  test("reacts to a coder question with a resumable awaiting-user state", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const taskId = submit(controller);
+      const awaiting = controller.awaitUserInput(
+        Bun.randomUUIDv7(),
+        taskId,
+        "Which deployment target should I use?",
+      );
+      expect(awaiting.status).toBe("accepted");
+      let snapshot = controller.snapshot();
+      expect(snapshot.activeTaskId).toBe(taskId);
+      expect(snapshot.tasks[0]?.state).toBe("awaiting_user");
+      expect(snapshot.runs[0]?.state).toBe("paused");
+      expect(controller.eventsAfter().at(-1)?.type).toBe("task.awaitingUser");
+
+      const resumed = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.resume",
+        actor: "ui",
+        expectedRevision: 1,
+        payload: { taskId },
+      });
+      expect(resumed.status).toBe("accepted");
+      snapshot = controller.snapshot();
+      expect(snapshot.tasks[0]?.state).toBe("running");
+      expect(snapshot.runs).toHaveLength(2);
+    } finally {
+      store.close();
+    }
+  });
 });

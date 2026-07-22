@@ -16,6 +16,14 @@ struct MenuBarView: View {
             }
             .keyboardShortcut(.space, modifiers: [.command, .shift])
 
+            Button {
+                model.setInteractionMode(.text)
+                model.drawerExpanded = true
+                showOverlay()
+            } label: {
+                Label("Open Silent Chat", systemImage: "text.bubble")
+            }
+
             Button("Show Overlay", action: showOverlay)
             Button("Hide Overlay", action: hideOverlay)
 
@@ -32,11 +40,12 @@ struct MenuBarView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                if task.state == "paused" {
+                if task.state == "paused" || task.state == "awaiting_user" {
                     Button("Resume Coding") { model.controlActiveTask("resume") }
-                } else {
+                } else if task.state == "running" || task.state == "pause_requested" {
                     Button("Pause Coding") { model.controlActiveTask("pause") }
                 }
+                Button("Cancel Coding", role: .destructive) { model.controlActiveTask("cancel") }
             } else {
                 Text(model.daemonConnected ? "Coder idle" : "Starting daemon…")
                     .foregroundStyle(.secondary)

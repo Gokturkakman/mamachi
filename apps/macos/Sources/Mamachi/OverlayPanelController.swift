@@ -15,7 +15,7 @@ final class OverlayPanelController {
 
     init(model: AppModel) {
         panel = MamachiPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 528, height: 225),
+            contentRect: NSRect(x: 0, y: 0, width: 144, height: 144),
             styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -48,13 +48,15 @@ final class OverlayPanelController {
     }
 
     private func resize(expanded: Bool) {
-        let newHeight: CGFloat = expanded ? 680 : 225
+        let newSize = expanded
+            ? NSSize(width: 512, height: 652)
+            : NSSize(width: 144, height: 144)
         var frame = panel.frame
-        let delta = newHeight - frame.height
-        frame.origin.y -= delta / 2
-        frame.size.height = newHeight
+        frame.origin.x -= (newSize.width - frame.width) / 2
+        frame.origin.y -= (newSize.height - frame.height) / 2
+        frame.size = newSize
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.22
+            context.duration = 0.38
             context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             panel.animator().setFrame(frame, display: true)
         }

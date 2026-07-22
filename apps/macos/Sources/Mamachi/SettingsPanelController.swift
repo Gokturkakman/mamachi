@@ -7,7 +7,7 @@ final class SettingsPanelController {
 
     init(model: AppModel) {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 580, height: 500),
+            contentRect: NSRect(x: 0, y: 0, width: 580, height: 660),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false

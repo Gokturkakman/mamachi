@@ -8,43 +8,80 @@ struct ThinkingOrbView: View {
 
     let state: VoiceConnectionState
     let microphoneLevel: Double
-    var size: CGFloat = 88
+    var size: CGFloat
+
+    @State private var renderedMode: OrbMode
+    @State private var previousMode: OrbMode?
+    @State private var transitionStartedAt = Date.distantPast
+
+    init(state: VoiceConnectionState, microphoneLevel: Double, size: CGFloat = 88) {
+        self.state = state
+        self.microphoneLevel = microphoneLevel
+        self.size = size
+        _renderedMode = State(initialValue: Self.mode(for: state))
+    }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion || !isAnimated)) { timeline in
+        TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion || (!isAnimated && previousMode == nil))) { timeline in
             Canvas(rendersAsynchronously: true) { context, canvasSize in
                 let clock = reduceMotion ? 0.7 : timeline.date.timeIntervalSinceReferenceDate
                 let side = min(canvasSize.width, canvasSize.height)
-                let dots: [OrbDot]
-                switch mode {
-                case .solving:
-                    dots = OrbRenderer.solving(size: side, time: clock * 2.2)
-                case .listening:
-                    dots = OrbRenderer.wave(size: side, time: clock * 4.388, level: microphoneLevel)
-                case .thinking:
-                    dots = OrbRenderer.globe(size: side, time: clock * 2.015)
-                case .speaking:
-                    dots = OrbRenderer.ribbon(size: side, time: clock * 2.34)
-                case .idle:
-                    dots = OrbRenderer.wave(size: side, time: 0.7, level: 0.05)
+                let transition = reduceMotion
+                    ? 1
+                    : min(1, max(0, timeline.date.timeIntervalSince(transitionStartedAt) / 0.38))
+                let opacity = state == .disconnected ? 0.38 : 1
+
+                if let previousMode, transition < 1 {
+                    OrbRenderer.paint(
+                        dots(for: previousMode, size: side, clock: clock),
+                        into: &context,
+                        dark: colorScheme == .dark,
+                        opacity: opacity * (1 - transition)
+                    )
                 }
                 OrbRenderer.paint(
-                    dots,
+                    dots(for: renderedMode, size: side, clock: clock),
                     into: &context,
                     dark: colorScheme == .dark,
-                    opacity: state == .disconnected ? 0.38 : 1
+                    opacity: opacity * (previousMode == nil ? 1 : transition)
                 )
             }
         }
         .frame(width: size, height: size)
+        .onChange(of: Self.mode(for: state)) { _, nextMode in
+            guard nextMode != renderedMode else { return }
+            previousMode = renderedMode
+            renderedMode = nextMode
+            transitionStartedAt = Date()
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(400))
+                if renderedMode == nextMode { previousMode = nil }
+            }
+        }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
     }
 
-    private var mode: OrbMode {
+    private func dots(for mode: OrbMode, size: Double, clock: Double) -> [OrbDot] {
+        switch mode {
+        case .solving:
+            OrbRenderer.solving(size: size, time: clock * 2.2)
+        case .listening:
+            OrbRenderer.wave(size: size, time: clock * 4.388, level: microphoneLevel)
+        case .thinking:
+            OrbRenderer.globe(size: size, time: clock * 2.015)
+        case .speaking:
+            OrbRenderer.ribbon(size: size, time: clock * 2.34)
+        case .idle:
+            OrbRenderer.wave(size: size, time: 0.7, level: 0.05)
+        }
+    }
+
+    private static func mode(for state: VoiceConnectionState) -> OrbMode {
         switch state {
         case .listening: .listening
-        case .connecting, .thinking, .connected: .solving
+        case .connecting, .connected: .solving
+        case .thinking: .thinking
         case .speaking: .speaking
         case .disconnected, .error: .idle
         }

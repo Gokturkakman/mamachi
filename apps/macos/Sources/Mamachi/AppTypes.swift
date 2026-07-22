@@ -31,6 +31,15 @@ struct CapturedContextViewState: Identifiable, Equatable {
 }
 
 
+enum InteractionMode: String, CaseIterable, Identifiable {
+    case voice
+    case text
+
+    var id: String { rawValue }
+    var label: String { self == .voice ? "Voice" : "Chat" }
+    var systemImage: String { self == .voice ? "waveform" : "text.bubble" }
+}
+
 enum VoiceConnectionState: String {
     case disconnected
     case connecting

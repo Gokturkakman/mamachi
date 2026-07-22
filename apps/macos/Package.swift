@@ -16,6 +16,7 @@ let package = Package(
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("Carbon"),
                 .linkedFramework("Security"),
+                .linkedFramework("UserNotifications"),
             ]
         ),
         .testTarget(

@@ -2,10 +2,33 @@ import {
   createAgentSession,
   type AgentSession,
   type ExtensionFactory,
+  type CreateAgentSessionOptions,
 } from "@oh-my-pi/pi-coding-agent";
+import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ActionResult, DomainEvent } from "@mamachi/protocol";
 import type { TaskRecord } from "./domain.ts";
 import type { CapturedContext } from "./artifact-store.ts";
+import {
+  defaultRuntimeSettings,
+  resolveTaskRoute,
+  type RuntimeSettings,
+} from "./model-router.ts";
+
+function configuredThinkingLevel(
+  level: RuntimeSettings["thinkingLevel"],
+): NonNullable<CreateAgentSessionOptions["thinkingLevel"]> {
+  switch (level) {
+    case "inherit": return ThinkingLevel.Inherit;
+    case "auto": return "auto";
+    case "off": return ThinkingLevel.Off;
+    case "minimal": return ThinkingLevel.Minimal;
+    case "low": return ThinkingLevel.Low;
+    case "medium": return ThinkingLevel.Medium;
+    case "high": return ThinkingLevel.High;
+    case "xhigh": return ThinkingLevel.XHigh;
+    case "max": return ThinkingLevel.Max;
+  }
+}
 
 export interface OmpRunnerOptions {
   getTask: (taskId: string) => TaskRecord | undefined;
@@ -14,7 +37,8 @@ export interface OmpRunnerOptions {
   onSafePause: (taskId: string, reason: string) => Promise<ActionResult>;
   onComplete: (taskId: string, summary: string) => Promise<ActionResult>;
   onFail: (taskId: string, error: string) => Promise<ActionResult>;
-  modelPattern?: string;
+  onNeedInput: (taskId: string, question: string) => Promise<ActionResult>;
+  runtimeSettings?: RuntimeSettings;
 }
 
 export class OmpRunner {
@@ -25,9 +49,15 @@ export class OmpRunner {
   #generation = 0;
   #pauseRequested = false;
   #pauseAcknowledged = false;
+  #runtimeSettings: RuntimeSettings;
 
   constructor(options: OmpRunnerOptions) {
     this.#options = options;
+    this.#runtimeSettings = options.runtimeSettings ?? defaultRuntimeSettings;
+  }
+
+  configure(settings: RuntimeSettings): void {
+    this.#runtimeSettings = settings;
   }
 
   handleEvents(events: readonly DomainEvent[]): void {
@@ -76,6 +106,14 @@ export class OmpRunner {
     this.#taskId = taskId;
     this.#pauseRequested = task.state === "pause_requested";
     this.#pauseAcknowledged = false;
+    const route = resolveTaskRoute(task, this.#runtimeSettings);
+    this.#options.emit("coder.routed", {
+      taskId,
+      tier: route.tier,
+      model: route.modelPattern ?? null,
+      thinkingLevel: route.thinkingLevel,
+      reason: route.reason,
+    });
     this.#options.emit("coder.initializing", { taskId, repository: task.repositoryId });
 
     const safePauseExtension: ExtensionFactory = (pi) => {
@@ -93,7 +131,8 @@ export class OmpRunner {
     try {
       const created = await createAgentSession({
         cwd: task.repositoryId,
-        ...(this.#options.modelPattern ? { modelPattern: this.#options.modelPattern } : {}),
+        ...(route.modelPattern ? { modelPattern: route.modelPattern } : {}),
+        thinkingLevel: configuredThinkingLevel(route.thinkingLevel),
         extensions: [safePauseExtension],
         autoApprove: true,
         hasUI: false,
@@ -101,10 +140,12 @@ export class OmpRunner {
         enableIrc: false,
         skipPythonPreflight: true,
         appendSystemPrompt: [
-          "You are the coding executor in Mamachi, a voice-orchestrated harness.",
+          "You are the coding and research executor in Mamachi, a voice-orchestrated harness.",
           "Work autonomously inside the selected repository until the task is complete.",
           "Preserve pre-existing user changes. Do not commit, switch branches, or publish externally.",
-          "Use repository tools and verification. Give a concise final summary with files changed and checks run.",
+          "Use repository tools, including web_search for current information, and verify the result.",
+          "If one missing user decision makes further work unsafe, stop and reply exactly `MAMACHI_NEEDS_INPUT: <one concise question>`.",
+          "Otherwise give a concise final summary with files changed, sources when applicable, and checks run.",
         ].join("\n"),
       });
       if (generation !== this.#generation) {
@@ -201,6 +242,21 @@ export class OmpRunner {
       const summary = session.getLastAssistantText()?.trim();
       if (!summary) {
         await this.#options.onFail(task.id, "OMP ended without a final task summary");
+      } else if (summary.startsWith("MAMACHI_NEEDS_INPUT:")) {
+        const question = summary.slice("MAMACHI_NEEDS_INPUT:".length).trim();
+        if (!question) {
+          await this.#options.onFail(task.id, "OMP requested input without a question");
+        } else {
+          const result = await this.#options.onNeedInput(task.id, question);
+          if (result.status === "accepted") {
+            this.#options.emit("coder.needs_attention", { taskId: task.id, question });
+            return;
+          }
+          await this.#options.onFail(
+            task.id,
+            result.status === "rejected" ? result.explanation : "Could not pause for user input",
+          );
+        }
       } else {
         await this.#options.onComplete(task.id, summary);
       }

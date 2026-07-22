@@ -112,7 +112,8 @@ describe("RealtimeBridge", () => {
     expect(sawAuthorization).toBe(true);
     const update = incoming.find((event) => event["type"] === "session.update");
     expect(update).toBeDefined();
-    const session = update?.["session"] as Record<string, unknown>;
+    const session = update?.["session"];
+    if (!isRecord(session)) throw new Error("session.update did not include a session object");
     expect(session["output_modalities"]).toEqual(["audio"]);
     expect(session["parallel_tool_calls"]).toBe(false);
     expect(session["audio"]).toMatchObject({
@@ -122,11 +123,13 @@ describe("RealtimeBridge", () => {
       },
       output: { format: { type: "audio/pcm", rate: 24_000 }, voice: "marin" },
     });
-    expect((session["tools"] as Array<{ name: string }>).map((tool) => tool.name)).toEqual([
+    const tools = session["tools"];
+    expect(Array.isArray(tools) ? tools.map((tool) => isRecord(tool) ? tool["name"] : null) : []).toEqual([
       "submit_task",
       "get_task_status",
       "control_task",
       "revise_task",
+      "research_web",
       "get_workspace",
       "wait_for_user",
     ]);
@@ -458,6 +461,150 @@ describe("RealtimeBridge", () => {
     await resumedResponse.promise;
     expect(responseCreates).toBe(2);
     expect(errors).toEqual([]);
+    await bridge.disconnect();
+  });
+
+  test("switches future responses to silent text without cutting the active response", async () => {
+    let client: ServerWebSocket<MockClientData> | undefined;
+    const updates: Record<string, unknown>[] = [];
+    let responseCreates = 0;
+    const firstResponse = Promise.withResolvers<void>();
+    const modeUpdated = Promise.withResolvers<void>();
+    const textReceived = Promise.withResolvers<void>();
+    server = Bun.serve<MockClientData>({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request, bunServer) {
+        const upgraded = bunServer.upgrade(request, { data: { authenticated: true } });
+        return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
+      },
+      websocket: {
+        open(socket) {
+          client = socket;
+        },
+        message(socket, message) {
+          if (typeof message !== "string") return;
+          const event = JSON.parse(message) as Record<string, unknown>;
+          if (event["type"] === "session.update") {
+            updates.push(event);
+            socket.send(JSON.stringify({ type: "session.updated", session: { id: "session_text" } }));
+            if (updates.length === 2) modeUpdated.resolve();
+          } else if (event["type"] === "response.create") {
+            responseCreates += 1;
+            if (responseCreates === 1) {
+              firstResponse.resolve();
+            } else {
+              socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "Silent " }));
+              socket.send(JSON.stringify({ type: "response.output_text.done", text: "Silent response" }));
+              socket.send(JSON.stringify({ type: "response.done", response: { status: "completed", output: [] } }));
+            }
+          }
+        },
+      },
+    });
+    const emitted: Array<{ type: string; payload: unknown }> = [];
+    const audio: Uint8Array[] = [];
+    const bridge = new RealtimeBridge({
+      apiKey: "test-realtime-key",
+      endpoint: `ws://127.0.0.1:${server.port}/realtime`,
+      getWorkspace: () => "/tmp/mamachi-workspace",
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      executeCommand: async () => {
+        throw new Error("text chat must not execute a coding command");
+      },
+      emit: (type, payload) => {
+        emitted.push({ type, payload });
+        if (type === "voice.transcript.assistant") textReceived.resolve();
+      },
+      emitAudio: (pcm) => audio.push(pcm),
+    });
+
+    await bridge.connect();
+    bridge.sendText("Start a voice response");
+    await firstResponse.promise;
+    expect(updates).toHaveLength(1);
+    bridge.setResponseMode("text");
+    expect(updates).toHaveLength(1);
+    client?.send(JSON.stringify({ type: "response.done", response: { status: "completed", output: [] } }));
+    await modeUpdated.promise;
+    bridge.sendText("Reply silently");
+    await textReceived.promise;
+
+    const latestSession = updates.at(-1)?.["session"];
+    expect(isRecord(latestSession) ? latestSession["output_modalities"] : null).toEqual(["text"]);
+    expect(emitted).toContainEqual({ type: "voice.transcript.assistant", payload: { text: "Silent response" } });
+    expect(audio).toEqual([]);
+    await bridge.disconnect();
+    expect(client).toBeDefined();
+  });
+
+  test("delegates current web research to a fast coding task", async () => {
+    const commands: unknown[] = [];
+    let responseCreates = 0;
+    const delegated = Promise.withResolvers<void>();
+    server = Bun.serve<MockClientData>({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request, bunServer) {
+        const upgraded = bunServer.upgrade(request, { data: { authenticated: true } });
+        return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
+      },
+      websocket: {
+        open() {},
+        message(socket, message) {
+          if (typeof message !== "string") return;
+          const event = JSON.parse(message) as Record<string, unknown>;
+          if (event["type"] === "session.update") {
+            socket.send(JSON.stringify({ type: "session.updated", session: { id: "session_research" } }));
+          } else if (event["type"] === "response.create") {
+            responseCreates += 1;
+            if (responseCreates === 1) {
+              socket.send(
+                JSON.stringify({
+                  type: "response.done",
+                  response: {
+                    status: "completed",
+                    output: [{
+                      type: "function_call",
+                      call_id: "research_call",
+                      name: "research_web",
+                      arguments: JSON.stringify({
+                        query: "confirmed upcoming fixtures",
+                        deliverable: "Return a concise fixture list",
+                      }),
+                    }],
+                  },
+                }),
+              );
+            } else {
+              delegated.resolve();
+            }
+          }
+        },
+      },
+    });
+    const bridge = new RealtimeBridge({
+      apiKey: "test-realtime-key",
+      endpoint: `ws://127.0.0.1:${server.port}/realtime`,
+      getWorkspace: () => "/tmp/mamachi-workspace",
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      executeCommand: async (command) => {
+        commands.push(command);
+        return { status: "accepted", eventId: Bun.randomUUIDv7(), taskId: Bun.randomUUIDv7() };
+      },
+      emit: () => {},
+      emitAudio: () => {},
+    });
+
+    await bridge.connect();
+    bridge.sendText("Find the upcoming fixtures");
+    await delegated.promise;
+
+    const command = commands[0];
+    expect(isRecord(command) ? command["type"] : null).toBe("task.submit");
+    const payload = isRecord(command) ? command["payload"] : null;
+    expect(isRecord(payload) ? payload["codingProfileId"] : null).toBe("fast");
+    expect(isRecord(payload) ? payload["constraints"] : null).toContain("Research only; do not modify workspace files.");
     await bridge.disconnect();
   });
 });

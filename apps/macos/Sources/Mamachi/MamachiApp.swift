@@ -35,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlay = OverlayPanelController(model: model)
         settingsPanel = SettingsPanelController(model: model)
         model.onOpenSettings = { [weak self] in self?.showSettings() }
+        model.onShowOverlay = { [weak self] in self?.showOverlay() }
         do {
             hotKey = try GlobalHotKey { [weak self] in
                 guard let self else { return }

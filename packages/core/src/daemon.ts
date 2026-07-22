@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import { MamachiIpcServer } from "./ipc-server.ts";
 import { OmpRunner } from "./omp-runner.ts";
 import { RealtimeBridge } from "./realtime-bridge.ts";
+import { defaultRuntimeSettings, type RuntimeSettings } from "./model-router.ts";
 
 const token = process.env["MAMACHI_TOKEN"] ?? Bun.randomUUIDv7();
 const port = Number.parseInt(process.env["MAMACHI_PORT"] ?? "47821", 10);
@@ -18,6 +19,10 @@ const connectionPath = process.env["MAMACHI_CONNECTION_PATH"]
 
 let runner: OmpRunner | null = null;
 let realtime: RealtimeBridge | null = null;
+const initialRuntimeSettings: RuntimeSettings = {
+  ...defaultRuntimeSettings,
+  primaryModel: process.env["MAMACHI_CODING_MODEL"] ?? defaultRuntimeSettings.primaryModel,
+};
 const daemon = new MamachiIpcServer({
   token,
   port,
@@ -30,10 +35,12 @@ const daemon = new MamachiIpcServer({
       realtime?.handleTaskEvents(events);
       await runner?.handleEvents(events);
     },
+    onSettingsUpdate: (settings) => runner?.configure(settings),
     onVoiceConnect: (apiKey) => realtime?.connect(apiKey),
     onVoiceDisconnect: () => realtime?.disconnect(),
     onVoiceInterrupt: () => realtime?.interrupt(),
     onVoiceText: (text) => realtime?.sendText(text),
+    onVoiceMode: (mode) => realtime?.setResponseMode(mode),
   },
 });
 
@@ -56,9 +63,8 @@ runner = new OmpRunner({
   onSafePause: (taskId, reason) => daemon.pauseAtSafeBoundary(taskId, reason),
   onComplete: (taskId, summary) => daemon.completeTask(taskId, summary),
   onFail: (taskId, error) => daemon.failTask(taskId, error),
-  ...(process.env["MAMACHI_CODING_MODEL"]
-    ? { modelPattern: process.env["MAMACHI_CODING_MODEL"] }
-    : {}),
+  onNeedInput: (taskId, question) => daemon.awaitUserInput(taskId, question),
+  runtimeSettings: initialRuntimeSettings,
 });
 await daemon.recoverAfterRestart();
 if (connectionPath) {
