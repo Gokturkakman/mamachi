@@ -313,6 +313,7 @@ final class AppModel: ObservableObject {
         switch type {
         case "server.ready":
             daemonConnected = true
+            applySnapshot(payload["snapshot"] as? [String: Any])
         case "response":
             if payload["ok"] as? Bool == false {
                 errorMessage = payload["error"] as? String ?? "Mamachi request failed."

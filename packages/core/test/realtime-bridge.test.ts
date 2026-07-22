@@ -392,4 +392,72 @@ describe("RealtimeBridge", () => {
     expect(emitted).toContainEqual({ type: "voice.interrupt", payload: {} });
     await bridge.disconnect();
   });
+
+  test("ignores a raced cancel error and continues the interrupted turn", async () => {
+    let client: ServerWebSocket<MockClientData> | undefined;
+    let responseCreates = 0;
+    const firstResponse = Promise.withResolvers<void>();
+    const cancelReceived = Promise.withResolvers<void>();
+    const resumedResponse = Promise.withResolvers<void>();
+    const errors: string[] = [];
+    server = Bun.serve<MockClientData>({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request, bunServer) {
+        const upgraded = bunServer.upgrade(request, { data: { authenticated: true } });
+        return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
+      },
+      websocket: {
+        open(socket) {
+          client = socket;
+        },
+        message(socket, message) {
+          if (typeof message !== "string") return;
+          const event = JSON.parse(message) as Record<string, unknown>;
+          if (event["type"] === "session.update") {
+            socket.send(JSON.stringify({ type: "session.updated", session: { id: "session_cancel_race" } }));
+          } else if (event["type"] === "response.create") {
+            responseCreates += 1;
+            if (responseCreates === 1) firstResponse.resolve();
+            if (responseCreates === 2) resumedResponse.resolve();
+          } else if (event["type"] === "response.cancel") {
+            cancelReceived.resolve();
+          }
+        },
+      },
+    });
+    const bridge = new RealtimeBridge({
+      apiKey: "test-realtime-key",
+      endpoint: `ws://127.0.0.1:${server.port}/realtime`,
+      getWorkspace: () => "/tmp/mamachi-workspace",
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      executeCommand: async () => {
+        throw new Error("cancel race must not execute a coding command");
+      },
+      emit: (type, payload) => {
+        if (type === "voice.error" && isRecord(payload) && typeof payload["error"] === "string") {
+          errors.push(payload["error"]);
+        }
+      },
+      emitAudio: () => {},
+    });
+
+    await bridge.connect();
+    bridge.sendText("Start answering");
+    await firstResponse.promise;
+    bridge.interrupt();
+    await cancelReceived.promise;
+    client?.send(JSON.stringify({ type: "input_audio_buffer.speech_stopped" }));
+    client?.send(
+      JSON.stringify({
+        type: "error",
+        error: { message: "Cancellation failed: no active response found" },
+      }),
+    );
+
+    await resumedResponse.promise;
+    expect(responseCreates).toBe(2);
+    expect(errors).toEqual([]);
+    await bridge.disconnect();
+  });
 });

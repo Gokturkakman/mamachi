@@ -229,36 +229,21 @@ struct OverlayView: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 9) {
-                        ForEach(model.transcripts.suffix(16)) { entry in
-                            transcriptRow(speaker: entry.speaker, text: entry.text, streaming: false)
-                                .id(entry.id)
-                        }
-                        if !model.liveUserTranscript.isEmpty {
-                            transcriptRow(speaker: .user, text: model.liveUserTranscript, streaming: true)
-                        }
-                        if !model.liveAssistantTranscript.isEmpty {
-                            transcriptRow(speaker: .mamachi, text: model.liveAssistantTranscript, streaming: true)
-                        }
-                        Color.clear.frame(height: 1).id("conversation-bottom")
+            ScrollView {
+                VStack(alignment: .leading, spacing: 9) {
+                    ForEach(model.transcripts.suffix(16)) { entry in
+                        transcriptRow(speaker: entry.speaker, text: entry.text, streaming: false)
+                    }
+                    if !model.liveUserTranscript.isEmpty {
+                        transcriptRow(speaker: .user, text: model.liveUserTranscript, streaming: true)
+                    }
+                    if !model.liveAssistantTranscript.isEmpty {
+                        transcriptRow(speaker: .mamachi, text: model.liveAssistantTranscript, streaming: true)
                     }
                 }
-                .onChange(of: model.transcripts.count) {
-                    proxy.scrollTo("conversation-bottom", anchor: .bottom)
-                }
-                .onChange(of: model.liveUserTranscript) {
-                    withAnimation(.easeOut(duration: 0.12)) {
-                        proxy.scrollTo("conversation-bottom", anchor: .bottom)
-                    }
-                }
-                .onChange(of: model.liveAssistantTranscript) {
-                    withAnimation(.easeOut(duration: 0.12)) {
-                        proxy.scrollTo("conversation-bottom", anchor: .bottom)
-                    }
-                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .defaultScrollAnchor(.bottom)
         }
         .frame(maxHeight: .infinity)
     }

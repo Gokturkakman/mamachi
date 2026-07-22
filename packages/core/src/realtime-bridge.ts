@@ -51,6 +51,7 @@ export class RealtimeBridge {
   #responseActive = false;
   #responsePending = false;
   #suppressAudio = false;
+  #cancellationRequested = false;
   #toolChainDepth = 0;
 
   constructor(options: RealtimeBridgeOptions) {
@@ -71,6 +72,7 @@ export class RealtimeBridge {
     this.#responseActive = false;
     this.#responsePending = false;
     this.#suppressAudio = false;
+    this.#cancellationRequested = false;
     this.#toolChainDepth = 0;
     this.#options.emit("voice.state", { state: "connecting" });
     const separator = this.#endpoint.includes("?") ? "&" : "?";
@@ -85,6 +87,7 @@ export class RealtimeBridge {
       this.#responseActive = false;
       this.#responsePending = false;
       this.#suppressAudio = false;
+      this.#cancellationRequested = false;
       if (!this.#manualClose) {
         this.#options.emit("voice.state", { state: "disconnected", reason: "provider_connection_closed" });
       }
@@ -138,6 +141,7 @@ export class RealtimeBridge {
     this.#responseActive = false;
     this.#responsePending = false;
     this.#suppressAudio = false;
+    this.#cancellationRequested = false;
     this.#toolChainDepth = 0;
     this.#socket = null;
     if (socket.readyState === WebSocket.CLOSED) return;
@@ -162,7 +166,10 @@ export class RealtimeBridge {
     if (this.#socket?.readyState !== WebSocket.OPEN) return;
     this.#toolChainDepth = 0;
     this.#suppressAudio = true;
-    if (this.#responseActive) this.#send({ type: "response.cancel" });
+    if (this.#responseActive) {
+      this.#cancellationRequested = true;
+      this.#send({ type: "response.cancel" });
+    }
     this.#options.emit("voice.interrupt", {});
     this.#options.emit("voice.state", { state: "listening" });
   }
@@ -455,12 +462,26 @@ ${this.#options.getWorkspace()}
       }
     } else if (type === "response.done") {
       this.#responseActive = false;
+      this.#cancellationRequested = false;
       await this.#handleResponseDone(event);
     } else if (type === "error") {
+      const message = this.#errorMessage(event);
+      if (this.#cancellationRequested && /no active response/i.test(message)) {
+        this.#responseActive = false;
+        this.#cancellationRequested = false;
+        if (this.#responsePending) {
+          this.#responsePending = false;
+          this.#requestResponse();
+        } else {
+          this.#options.emit("voice.state", { state: "listening" });
+        }
+        return;
+      }
       this.#responseActive = false;
       this.#responsePending = false;
       this.#suppressAudio = false;
-      this.#options.emit("voice.error", { error: this.#errorMessage(event) });
+      this.#cancellationRequested = false;
+      this.#options.emit("voice.error", { error: message });
     }
   }
 
