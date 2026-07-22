@@ -3,6 +3,7 @@ import SwiftUI
 struct OverlayView: View {
     @ObservedObject var model: AppModel
     @State private var message = ""
+    @FocusState private var composerFocused: Bool
 
     var body: some View {
         Group {
@@ -37,8 +38,12 @@ struct OverlayView: View {
             } label: {
                 Image(systemName: "arrow.up.left.and.arrow.down.right")
                     .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.secondary)
                     .frame(width: 25, height: 25)
                     .background(.regularMaterial, in: Circle())
+                    .overlay {
+                        Circle().strokeBorder(.white.opacity(0.14), lineWidth: 1)
+                    }
             }
             .buttonStyle(.plain)
             .help("Open current conversation")
@@ -46,9 +51,9 @@ struct OverlayView: View {
         .frame(width: 112, height: 112)
         .background(.ultraThinMaterial, in: Circle())
         .overlay {
-            Circle().strokeBorder(.white.opacity(0.18), lineWidth: 1)
+            Circle().strokeBorder(Theme.specularEdge, lineWidth: 1)
         }
-        .shadow(color: .black.opacity(0.24), radius: 18, y: 8)
+        .shadow(color: .black.opacity(0.26), radius: 18, y: 8)
     }
 
     private var expandedPanel: some View {
@@ -64,12 +69,20 @@ struct OverlayView: View {
         }
         .padding(14)
         .frame(width: 480, height: 620)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .background {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .fill(Theme.panelWash)
+                }
+        }
         .overlay {
             RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .strokeBorder(.white.opacity(0.16), lineWidth: 1)
+                .strokeBorder(Theme.specularEdge, lineWidth: 1)
         }
-        .shadow(color: .black.opacity(0.25), radius: 24, y: 10)
+        .shadow(color: .black.opacity(0.28), radius: 26, y: 10)
+        .shadow(color: Theme.accentB.opacity(0.08), radius: 36)
         .animation(.smooth(duration: 0.3), value: model.voiceState)
         .animation(.smooth(duration: 0.3), value: model.interactionMode)
     }
@@ -90,6 +103,7 @@ struct OverlayView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(currentHeadline)
                     .font(.system(size: 13, weight: .semibold))
+                    .tracking(0.1)
                     .lineLimit(1)
                 Text(currentDetail)
                     .font(.system(size: 10))
@@ -110,21 +124,11 @@ struct OverlayView: View {
             .pickerStyle(.segmented)
             .frame(width: 84)
 
-            Button(action: model.openSettings) {
-                Image(systemName: "gearshape")
-                    .frame(width: 26, height: 26)
-            }
-            .buttonStyle(.plain)
-            .help("Settings")
+            GlassIconButton(systemImage: "gearshape", help: "Settings", action: model.openSettings)
 
-            Button {
+            GlassIconButton(systemImage: "chevron.down", help: "Collapse to orb") {
                 model.drawerExpanded = false
-            } label: {
-                Image(systemName: "chevron.down")
-                    .frame(width: 26, height: 26)
             }
-            .buttonStyle(.plain)
-            .help("Collapse to orb")
         }
     }
 
@@ -132,13 +136,13 @@ struct OverlayView: View {
     private var currentTaskSection: some View {
         if let task = model.activeTask {
             VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Label("Current task", systemImage: task.state == "awaiting_user" ? "questionmark.bubble.fill" : "terminal")
-                        .font(.system(size: 11, weight: .semibold))
+                HStack(spacing: 6) {
+                    Image(systemName: task.state == "awaiting_user" ? "questionmark.bubble.fill" : "terminal")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Theme.brand)
+                    SectionLabel("Current task")
                     Spacer()
-                    Text(task.state.replacingOccurrences(of: "_", with: " ").uppercased())
-                        .font(.system(size: 9, weight: .bold, design: .rounded))
-                        .foregroundStyle(taskStateColor(task.state))
+                    StatusChip(state: task.state)
                 }
                 Text(task.objective)
                     .font(.system(size: 12, weight: .medium))
@@ -156,12 +160,12 @@ struct OverlayView: View {
                 }
                 HStack(spacing: 8) {
                     if task.state == "running" || task.state == "pause_requested" {
-                        taskButton("Pause", systemImage: "pause.fill") { model.controlActiveTask("pause") }
+                        PillButton(title: "Pause", systemImage: "pause.fill") { model.controlActiveTask("pause") }
                     } else if task.state == "paused" || task.state == "awaiting_user" {
-                        taskButton("Resume", systemImage: "play.fill") { model.controlActiveTask("resume") }
+                        PillButton(title: "Resume", systemImage: "play.fill") { model.controlActiveTask("resume") }
                     }
                     if !task.isTerminal {
-                        taskButton("Cancel", systemImage: "xmark") { model.controlActiveTask("cancel") }
+                        PillButton(title: "Cancel", systemImage: "xmark") { model.controlActiveTask("cancel") }
                     }
                     Spacer()
                     if !model.queue.isEmpty {
@@ -171,12 +175,12 @@ struct OverlayView: View {
                     }
                 }
             }
-            .padding(11)
-            .background(.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+            .padding(12)
+            .glassCard()
         } else if let latest = model.tasks.last {
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: latest.state == "completed" ? "checkmark.circle.fill" : "circle.dashed")
-                    .foregroundStyle(taskStateColor(latest.state))
+                    .foregroundStyle(Theme.statusColor(latest.state))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(latest.state.capitalized)
                         .font(.system(size: 11, weight: .semibold))
@@ -187,16 +191,15 @@ struct OverlayView: View {
                 }
                 Spacer()
             }
-            .padding(11)
-            .background(.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+            .padding(12)
+            .glassCard()
         }
     }
 
     private var transcriptSection: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Text("Current conversation")
-                    .font(.system(size: 11, weight: .semibold))
+                SectionLabel("Current conversation")
                 Spacer()
                 Button("Clear") { model.clearTranscripts() }
                     .buttonStyle(.plain)
@@ -229,25 +232,56 @@ struct OverlayView: View {
                 text: $message
             )
             .textFieldStyle(.plain)
+            .font(.system(size: 12))
+            .focused($composerFocused)
             .onSubmit(sendMessage)
+
             Button(action: sendMessage) {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 22))
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(canSend ? AnyShapeStyle(.white) : AnyShapeStyle(.tertiary))
+                    .frame(width: 26, height: 26)
+                    .background(
+                        canSend ? AnyShapeStyle(Theme.brand) : AnyShapeStyle(Color.primary.opacity(0.08)),
+                        in: Circle()
+                    )
             }
             .buttonStyle(.plain)
-            .disabled(message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .disabled(!canSend)
         }
         .padding(.horizontal, 12)
-        .frame(height: 40)
-        .background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .frame(height: 42)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .strokeBorder(
+                    composerFocused ? AnyShapeStyle(Theme.brand.opacity(0.55)) : AnyShapeStyle(Color.primary.opacity(0.07)),
+                    lineWidth: 1
+                )
+        }
+        .animation(.easeOut(duration: 0.15), value: composerFocused)
     }
 
     private func transcriptRow(speaker: TranscriptEntry.Speaker, text: String, streaming: Bool) -> some View {
         HStack(alignment: .top, spacing: 8) {
-            Text(speaker == .user ? "You" : "M")
-                .font(.system(size: 9, weight: .bold))
-                .foregroundStyle(speaker == .user ? .secondary : Color.accentColor)
-                .frame(width: 22, alignment: .leading)
+            Group {
+                if speaker == .mamachi {
+                    Text("M")
+                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .frame(width: 18, height: 18)
+                        .background(Theme.brand, in: Circle())
+                } else {
+                    Image(systemName: "person.fill")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 18, height: 18)
+                        .background(Color.primary.opacity(0.06), in: Circle())
+                }
+            }
+            .padding(.top, 4)
+            .frame(width: 22, alignment: .leading)
+
             Text(text)
                 .font(.system(size: 12))
                 .lineSpacing(3)
@@ -259,22 +293,26 @@ struct OverlayView: View {
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
                 .background(
-                    speaker == .user ? Color.primary.opacity(0.05) : Color.accentColor.opacity(0.08),
-                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    speaker == .user
+                        ? AnyShapeStyle(Color.primary.opacity(0.05))
+                        : AnyShapeStyle(
+                            LinearGradient(
+                                colors: [Theme.accentA.opacity(0.10), Theme.accentB.opacity(0.08)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        ),
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous)
                 )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(
+                            speaker == .user ? Color.primary.opacity(0.05) : Theme.accentB.opacity(0.13),
+                            lineWidth: 1
+                        )
+                }
                 .opacity(streaming ? 0.92 : 1)
         }
-    }
-
-    private func taskButton(_ title: String, systemImage: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Label(title, systemImage: systemImage)
-                .font(.system(size: 10, weight: .semibold))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(.primary.opacity(0.07), in: Capsule())
-        }
-        .buttonStyle(.plain)
     }
 
     private func errorBanner(_ message: String) -> some View {
@@ -293,11 +331,19 @@ struct OverlayView: View {
         .font(.system(size: 11, weight: .medium))
         .foregroundStyle(.red)
         .padding(10)
-        .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(.red.opacity(0.18), lineWidth: 1)
+        }
     }
 
     private var interactionMode: Binding<InteractionMode> {
         Binding(get: { model.interactionMode }, set: model.setInteractionMode)
+    }
+
+    private var canSend: Bool {
+        !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var currentHeadline: String {
@@ -331,15 +377,6 @@ struct OverlayView: View {
     private func expandedOrbAction() {
         if model.interactionMode == .voice {
             model.toggleEngagement()
-        }
-    }
-
-    private func taskStateColor(_ state: String) -> Color {
-        switch state {
-        case "completed": .green
-        case "failed", "cancelled": .red
-        case "paused", "pause_requested", "awaiting_user": .orange
-        default: .blue
         }
     }
 

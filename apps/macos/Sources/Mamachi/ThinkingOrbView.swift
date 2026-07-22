@@ -22,29 +22,32 @@ struct ThinkingOrbView: View {
     }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion || (!isAnimated && previousMode == nil))) { timeline in
-            Canvas(rendersAsynchronously: true) { context, canvasSize in
-                let clock = reduceMotion ? 0.7 : timeline.date.timeIntervalSinceReferenceDate
-                let side = min(canvasSize.width, canvasSize.height)
-                let transition = reduceMotion
-                    ? 1
-                    : min(1, max(0, timeline.date.timeIntervalSince(transitionStartedAt) / 0.38))
-                let opacity = state == .disconnected ? 0.38 : 1
+        ZStack {
+            ambientGlow
+            TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion || (!isAnimated && previousMode == nil))) { timeline in
+                Canvas(rendersAsynchronously: true) { context, canvasSize in
+                    let clock = reduceMotion ? 0.7 : timeline.date.timeIntervalSinceReferenceDate
+                    let side = min(canvasSize.width, canvasSize.height)
+                    let transition = reduceMotion
+                        ? 1
+                        : min(1, max(0, timeline.date.timeIntervalSince(transitionStartedAt) / 0.38))
+                    let opacity = state == .disconnected ? 0.38 : 1
 
-                if let previousMode, transition < 1 {
+                    if let previousMode, transition < 1 {
+                        OrbRenderer.paint(
+                            dots(for: previousMode, size: side, clock: clock),
+                            into: &context,
+                            dark: colorScheme == .dark,
+                            opacity: opacity * (1 - transition)
+                        )
+                    }
                     OrbRenderer.paint(
-                        dots(for: previousMode, size: side, clock: clock),
+                        dots(for: renderedMode, size: side, clock: clock),
                         into: &context,
                         dark: colorScheme == .dark,
-                        opacity: opacity * (1 - transition)
+                        opacity: opacity * (previousMode == nil ? 1 : transition)
                     )
                 }
-                OrbRenderer.paint(
-                    dots(for: renderedMode, size: side, clock: clock),
-                    into: &context,
-                    dark: colorScheme == .dark,
-                    opacity: opacity * (previousMode == nil ? 1 : transition)
-                )
             }
         }
         .frame(width: size, height: size)
@@ -60,6 +63,34 @@ struct ThinkingOrbView: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var ambientGlow: some View {
+        Circle()
+            .fill(
+                RadialGradient(
+                    colors: [Theme.accentA.opacity(0.85), Theme.accentB.opacity(0.35), .clear],
+                    center: .center,
+                    startRadius: 0,
+                    endRadius: size * 0.55
+                )
+            )
+            .blur(radius: size * 0.1)
+            .opacity(glowStrength)
+            .animation(.smooth(duration: 0.45), value: state)
+            .animation(.linear(duration: 0.1), value: microphoneLevel)
+            .allowsHitTesting(false)
+    }
+
+    private var glowStrength: Double {
+        let base: Double = switch state {
+        case .listening: 0.28 + 0.30 * min(1, max(0, microphoneLevel))
+        case .speaking: 0.32
+        case .thinking: 0.24
+        case .connecting, .connected: 0.15
+        case .disconnected, .error: 0
+        }
+        return colorScheme == .dark ? base : base * 0.55
     }
 
     private func dots(for mode: OrbMode, size: Double, clock: Double) -> [OrbDot] {
@@ -355,14 +386,27 @@ private enum OrbRenderer {
     }
 
     static func paint(_ unsortedDots: [OrbDot], into context: inout GraphicsContext, dark: Bool, opacity: Double) {
+        // Foreground dots drift toward the brand tones: icy cyan on dark,
+        // deep indigo on light. Background dots stay near-neutral.
+        let tint: (red: Double, green: Double, blue: Double) = dark
+            ? (0.62, 0.82, 1.00)
+            : (0.30, 0.26, 0.64)
         for dot in unsortedDots.sorted(by: { $0.z < $1.z }) where dot.alpha >= 0.02 {
             let white = min(1, max(0, dot.white))
             let gray = dark ? 1 - white : white
+            let blend = 0.38 * (dark ? gray : 1 - gray)
             let radius = max(0.3, dot.radius)
             let rect = CGRect(x: dot.x - radius, y: dot.y - radius, width: radius * 2, height: radius * 2)
             context.fill(
                 Path(ellipseIn: rect),
-                with: .color(Color(white: gray).opacity(dot.alpha * opacity))
+                with: .color(
+                    Color(
+                        red: gray + (tint.red - gray) * blend,
+                        green: gray + (tint.green - gray) * blend,
+                        blue: gray + (tint.blue - gray) * blend
+                    )
+                    .opacity(dot.alpha * opacity)
+                )
             )
         }
     }
