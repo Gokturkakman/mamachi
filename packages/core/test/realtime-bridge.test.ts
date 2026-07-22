@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { Server, ServerWebSocket } from "bun";
-import type { ActionResult } from "@mamachi/protocol";
+import type { ActionResult, DomainEvent } from "@mamachi/protocol";
 import { RealtimeBridge } from "../src/realtime-bridge.ts";
 import type { ControllerSnapshot } from "../src/domain.ts";
 
@@ -129,6 +129,7 @@ describe("RealtimeBridge", () => {
       "get_task_status",
       "control_task",
       "revise_task",
+      "inspect_workspace",
       "research_web",
       "get_workspace",
       "wait_for_user",
@@ -605,6 +606,177 @@ describe("RealtimeBridge", () => {
     const payload = isRecord(command) ? command["payload"] : null;
     expect(isRecord(payload) ? payload["codingProfileId"] : null).toBe("fast");
     expect(isRecord(payload) ? payload["constraints"] : null).toContain("Research only; do not modify workspace files.");
+    await bridge.disconnect();
+  });
+
+  test("delegates repository questions to a read-only fast coding task", async () => {
+    const commands: unknown[] = [];
+    let responseCreates = 0;
+    const delegated = Promise.withResolvers<void>();
+    server = Bun.serve<MockClientData>({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request, bunServer) {
+        const upgraded = bunServer.upgrade(request, { data: { authenticated: true } });
+        return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
+      },
+      websocket: {
+        open() {},
+        message(socket, message) {
+          if (typeof message !== "string") return;
+          const event = JSON.parse(message) as Record<string, unknown>;
+          if (event["type"] === "session.update") {
+            const session = event["session"];
+            expect(isRecord(session) ? session["instructions"] : null).toContain(
+              "Any request whose answer depends on current workspace state",
+            );
+            socket.send(JSON.stringify({ type: "session.updated", session: { id: "session_inspect" } }));
+          } else if (event["type"] === "response.create") {
+            responseCreates += 1;
+            if (responseCreates === 1) {
+              socket.send(
+                JSON.stringify({
+                  type: "response.done",
+                  response: {
+                    status: "completed",
+                    output: [{
+                      type: "function_call",
+                      call_id: "inspect_call",
+                      name: "inspect_workspace",
+                      arguments: JSON.stringify({
+                        question: "What are the latest commits?",
+                        deliverable: "Return the five newest commits with hashes and subjects.",
+                      }),
+                    }],
+                  },
+                }),
+              );
+            } else {
+              delegated.resolve();
+            }
+          }
+        },
+      },
+    });
+    const bridge = new RealtimeBridge({
+      apiKey: "test-realtime-key",
+      endpoint: `ws://127.0.0.1:${server.port}/realtime`,
+      getWorkspace: () => "/tmp/mamachi-workspace",
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      executeCommand: async (command) => {
+        commands.push(command);
+        return { status: "accepted", eventId: Bun.randomUUIDv7(), taskId: Bun.randomUUIDv7() };
+      },
+      emit: () => {},
+      emitAudio: () => {},
+    });
+
+    await bridge.connect();
+    bridge.sendText("What are the latest commits?");
+    await delegated.promise;
+
+    const command = commands[0];
+    expect(isRecord(command) ? command["type"] : null).toBe("task.submit");
+    const payload = isRecord(command) ? command["payload"] : null;
+    expect(isRecord(payload) ? payload["codingProfileId"] : null).toBe("fast");
+    expect(isRecord(payload) ? payload["objective"] : null).toContain("What are the latest commits?");
+    expect(isRecord(payload) ? payload["constraints"] : null).toContain(
+      "Read-only inspection; do not modify workspace files.",
+    );
+    await bridge.disconnect();
+  });
+
+  test("queues a proactive completion announcement behind an active response", async () => {
+    let client: ServerWebSocket<MockClientData> | undefined;
+    let responseCreates = 0;
+    const injectedItems: Record<string, unknown>[] = [];
+    const firstResponse = Promise.withResolvers<void>();
+    const proactiveResponse = Promise.withResolvers<void>();
+    const announcementSpoken = Promise.withResolvers<void>();
+    const completionContextReceived = Promise.withResolvers<void>();
+    server = Bun.serve<MockClientData>({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request, bunServer) {
+        const upgraded = bunServer.upgrade(request, { data: { authenticated: true } });
+        return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
+      },
+      websocket: {
+        open(socket) {
+          client = socket;
+        },
+        message(socket, message) {
+          if (typeof message !== "string") return;
+          const event = JSON.parse(message) as Record<string, unknown>;
+          if (event["type"] === "session.update") {
+            socket.send(JSON.stringify({ type: "session.updated", session: { id: "session_completion" } }));
+          } else if (event["type"] === "conversation.item.create") {
+            injectedItems.push(event);
+            if (JSON.stringify(event).includes("Proactively tell the user now")) completionContextReceived.resolve();
+          } else if (event["type"] === "response.create") {
+            responseCreates += 1;
+            if (responseCreates === 1) {
+              firstResponse.resolve();
+            } else {
+              proactiveResponse.resolve();
+              socket.send(
+                JSON.stringify({
+                  type: "response.output_audio_transcript.done",
+                  transcript: "The coding task finished and all checks passed.",
+                }),
+              );
+              socket.send(JSON.stringify({ type: "response.done", response: { status: "completed", output: [] } }));
+            }
+          }
+        },
+      },
+    });
+    const bridge = new RealtimeBridge({
+      apiKey: "test-realtime-key",
+      endpoint: `ws://127.0.0.1:${server.port}/realtime`,
+      getWorkspace: () => "/tmp/mamachi-workspace",
+      getSnapshot: () => ({ seq: 7, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      executeCommand: async () => {
+        throw new Error("completion announcements must not execute another command");
+      },
+      emit: (type, payload) => {
+        if (type === "voice.transcript.assistant" && isRecord(payload)) announcementSpoken.resolve();
+      },
+      emitAudio: () => {},
+    });
+
+    await bridge.connect();
+    bridge.sendText("Tell me something while coding finishes");
+    await firstResponse.promise;
+    const taskId = Bun.randomUUIDv7();
+    const runId = Bun.randomUUIDv7();
+    const eventId = Bun.randomUUIDv7();
+    const completion: DomainEvent<"task.completed"> = {
+      version: 1,
+      id: eventId,
+      seq: 7,
+      at: new Date().toISOString(),
+      type: "task.completed",
+      actor: "controller",
+      taskId,
+      runId,
+      correlationId: eventId,
+      payload: {
+        runId,
+        summary: "Implemented the requested change; all checks passed.",
+        evidenceIds: [],
+      },
+    };
+
+    bridge.handleTaskEvents([completion]);
+    await completionContextReceived.promise;
+    expect(responseCreates).toBe(1);
+    expect(injectedItems.some((item) => JSON.stringify(item).includes("Proactively tell the user now"))).toBe(true);
+    expect(injectedItems.some((item) => JSON.stringify(item).includes("all checks passed"))).toBe(true);
+    client?.send(JSON.stringify({ type: "response.done", response: { status: "completed", output: [] } }));
+    await proactiveResponse.promise;
+    await announcementSpoken.promise;
+    expect(responseCreates).toBe(2);
     await bridge.disconnect();
   });
 });

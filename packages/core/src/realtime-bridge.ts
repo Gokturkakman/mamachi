@@ -51,6 +51,7 @@ export class RealtimeBridge {
   #manualClose = false;
   #responseActive = false;
   #responsePending = false;
+  #inputActive = false;
   #suppressAudio = false;
   #cancellationRequested = false;
   #responseMode: RealtimeResponseMode = "voice";
@@ -74,6 +75,7 @@ export class RealtimeBridge {
     this.#manualClose = false;
     this.#responseActive = false;
     this.#responsePending = false;
+    this.#inputActive = false;
     this.#suppressAudio = false;
     this.#cancellationRequested = false;
     this.#toolChainDepth = 0;
@@ -89,6 +91,7 @@ export class RealtimeBridge {
       if (this.#socket === socket) this.#socket = null;
       this.#responseActive = false;
       this.#responsePending = false;
+      this.#inputActive = false;
       this.#suppressAudio = false;
       this.#cancellationRequested = false;
       if (!this.#manualClose) {
@@ -143,6 +146,7 @@ export class RealtimeBridge {
     this.#manualClose = true;
     this.#responseActive = false;
     this.#responsePending = false;
+    this.#inputActive = false;
     this.#suppressAudio = false;
     this.#cancellationRequested = false;
     this.#toolChainDepth = 0;
@@ -225,6 +229,9 @@ export class RealtimeBridge {
       ].includes(event.type),
     );
     if (relevant.length === 0) return;
+    const announce = relevant.some((event) =>
+      event.type === "task.awaitingUser" || event.type === "task.completed" || event.type === "task.failed",
+    );
     const snapshot = this.#options.getSnapshot();
     this.#send({
       type: "conversation.item.create",
@@ -235,7 +242,9 @@ export class RealtimeBridge {
           {
             type: "input_text",
             text: [
-              "Mamachi controller state update. Treat this as authoritative; do not reply unless the user asks or a separate response is requested.",
+              announce
+                ? "The coding agent has a user-visible update. Proactively tell the user now without waiting for a status question. For completion or failure, give the outcome in one short sentence. For awaiting input, ask the exact question. This event is authoritative; do not call get_task_status first."
+                : "Mamachi controller state update. Treat this as authoritative; do not reply unless the user asks or a separate response is requested.",
               JSON.stringify({
                 workspace: this.#options.getWorkspace(),
                 activeTaskId: snapshot.activeTaskId,
@@ -251,6 +260,7 @@ export class RealtimeBridge {
         ],
       },
     });
+    if (announce) this.#requestResponse();
   }
 
   noteHarnessEvent(type: string, payload: unknown): void {
@@ -332,10 +342,13 @@ You are Mamachi, a realtime voice companion bridging the user and a separate cod
 The local controller and tool results are authoritative for workspace, task, queue, progress, and completion. Never claim a transition or verification without a successful tool result or controller state update. You cannot read or edit files and must not pretend to.
 
 # Conversation versus action
-Brainstorming, hypotheticals, examples, and side discussion are non-operative. For a small concrete coding request, call submit_task when the objective, at least one observable acceptance criterion, and constraints are clear. For a broad request, summarize it and obtain confirmation first. Ask one question at a time.
+Brainstorming, hypotheticals, examples, and side discussion are non-operative. A concrete coding request belongs to the coding agent: call submit_task when the objective, at least one observable acceptance criterion, and constraints are clear. For a broad request, summarize it and obtain confirmation first. Ask one question at a time.
 
 # Active work
-Coding continues after submit_task returns. Stay available for unrelated conversation. For status, use get_task_status. Do not narrate routine tools. Surface blockers, consequential changes, requested status, and completion.
+Coding continues after submit_task returns. Stay available for unrelated conversation. For status, use get_task_status. Do not narrate routine tools. Surface blockers, consequential changes, requested status, and completion. Controller completion, failure, and input-needed events require an immediate brief update; never wait for the user to ask.
+
+# Workspace inspection
+You cannot inspect the repository yourself. Any request whose answer depends on current workspace state—including latest commits, branches, files, code, dependencies, tests, diagnostics, or logs—MUST call inspect_workspace. Never answer these from memory and never ask the user to run a command for you.
 
 # Web research
 For current facts or web lookup, call research_web instead of answering from memory. Research runs through the coding agent and must return source URLs.
@@ -419,6 +432,20 @@ ${this.#options.getWorkspace()}
       },
       {
         type: "function",
+        name: "inspect_workspace",
+        description: "Delegate a read-only question about current repository state to the coding agent. Always use for commits, branches, files, code, tests, diagnostics, dependencies, or logs.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            question: { type: "string", minLength: 1 },
+            deliverable: { type: "string", minLength: 1 },
+          },
+          required: ["question", "deliverable"],
+        },
+      },
+      {
+        type: "function",
         name: "research_web",
         description: "Delegate a current-information or web-research request to the coding agent.",
         parameters: {
@@ -463,11 +490,13 @@ ${this.#options.getWorkspace()}
     if (type === "session.updated") {
       this.#options.emit("voice.state", { state: "connected", model: this.#model, voice: this.#voice });
     } else if (type === "input_audio_buffer.speech_started") {
+      this.#inputActive = true;
       this.#toolChainDepth = 0;
       if (this.#responseActive) this.#suppressAudio = true;
       this.#options.emit("voice.interrupt", {});
       this.#options.emit("voice.state", { state: "listening" });
     } else if (type === "input_audio_buffer.speech_stopped") {
+      this.#inputActive = false;
       this.#options.emit("voice.state", { state: "thinking" });
       this.#requestResponse();
     } else if (type === "conversation.item.input_audio_transcription.delta") {
@@ -550,8 +579,7 @@ ${this.#options.getWorkspace()}
       }
     }
 
-    if (this.#responsePending) {
-      this.#responsePending = false;
+    if (calls.length === 0 && this.#responsePending) {
       this.#toolChainDepth = 0;
       this.#requestResponse();
       return;
@@ -585,7 +613,11 @@ ${this.#options.getWorkspace()}
     }
     if (calls.every((call) => call.name === "wait_for_user")) {
       this.#toolChainDepth = 0;
-      this.#options.emit("voice.state", { state: "idle" });
+      if (this.#responsePending) {
+        this.#requestResponse();
+      } else {
+        this.#options.emit("voice.state", { state: "idle" });
+      }
       return;
     }
     if (this.#toolChainDepth >= 4) {
@@ -638,6 +670,31 @@ ${this.#options.getWorkspace()}
           }
         }
         return { ...result, attachmentIds };
+      }
+      case "inspect_workspace": {
+        const question = requireString(input["question"], "question");
+        const deliverable = requireString(input["deliverable"], "deliverable");
+        return this.#options.executeCommand({
+          id: Bun.randomUUIDv7(),
+          type: "task.submit",
+          actor: "voice",
+          expectedRevision: null,
+          payload: {
+            repositoryId: this.#options.getWorkspace(),
+            objective: `Inspect the current repository to answer: ${question}`,
+            acceptanceCriteria: [
+              deliverable,
+              "Use current workspace evidence and identify exact commits, paths, symbols, or command output where relevant.",
+              "Clearly distinguish observed facts from inference.",
+            ],
+            constraints: [
+              "Read-only inspection; do not modify workspace files.",
+              "Use the coding agent's repository tools rather than relying on the voice model's memory.",
+            ],
+            attachmentIds: [],
+            codingProfileId: "fast",
+          },
+        });
       }
       case "research_web": {
         const query = requireString(input["query"], "query");
@@ -794,12 +851,14 @@ ${this.#options.getWorkspace()}
   }
 
   #requestResponse(): void {
-    if (this.#responseActive) {
+    if (this.#responseActive || this.#inputActive) {
       this.#responsePending = true;
       return;
     }
+    this.#responsePending = false;
     this.#responseActive = true;
     this.#suppressAudio = false;
+    this.#options.emit("voice.state", { state: "thinking" });
     this.#send({ type: "response.create" });
   }
 
