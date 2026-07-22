@@ -1,0 +1,17 @@
+{
+  "name": "@mamachi/core",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "demo": "bun src/demo.ts"
+  },
+  "dependencies": {
+    "@mamachi/protocol": "workspace:*",
+    "@oh-my-pi/pi-coding-agent": "17.0.7",
+    "ws": "^8.18.3"
+  }
+}

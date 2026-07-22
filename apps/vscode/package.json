@@ -1,0 +1,79 @@
+{
+  "name": "mamachi-vscode",
+  "displayName": "Mamachi",
+  "description": "Explicit editor context bridge for the Mamachi voice coding harness",
+  "version": "0.1.0",
+  "private": true,
+  "publisher": "mamachi",
+  "engines": {
+    "vscode": "^1.101.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "mamachi.captureActiveFile",
+        "title": "Mamachi: Capture Active File"
+      },
+      {
+        "command": "mamachi.captureSelection",
+        "title": "Mamachi: Capture Selection"
+      },
+      {
+        "command": "mamachi.captureDiagnostics",
+        "title": "Mamachi: Capture Diagnostics"
+      },
+      {
+        "command": "mamachi.captureTerminalSelection",
+        "title": "Mamachi: Capture Terminal Selection"
+      },
+      {
+        "command": "mamachi.focusWorkspace",
+        "title": "Mamachi: Use This Workspace"
+      },
+      {
+        "command": "mamachi.showStatus",
+        "title": "Mamachi: Show Connection Status"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "mamachi.captureSelection",
+          "group": "mamachi@1",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "mamachi.captureActiveFile",
+          "group": "mamachi@2"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "mamachi.captureDiagnostics",
+          "group": "mamachi"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "@types/vscode": "^1.96.0",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.25.6",
+    "typescript": "^5.9.3"
+  }
+}

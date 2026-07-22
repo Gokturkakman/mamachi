@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mamachi}/apps/macos",
+            "name": "Debug Mamachi (apps/macos)",
+            "target": "Mamachi",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Mamachi (apps/macos)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mamachi}/apps/macos",
+            "name": "Release Mamachi (apps/macos)",
+            "target": "Mamachi",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Mamachi (apps/macos)"
+        }
+    ]
+}

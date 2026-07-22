@@ -1,0 +1,13 @@
+{
+  "name": "@mamachi/protocol",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "json-schema-to-ts": "^3.1.1"
+  }
+}

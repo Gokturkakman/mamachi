@@ -1,0 +1,74 @@
+import AppKit
+import Combine
+import QuartzCore
+import SwiftUI
+
+private final class MamachiPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+@MainActor
+final class OverlayPanelController {
+    private let panel: MamachiPanel
+    private var expansionSubscription: AnyCancellable?
+
+    init(model: AppModel) {
+        panel = MamachiPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 528, height: 225),
+            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .floating
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        panel.isMovableByWindowBackground = true
+        panel.contentView = NSHostingView(rootView: OverlayView(model: model))
+
+        expansionSubscription = model.$drawerExpanded
+            .removeDuplicates()
+            .sink { [weak self] expanded in self?.resize(expanded: expanded) }
+    }
+
+    func show() {
+        positionIfNeeded()
+        panel.orderFrontRegardless()
+    }
+
+    func hide() {
+        panel.orderOut(nil)
+    }
+
+    func toggleVisibility() {
+        panel.isVisible ? hide() : show()
+    }
+
+    private func resize(expanded: Bool) {
+        let newHeight: CGFloat = expanded ? 680 : 225
+        var frame = panel.frame
+        let delta = newHeight - frame.height
+        frame.origin.y -= delta / 2
+        frame.size.height = newHeight
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.22
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            panel.animator().setFrame(frame, display: true)
+        }
+    }
+
+    private func positionIfNeeded() {
+        guard !panel.isVisible, let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        let frame = panel.frame
+        let visible = screen.visibleFrame
+        panel.setFrameOrigin(
+            NSPoint(
+                x: visible.midX - frame.width / 2,
+                y: visible.minY + 42
+            )
+        )
+    }
+}

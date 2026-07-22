@@ -1,0 +1,63 @@
+import AppKit
+import SwiftUI
+
+struct MenuBarView: View {
+    @ObservedObject var model: AppModel
+    let showOverlay: () -> Void
+    let hideOverlay: () -> Void
+
+    var body: some View {
+        Group {
+            Button {
+                showOverlay()
+                model.toggleEngagement()
+            } label: {
+                Label(model.isEngaged ? "Sleep microphone" : "Talk to Mamachi", systemImage: model.isEngaged ? "mic.slash" : "mic")
+            }
+            .keyboardShortcut(.space, modifiers: [.command, .shift])
+
+            Button("Show Overlay", action: showOverlay)
+            Button("Hide Overlay", action: hideOverlay)
+
+            Divider()
+
+            if let task = model.activeTask {
+                VStack(alignment: .leading) {
+                    Text("Coding")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(task.objective)
+                        .lineLimit(2)
+                    Text(task.state.replacingOccurrences(of: "_", with: " ").capitalized)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if task.state == "paused" {
+                    Button("Resume Coding") { model.controlActiveTask("resume") }
+                } else {
+                    Button("Pause Coding") { model.controlActiveTask("pause") }
+                }
+            } else {
+                Text(model.daemonConnected ? "Coder idle" : "Starting daemon…")
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            Button {
+                model.chooseWorkspace()
+            } label: {
+                Label(URL(filePath: model.workspace).lastPathComponent, systemImage: "folder")
+            }
+
+            Button(action: model.openSettings) {
+                Label("Settings…", systemImage: "gear")
+            }
+
+            Divider()
+
+            Button("Quit Mamachi") { NSApp.terminate(nil) }
+                .keyboardShortcut("q")
+        }
+    }
+}

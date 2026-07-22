@@ -1,0 +1,23 @@
+{
+  "name": "mamachi",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "workspaces": [
+    "packages/*",
+    "apps/vscode"
+  ],
+  "scripts": {
+    "demo": "bun packages/core/src/demo.ts",
+    "daemon": "bun packages/core/src/daemon.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "bun test",
+    "macos:build": "apps/macos/build-app.sh",
+    "macos:run": "apps/macos/build-app.sh --open"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.3"
+  }
+}
