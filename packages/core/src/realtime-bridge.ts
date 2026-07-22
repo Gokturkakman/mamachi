@@ -353,6 +353,12 @@ You cannot inspect the repository yourself. Any request whose answer depends on 
 # Web research
 For current facts or web lookup, call research_web instead of answering from memory. Research runs through the coding agent and must return source URLs.
 
+# Preambles
+Do not speak before any tool call. Status checks, interface controls, workspace inspection, and task commands must be called immediately and silently. For a coding or research handoff, call the tool silently, then acknowledge it in one short sentence only after the tool succeeds. Never start a tool turn with filler such as "Let me check," "I'll look that up," or "One moment."
+
+# Interface control
+When the user says "expand", asks to open the orb, or asks to show the conversation or current task, call set_overlay with action "expand". When the user asks to collapse, minimize, or return to the orb, call set_overlay with action "collapse".
+
 # Course correction
 A clarification or changed requirement must use revise_task. Before calling it, summarize the revised objective and obtain explicit confirmation. The tool safely pauses, versions the task, and resumes it. Never describe a revision as applied before the tool succeeds.
 
@@ -360,7 +366,7 @@ A clarification or changed requirement must use revise_task. Before calling it, 
 Use control_task only for an explicit pause, resume, or cancel request. A barge-in does not imply cancellation.
 
 # Style
-Default to one short spoken sentence of at most 20 words. Do not restate the request or narrate your reasoning. Ask one brief question only when required. Task status gives only outcome, current step, or blocker. Expand only when the user explicitly asks for detail. Never give progress percentages or time estimates. Mirror the user's language and preserve technical identifiers verbatim.
+Default to one short spoken sentence of at most 20 words. Do not restate the request or narrate your reasoning. Ask one brief question only when required. Task status gives only outcome, current step, or blocker. Give additional detail only when the user explicitly asks. Never give progress percentages or time estimates. Mirror the user's language and preserve technical identifiers verbatim.
 
 # Audio
 If audio is unclear, ask briefly rather than guessing. If audio is silence, media, background speech, or not addressed to you, call wait_for_user and remain silent.
@@ -390,7 +396,7 @@ ${this.#options.getWorkspace()}
       {
         type: "function",
         name: "get_task_status",
-        description: "Read authoritative status for the active or specified task.",
+        description: "Silently read authoritative status for the active or specified task. Call immediately with no spoken preamble.",
         parameters: {
           type: "object",
           additionalProperties: false,
@@ -456,6 +462,19 @@ ${this.#options.getWorkspace()}
             deliverable: { type: "string", minLength: 1 },
           },
           required: ["query", "deliverable"],
+        },
+      },
+      {
+        type: "function",
+        name: "set_overlay",
+        description: "Silently expand or collapse the Mamachi orb. Use immediately when the user says expand, open, show conversation, collapse, or minimize.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            action: { type: "string", enum: ["expand", "collapse"] },
+          },
+          required: ["action"],
         },
       },
       {
@@ -725,6 +744,15 @@ ${this.#options.getWorkspace()}
         const task = this.#resolveTask(input["taskId"]);
         if (!task) return { status: "idle", queue: this.#options.getSnapshot().queue };
         return this.#status(task);
+      }
+      case "set_overlay": {
+        const action = requireString(input["action"], "action");
+        if (!(action === "expand" || action === "collapse")) {
+          throw new Error("action must be expand or collapse");
+        }
+        const expanded = action === "expand";
+        this.#options.emit("ui.overlay", { expanded });
+        return { status: "ok", expanded };
       }
       case "control_task": {
         const task = this.#resolveTask(input["taskId"]);

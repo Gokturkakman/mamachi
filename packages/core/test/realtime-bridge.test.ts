@@ -123,6 +123,7 @@ describe("RealtimeBridge", () => {
       },
       output: { format: { type: "audio/pcm", rate: 24_000 }, voice: "marin" },
     });
+    expect(session["instructions"]).toContain("Do not speak before any tool call.");
     const tools = session["tools"];
     expect(Array.isArray(tools) ? tools.map((tool) => isRecord(tool) ? tool["name"] : null) : []).toEqual([
       "submit_task",
@@ -131,6 +132,7 @@ describe("RealtimeBridge", () => {
       "revise_task",
       "inspect_workspace",
       "research_web",
+      "set_overlay",
       "get_workspace",
       "wait_for_user",
     ]);
@@ -776,6 +778,74 @@ describe("RealtimeBridge", () => {
     client?.send(JSON.stringify({ type: "response.done", response: { status: "completed", output: [] } }));
     await proactiveResponse.promise;
     await announcementSpoken.promise;
+    expect(responseCreates).toBe(2);
+    await bridge.disconnect();
+  });
+
+  test("expands the orb through a silent realtime tool", async () => {
+    let responseCreates = 0;
+    const expanded = Promise.withResolvers<void>();
+    const followUpRequested = Promise.withResolvers<void>();
+    const emitted: Array<{ type: string; payload: unknown }> = [];
+    server = Bun.serve<MockClientData>({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request, bunServer) {
+        const upgraded = bunServer.upgrade(request, { data: { authenticated: true } });
+        return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
+      },
+      websocket: {
+        open() {},
+        message(socket, message) {
+          if (typeof message !== "string") return;
+          const event = JSON.parse(message) as Record<string, unknown>;
+          if (event["type"] === "session.update") {
+            socket.send(JSON.stringify({ type: "session.updated", session: { id: "session_overlay" } }));
+          } else if (event["type"] === "response.create") {
+            responseCreates += 1;
+            if (responseCreates === 1) {
+              socket.send(
+                JSON.stringify({
+                  type: "response.done",
+                  response: {
+                    status: "completed",
+                    output: [{
+                      type: "function_call",
+                      call_id: "overlay_call",
+                      name: "set_overlay",
+                      arguments: JSON.stringify({ action: "expand" }),
+                    }],
+                  },
+                }),
+              );
+            } else {
+              followUpRequested.resolve();
+            }
+          }
+        },
+      },
+    });
+    const bridge = new RealtimeBridge({
+      apiKey: "test-realtime-key",
+      endpoint: `ws://127.0.0.1:${server.port}/realtime`,
+      getWorkspace: () => "/tmp/mamachi-workspace",
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [] }),
+      executeCommand: async () => {
+        throw new Error("overlay controls must not execute a coding command");
+      },
+      emit: (type, payload) => {
+        emitted.push({ type, payload });
+        if (type === "ui.overlay") expanded.resolve();
+      },
+      emitAudio: () => {},
+    });
+
+    await bridge.connect();
+    bridge.sendText("Expand");
+    await expanded.promise;
+    await followUpRequested.promise;
+
+    expect(emitted).toContainEqual({ type: "ui.overlay", payload: { expanded: true } });
     expect(responseCreates).toBe(2);
     await bridge.disconnect();
   });

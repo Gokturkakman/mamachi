@@ -425,6 +425,11 @@ final class AppModel: ObservableObject {
             if let mode = payload["mode"] as? String, let interactionMode = InteractionMode(rawValue: mode) {
                 self.interactionMode = interactionMode
             }
+        case "ui.overlay":
+            if let expanded = payload["expanded"] as? Bool {
+                drawerExpanded = expanded
+                if expanded { onShowOverlay?() }
+            }
         case "voice.interrupt":
             audio.clearPlayback()
         case "voice.error":
