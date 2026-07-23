@@ -85,6 +85,9 @@ export interface VoiceHostCallbacks {
   forgetFact?: (memoryId: string) => boolean;
   controlComputer?: (request: ComputerControlRequest) => Promise<ComputerControlResult>;
   emit: (type: string, payload: unknown) => void;
+  /// Registers a screen capture as an attachable context artifact (returns
+  /// the stored artifact) so voice can hand pixels to the coding agent.
+  captureScreenContext?: (path: string, summary: string) => Promise<CapturedContext>;
 }
 
 /// What the toolkit sees: daemon callbacks plus the little bridge state the
@@ -94,6 +97,11 @@ export interface VoiceToolHost extends VoiceHostCallbacks {
   getResponseMode(): VoiceResponseMode;
   /// `mute_mamachi`: disengage the microphone silently.
   sleepMicrophone(): void;
+  /// Attach a user-turn image (data URL) plus a guidance note to the live
+  /// conversation so the model can inspect pixels this turn. Bridges own
+  /// retention: the cascade detaches images after their turn because it
+  /// re-sends full history per request.
+  attachUserImage(note: string, dataUrl: string): void;
 }
 
 /// Function-tool definition in OpenAI Responses API shape. The Realtime API

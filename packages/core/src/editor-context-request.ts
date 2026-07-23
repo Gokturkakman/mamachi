@@ -1,6 +1,8 @@
 import type { ContextKind } from "./artifact-store.ts";
 
-export const editorContextKinds = ["active_file", "selection", "diagnostics", "terminal_excerpt"] as const satisfies readonly ContextKind[];
+/// The kinds VS Code can capture; deliberately narrower than `ContextKind`
+/// (daemon-internal kinds like `screenshot` are not editor-capturable).
+export const editorContextKinds: readonly ContextKind[] = ["active_file", "selection", "diagnostics", "terminal_excerpt"];
 
 export interface EditorContextCapture {
   kind: ContextKind;

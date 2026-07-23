@@ -71,10 +71,16 @@ interface MessageContent {
   text: string;
 }
 
+interface ImageContent {
+  type: "input_image";
+  image_url: string;
+  detail: "high";
+}
+
 interface MessageItem {
   type: "message";
   role: "user" | "assistant" | "system";
-  content: [MessageContent];
+  content: [MessageContent] | [MessageContent, ImageContent];
 }
 
 type HistoryItem =
@@ -141,6 +147,8 @@ export class CascadeBridge implements VoiceBridge {
   readonly #responsesEndpoint: string;
   readonly #reconnectDelaysMs: readonly number[];
   readonly #history: HistoryItem[] = [];
+  /// Live screenshot attachments awaiting end-of-turn detachment.
+  readonly #imageItems: MessageItem[] = [];
   readonly #queuedBriefs = new Map<string, VoiceBrief>();
   #openaiApiKey: string | undefined;
   #elevenLabsApiKey: string | undefined;
@@ -384,6 +392,19 @@ export class CascadeBridge implements VoiceBridge {
         this.setEngaged(false);
         this.#options.emit("ui.mute", {});
       },
+      attachUserImage: (note: string, dataUrl: string) => {
+        const item: MessageItem = {
+          type: "message",
+          role: "user",
+          content: [
+            { type: "input_text", text: note },
+            { type: "input_image", image_url: dataUrl, detail: "high" },
+          ],
+        };
+        this.#history.push(item);
+        this.#imageItems.push(item);
+        this.#log("vision.attached", { bytes: dataUrl.length });
+      },
     };
     if (options.getAvailableWorkspaces) host.getAvailableWorkspaces = options.getAvailableWorkspaces;
     if (options.getCodingProfiles) host.getCodingProfiles = options.getCodingProfiles;
@@ -599,6 +620,7 @@ export class CascadeBridge implements VoiceBridge {
 
   #startTurn(): void {
     this.#abortActiveTurn();
+    this.#detachStaleImages();
     this.#log("turn.start", { history: this.#history.length, mode: this.#responseMode });
     const turn: ActiveTurn = {
       itemId: Bun.randomUUIDv7(),
@@ -618,6 +640,22 @@ export class CascadeBridge implements VoiceBridge {
     this.#turn = turn;
     this.#options.emit("voice.state", { state: "thinking" });
     void this.#runTurn(turn);
+  }
+
+  /// Images ride only the turn they were captured in: the cascade re-sends
+  /// the FULL history with every Responses request, so a Retina screenshot
+  /// left in place would be re-uploaded on every future turn. The realtime
+  /// engine keeps images server-side; one-turn retention is the cascade's
+  /// equivalent.
+  #detachStaleImages(): void {
+    if (this.#imageItems.length === 0) return;
+    for (const item of this.#imageItems.splice(0)) {
+      item.content = [{
+        type: "input_text",
+        text: "[A screenshot was attached here and inspected during its turn. It was detached afterward to keep requests small; call look_at_screen again if the screen must be re-read.]",
+      }];
+    }
+    this.#log("vision.detached", {});
   }
 
   #abortActiveTurn(): void {
@@ -665,9 +703,14 @@ export class CascadeBridge implements VoiceBridge {
         // record outputs, stop the chain, request nothing further.
         if (calls.every((call) => call.name === "wait_for_user")) break;
         if (calls.some((call) => call.name === "mute_mamachi")) break;
-        if (rounds >= 4) {
+        // Interactive computer control (games, multi-step UI work) needs far
+        // more than the old 4 rounds; the cap is a runaway brake, not a
+        // budget — barge-in and mute remain the human stop. Realtime's own
+        // cap lives in its bridge and should be aligned when it migrates
+        // onto this toolkit.
+        if (rounds >= 24) {
           this.#options.emit("voice.error", {
-            error: "Voice tool chain stopped after four consecutive tool rounds",
+            error: "Voice tool chain stopped after 24 consecutive tool rounds",
           });
           break;
         }

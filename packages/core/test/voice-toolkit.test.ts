@@ -84,12 +84,14 @@ interface HostHarness {
   emitted: Array<{ type: string; payload: unknown }>;
   commands: Array<Record<string, unknown>>;
   sleepCalls: { count: number };
+  attachedImages: Array<{ note: string; dataUrl: string }>;
 }
 
 function makeHost(overrides: Partial<VoiceToolHost> = {}): HostHarness {
   const emitted: Array<{ type: string; payload: unknown }> = [];
   const commands: Array<Record<string, unknown>> = [];
   const sleepCalls = { count: 0 };
+  const attachedImages: Array<{ note: string; dataUrl: string }> = [];
   const host: VoiceToolHost = {
     getWorkspace: () => "/repo",
     getSnapshot: () => makeSnapshot(),
@@ -105,9 +107,12 @@ function makeHost(overrides: Partial<VoiceToolHost> = {}): HostHarness {
     sleepMicrophone: () => {
       sleepCalls.count += 1;
     },
+    attachUserImage: (note, dataUrl) => {
+      attachedImages.push({ note, dataUrl });
+    },
     ...overrides,
   };
-  return { host, emitted, commands, sleepCalls };
+  return { host, emitted, commands, sleepCalls, attachedImages };
 }
 
 function makeContext(id: string): CapturedContext {
@@ -147,6 +152,8 @@ describe("createVoiceToolkit", () => {
       "inspect_workspace",
       "research_web",
       "set_overlay",
+      "look_at_screen",
+      "capture_screen_context",
       "control_computer",
       "resolve_computer_control",
       "mute_mamachi",
@@ -487,6 +494,102 @@ describe("createVoiceToolkit", () => {
     const toolkit = createVoiceToolkit(host);
     expect(await toolkit.execute("mute_mamachi", {})).toEqual({ status: "ok", muted: true });
     expect(sleepCalls.count).toBe(1);
+    toolkit.dispose();
+  });
+  test("look_at_screen attaches validated pixels through the host", async () => {
+    const pngPath = `/tmp/mamachi-test-screen-${Bun.randomUUIDv7()}.png`;
+    const pngBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    await Bun.write(pngPath, Buffer.from(pngBase64, "base64"));
+    const { host, attachedImages } = makeHost({
+      controlComputer: async (request) => ({
+        status: "ok",
+        action: request.action,
+        target: pngPath,
+      } as ComputerControlResult),
+    });
+    const toolkit = createVoiceToolkit(host);
+
+    const result = asRecord(await toolkit.execute("look_at_screen", {}));
+    expect(result["visualInputAttached"]).toBe(true);
+    expect(typeof result["visualInputInstruction"]).toBe("string");
+    expect(attachedImages).toHaveLength(1);
+    expect(attachedImages[0]?.dataUrl.startsWith("data:image/png;base64,")).toBe(true);
+    expect(attachedImages[0]?.note).toContain("untrusted content");
+    toolkit.dispose();
+  });
+
+  test("look_at_screen reports a missing screenshot instead of attaching", async () => {
+    const { host, attachedImages } = makeHost({
+      controlComputer: async (request) => ({
+        status: "ok",
+        action: request.action,
+        target: `/tmp/mamachi-test-missing-${Bun.randomUUIDv7()}.png`,
+      } as ComputerControlResult),
+    });
+    const toolkit = createVoiceToolkit(host);
+
+    const result = asRecord(await toolkit.execute("look_at_screen", {}));
+    expect(result["visualInputAttached"]).toBe(false);
+    expect(result["visualInputError"]).toBe("The captured screenshot file does not exist");
+    expect(attachedImages).toHaveLength(0);
+    toolkit.dispose();
+  });
+
+  test("screenshots reach the model only through look_at_screen", () => {
+    const { host } = makeHost();
+    const toolkit = createVoiceToolkit(host);
+    const names = toolkit.tools().map((tool) => tool.name);
+    expect(names).toContain("look_at_screen");
+    expect(names).toContain("capture_screen_context");
+    const controlComputer = toolkit.tools().find((tool) => tool.name === "control_computer");
+    const actions = asRecord(asRecord(asRecord(controlComputer?.parameters)["properties"])["action"]);
+    expect(actions["enum"]).not.toContain("take_screenshot");
+    toolkit.dispose();
+  });
+
+  test("capture_screen_context returns a real attachment id", async () => {
+    const pngPath = `/tmp/mamachi-test-attach-${Bun.randomUUIDv7()}.png`;
+    await Bun.write(pngPath, Buffer.from([137, 80, 78, 71]));
+    const capturedSummaries: string[] = [];
+    const { host } = makeHost({
+      controlComputer: async (request) => ({
+        status: "ok",
+        action: request.action,
+        target: pngPath,
+      } as ComputerControlResult),
+      captureScreenContext: async (path, summary) => {
+        capturedSummaries.push(summary);
+        return {
+          id: "ctx_screen_1",
+          kind: "screenshot",
+          workspace: "/repo",
+          summary,
+          payload: { path },
+          createdAt: new Date(0).toISOString(),
+        };
+      },
+    });
+    const toolkit = createVoiceToolkit(host);
+
+    const result = asRecord(await toolkit.execute("capture_screen_context", {}));
+    expect(result["status"]).toBe("accepted");
+    expect(result["artifactIds"]).toEqual(["ctx_screen_1"]);
+    expect(result["kind"]).toBe("screenshot");
+    expect(capturedSummaries).toHaveLength(1);
+    toolkit.dispose();
+  });
+
+  test("capture_screen_context degrades without the daemon callback", async () => {
+    const harness = makeHost();
+    // Simulates a host wired without persistent state (":memory:" daemon).
+    const host = { ...harness.host };
+    delete (host as Partial<VoiceToolHost>).captureScreenContext;
+    const toolkit = createVoiceToolkit(host as VoiceToolHost);
+
+    const result = asRecord(await toolkit.execute("capture_screen_context", {}));
+    expect(result["status"]).toBe("rejected");
+    expect(result["code"]).toBe("screenshot_attachment_unavailable");
     toolkit.dispose();
   });
 });

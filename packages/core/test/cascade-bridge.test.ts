@@ -585,6 +585,65 @@ describe("CascadeBridge", () => {
     ]);
   });
 
+  test("screenshots attach for one turn then detach from history", async () => {
+    providers = startProviders();
+    const toolkit = createFakeToolkit();
+    // Mirrors look_at_screen: the executor pushes pixels through the host.
+    toolkit.execute = async (name, input) => {
+      toolkit.executed.push({ name, input });
+      toolkit.host?.attachUserImage("Inspect this image now.", "data:image/png;base64,QUJD");
+      return { visualInputAttached: true };
+    };
+    const emitted: Emitted[] = [];
+    const audio: Array<{ pcm: Uint8Array; playback: { itemId: string; contentIndex: number } }> = [];
+    const bridge = bridgeFor(providers, toolkit, emitted, audio);
+    const state = providers;
+
+    state.responseQueue.push(() => sse([
+      {
+        type: "response.output_item.done",
+        item: {
+          type: "function_call",
+          call_id: "call_see_1",
+          name: "look_at_screen",
+          arguments: "{}",
+        },
+      },
+      { type: "response.completed", response: {} },
+    ]));
+    state.responseQueue.push(() => sse([
+      { type: "response.output_text.delta", delta: "I can see the board now." },
+      { type: "response.completed", response: {} },
+    ]));
+    state.onTtsMessage = (socket, event) => {
+      if (event["text"] === "") socket.send(JSON.stringify({ isFinal: true }));
+    };
+
+    await bridge.connect();
+    bridge.sendText("Look at my screen");
+
+    // The tool round attaches the image; the follow-up request must carry it.
+    const secondBody = await state.until(() => state.responsesBodies[1]);
+    const withImage = JSON.stringify(secondBody["input"]);
+    expect(withImage).toContain("\"type\":\"input_image\"");
+    expect(withImage).toContain("data:image/png;base64,QUJD");
+    expect(withImage).toContain("\"detail\":\"high\"");
+
+    await state.until(() => emitted.find((entry) => entry.type === "voice.transcript.assistant"));
+
+    // Next turn: the image is detached so it never rides future requests.
+    state.responseQueue.push(() => sse([
+      { type: "response.output_text.delta", delta: "Next." },
+      { type: "response.completed", response: {} },
+    ]));
+    bridge.sendText("Continue");
+    const thirdBody = await state.until(() => state.responsesBodies[2]);
+    const detached = JSON.stringify(thirdBody["input"]);
+    expect(detached).not.toContain("input_image");
+    expect(detached).not.toContain("QUJD");
+    expect(detached).toContain("detached");
+  });
+
   test("text mode skips TTS entirely", async () => {
     providers = startProviders();
     const toolkit = createFakeToolkit();

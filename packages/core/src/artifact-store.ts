@@ -4,7 +4,7 @@ import { assessToolCall, type PolicyCategory } from "./policy.ts";
 import { extractToolPaths } from "./workspace-guard.ts";
 import { migrateStorage } from "./storage-schema.ts";
 
-export type ContextKind = "active_file" | "selection" | "diagnostics" | "terminal_excerpt";
+export type ContextKind = "active_file" | "selection" | "diagnostics" | "terminal_excerpt" | "screenshot";
 
 export interface CapturedContext {
   id: string;

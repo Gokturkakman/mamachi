@@ -1,6 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
-import { realpathSync, statSync } from "node:fs";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { copyFileSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
 import { parseCommand, type ActionResult, type DomainEvent } from "@mamachi/protocol";
 import { TaskController } from "./controller.ts";
@@ -159,12 +159,16 @@ export class MamachiIpcServer {
   readonly #clients = new Set<ClientSocket>();
   readonly #server: Server<ClientData>;
   #workspace: string;
+  readonly #screenshotDirectory: string | null;
 
   constructor(options: IpcServerOptions) {
     this.#token = options.token;
     this.#hooks = options.hooks ?? {};
     this.#workspace = realpathSync(options.initialWorkspace ?? process.cwd());
     const databasePath = options.databasePath ?? ":memory:";
+    this.#screenshotDirectory = databasePath === ":memory:"
+      ? null
+      : join(dirname(resolve(databasePath)), "screenshots");
     this.#store = new EventStore(databasePath, { encryptionKey: options.encryptionKey ?? null });
     this.#artifacts = new ArtifactStore(databasePath, { encryptionKey: options.encryptionKey ?? null });
     this.#facts = new FactProjector(this.#artifacts);
@@ -238,6 +242,40 @@ export class MamachiIpcServer {
 
   getArtifacts(ids: readonly string[]): CapturedContext[] {
     return this.#artifacts.get(ids);
+  }
+
+  /// Registers a screen capture as an attachable context artifact. Voice
+  /// engines call this so a screenshot gets a real attachment ID that
+  /// `task.submit` accepts; the file is copied out of /tmp into the state
+  /// directory so it survives until the coding agent reads it.
+  captureScreenshotContext(sourcePath: string, summary: string): CapturedContext {
+    if (!this.#screenshotDirectory) {
+      throw new Error("Screenshot attachments require a persistent state directory");
+    }
+    if (!isAbsolute(sourcePath)) throw new Error("Screenshot path must be absolute");
+    const extension = extname(sourcePath).toLowerCase();
+    if (extension !== ".png" && extension !== ".jpg" && extension !== ".jpeg") {
+      throw new Error("Screenshot attachments support PNG and JPEG only");
+    }
+    const size = statSync(sourcePath).size;
+    if (size <= 0) throw new Error("The captured screenshot is empty");
+    mkdirSync(this.#screenshotDirectory, { recursive: true, mode: 0o700 });
+    const stablePath = join(this.#screenshotDirectory, `${Bun.randomUUIDv7()}${extension}`);
+    copyFileSync(sourcePath, stablePath);
+    const artifact = this.#artifacts.capture("screenshot", this.#workspace, summary, {
+      path: stablePath,
+      mimeType: extension === ".png" ? "image/png" : "image/jpeg",
+      byteLength: size,
+      note: "Open this image file to view the captured screen.",
+    });
+    this.emit("context.captured", {
+      id: artifact.id,
+      kind: artifact.kind,
+      workspace: artifact.workspace,
+      summary: artifact.summary,
+    });
+    this.#hooks.onContextCaptured?.(artifact);
+    return artifact;
   }
 
   getTaskArtifact(taskId: string, artifactId: string): EvidenceArtifact | null {

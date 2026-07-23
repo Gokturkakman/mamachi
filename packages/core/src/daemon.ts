@@ -213,6 +213,8 @@ const voiceCallbacks = {
   forgetFact: (memoryId: string) => daemon.forgetFact(memoryId),
   controlComputer: (request: ComputerControlRequest) => computerController.control(request),
   emit: (type: string, payload: unknown) => daemon.emit(type, payload),
+  captureScreenContext: async (path: string, summary: string) =>
+    daemon.captureScreenshotContext(path, summary),
 };
 
 realtime = new RealtimeBridge({
