@@ -6,7 +6,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 APP_DIR="${MAMACHI_APP_OUTPUT:-$SCRIPT_DIR/dist/Mamachi.app}"
 CONTENTS="$APP_DIR/Contents"
 RUNTIME_DIR="$CONTENTS/Resources/runtime"
-SIGN_MODE="${MAMACHI_SIGN_MODE:-adhoc}"
+SIGN_MODE="${MAMACHI_SIGN_MODE:-auto}"
 NOTARIZE="${MAMACHI_NOTARIZE:-0}"
 APP_VERSION="${MAMACHI_VERSION:-0.1.0}"
 
@@ -24,7 +24,30 @@ fi
     || fail "Bun is required at build time. Install Bun or set MAMACHI_BUILD_BUN to an executable."
 command -v swift >/dev/null || fail "Swift is required to build the macOS application."
 
+find_signing_identity() {
+    local prefix="$1"
+    security find-identity -v -p codesigning 2>/dev/null \
+        | awk -F '"' -v prefix="$prefix" 'index($2, prefix) == 1 { print $2; exit }'
+}
+
 case "$SIGN_MODE" in
+    auto)
+        SIGN_IDENTITY="${MAMACHI_SIGN_IDENTITY:-}"
+        if [[ -z "$SIGN_IDENTITY" ]]; then
+            SIGN_IDENTITY="$(find_signing_identity "Developer ID Application:")"
+        fi
+        if [[ -z "$SIGN_IDENTITY" ]]; then
+            SIGN_IDENTITY="$(find_signing_identity "Apple Development:")"
+        fi
+        if [[ -z "$SIGN_IDENTITY" ]]; then
+            SIGN_IDENTITY="-"
+            printf '%s\n' \
+                "build-app.sh: warning: no persistent signing identity found; using ad-hoc signing." \
+                "build-app.sh: warning: rebuilt apps may ask for Keychain access again. Configure MAMACHI_SIGN_IDENTITY to prevent this." >&2
+        else
+            printf 'Signing Mamachi with persistent identity: %s\n' "$SIGN_IDENTITY"
+        fi
+        ;;
     adhoc)
         SIGN_IDENTITY="-"
         ;;
@@ -35,20 +58,23 @@ case "$SIGN_MODE" in
         SIGN_IDENTITY="${MAMACHI_SIGN_IDENTITY:-}"
         [[ -n "$SIGN_IDENTITY" ]] \
             || fail "MAMACHI_SIGN_IDENTITY is required when MAMACHI_SIGN_MODE=developer-id."
-        security find-identity -v -p codesigning | grep -F "$SIGN_IDENTITY" >/dev/null \
-            || fail "Developer ID signing identity was not found in the keychain: $SIGN_IDENTITY"
         ;;
     *)
-        fail "MAMACHI_SIGN_MODE must be one of: adhoc, none, developer-id."
+        fail "MAMACHI_SIGN_MODE must be one of: auto, adhoc, none, developer-id."
         ;;
 esac
+
+if [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]]; then
+    security find-identity -v -p codesigning | grep -F "\"$SIGN_IDENTITY\"" >/dev/null \
+        || fail "Code-signing identity was not found in the keychain: $SIGN_IDENTITY"
+fi
 
 if [[ "$NOTARIZE" != "0" && "$NOTARIZE" != "1" ]]; then
     fail "MAMACHI_NOTARIZE must be 0 or 1."
 fi
 if [[ "$NOTARIZE" == "1" ]]; then
-    [[ "$SIGN_MODE" == "developer-id" ]] \
-        || fail "Notarization requires MAMACHI_SIGN_MODE=developer-id."
+    [[ "$SIGN_IDENTITY" == "Developer ID Application:"* ]] \
+        || fail "Notarization requires a Developer ID Application identity."
     [[ -n "${MAMACHI_NOTARY_PROFILE:-}" ]] \
         || fail "MAMACHI_NOTARY_PROFILE is required when MAMACHI_NOTARIZE=1."
     xcrun notarytool history --keychain-profile "$MAMACHI_NOTARY_PROFILE" >/dev/null \
@@ -112,7 +138,7 @@ printf '{"daemonVersion":"%s"}\n' "$APP_VERSION" > "$RUNTIME_DIR/daemon-version.
 
 if [[ -n "$SIGN_IDENTITY" ]]; then
     SIGN_ARGS=(--force --sign "$SIGN_IDENTITY")
-    if [[ "$SIGN_MODE" == "developer-id" ]]; then
+    if [[ "$SIGN_MODE" == "developer-id" || "$NOTARIZE" == "1" ]]; then
         SIGN_ARGS+=(--options runtime --timestamp)
     fi
     if [[ -n "${MAMACHI_ENTITLEMENTS:-}" ]]; then

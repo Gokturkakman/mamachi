@@ -15,6 +15,7 @@ struct OverlayView: View {
     @ObservedObject var model: AppModel
     @State private var message = ""
     @FocusState private var composerFocused: Bool
+    @State private var composerFocusTask: Task<Void, Never>?
     @State private var surface: OverlaySurface = .conversation
     @Environment(\.colorScheme) private var colorScheme
 
@@ -22,17 +23,17 @@ struct OverlayView: View {
         Group {
             if model.drawerExpanded {
                 expandedPanel
-                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
             } else {
-                compactOrb
-                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                compactIndicator
             }
         }
-        .padding(16)
-        .animation(.smooth(duration: 0.38), value: model.drawerExpanded)
         .onChange(of: model.drawerExpanded) { _, expanded in
-            guard expanded, surface == .conversation else { return }
-            focusComposerSoon()
+            composerFocusTask?.cancel()
+            if expanded, surface == .conversation {
+                focusComposerSoon()
+            } else {
+                composerFocused = false
+            }
         }
         .onChange(of: surface) { _, next in
             guard next == .conversation, model.drawerExpanded else { return }
@@ -40,68 +41,67 @@ struct OverlayView: View {
         }
     }
 
-    private var compactOrb: some View {
-        GeometryReader { proxy in
-            ZStack {
-                WindowDragHandle(
-                    onClick: compactOrbAction,
-                    contextMenuActions: OrbContextMenuActions(
-                        openTaskDrawer: {
-                            surface = .task
-                            model.drawerExpanded = true
-                        },
-                        openChat: {
-                            surface = .conversation
-                            model.drawerExpanded = true
-                        },
-                        openSettings: model.openSettings,
-                        hideOverlay: model.hideOverlay,
-                        quitApplication: model.quitApplication
-                    )
-                )
-                .clipShape(Capsule())
-
-                HStack(spacing: 7) {
-                    Capsule()
-                        .fill(compactIndicatorColor)
-                        .frame(width: model.isEngaged || model.activeTask != nil ? 22 : 12, height: 3)
-                        .shadow(color: compactIndicatorColor.opacity(0.8), radius: 3)
-                        .animation(.snappy(duration: 0.2), value: model.isEngaged)
-                        .animation(.snappy(duration: 0.2), value: model.activeTaskId)
-                    Text(compactIndicatorText)
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
-                    Button {
-                        model.drawerExpanded = true
-                    } label: {
-                        Image(systemName: "chevron.up")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 20, height: 20)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("Open Mamachi")
-                }
-                .padding(.leading, 10)
-                .padding(.trailing, 5)
-                .allowsHitTesting(true)
-            }
-            .frame(width: proxy.size.width, height: proxy.size.height)
-            .background(.ultraThinMaterial, in: Capsule())
-            .overlay {
-                Capsule().strokeBorder(Theme.specularEdge, lineWidth: 1)
-            }
-            .overlay(alignment: .bottom) {
+    private var compactIndicator: some View {
+        ZStack {
+            HStack(spacing: 8) {
                 Capsule()
-                    .fill(model.activeTask.map { Theme.statusColor($0.state) } ?? .clear)
-                    .frame(height: 1.5)
-                    .padding(.horizontal, 12)
+                    .fill(compactIndicatorColor)
+                    .frame(width: 18, height: 3)
+                    .shadow(
+                        color: compactIndicatorColor.opacity(model.isEngaged ? 0.8 : 0),
+                        radius: 3
+                    )
+
+                Text(compactIndicatorText)
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
+                Spacer(minLength: 4)
+
+                Image(systemName: "chevron.up")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.tertiary)
             }
-            .shadow(color: .black.opacity(colorScheme == .dark ? 0.26 : 0.12), radius: 7, y: 2)
+            .padding(.horizontal, 11)
+            .allowsHitTesting(false)
+
+            WindowDragHandle(
+                onClick: {
+                    model.drawerExpanded = true
+                },
+                contextMenuActions: OrbContextMenuActions(
+                    openTaskDrawer: {
+                        surface = .task
+                        model.drawerExpanded = true
+                    },
+                    openChat: {
+                        surface = .conversation
+                        model.drawerExpanded = true
+                    },
+                    openSettings: model.openSettings,
+                    hideOverlay: model.hideOverlay,
+                    quitApplication: model.quitApplication
+                )
+            )
+            .clipShape(Capsule())
         }
-        .help("\(compactOrbHelp). Right-click for app menu and Quit.")
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.ultraThinMaterial, in: Capsule())
+        .background(
+            Color(nsColor: .windowBackgroundColor)
+                .opacity(colorScheme == .dark ? 0.72 : 0.58),
+            in: Capsule()
+        )
+        .overlay {
+            Capsule().strokeBorder(Theme.specularEdge, lineWidth: 1)
+        }
+        .shadow(
+            color: .black.opacity(colorScheme == .dark ? 0.24 : 0.12),
+            radius: 6,
+            y: 2
+        )
+        .help("Open Mamachi. Drag to move; right-click for app controls.")
         .accessibilityLabel("\(compactIndicatorText), \(codingStatusLabel)")
     }
 
@@ -111,6 +111,7 @@ struct OverlayView: View {
 
     private var expandedPanel: some View {
         VStack(spacing: 12) {
+            expandedDragHandle
             expandedHeader
             workspaceStatusRow
             if let error = model.errorMessage {
@@ -133,7 +134,7 @@ struct OverlayView: View {
             }
         }
         .padding(14)
-        .frame(minWidth: 440, maxWidth: .infinity, minHeight: 508, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background {
             RoundedRectangle(cornerRadius: 24, style: .continuous)
                 .fill(.ultraThinMaterial)
@@ -271,10 +272,33 @@ struct OverlayView: View {
             GlassIconButton(systemImage: "power", help: "Quit Mamachi", action: model.quitApplication)
                 .keyboardShortcut("q", modifiers: .command)
 
-            GlassIconButton(systemImage: "chevron.down", help: "Collapse to orb") {
+            Button {
                 model.drawerExpanded = false
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .bold))
+                    .frame(width: 30, height: 28)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 9))
+                    .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .help("Collapse Mamachi")
+            .accessibilityLabel("Collapse Mamachi")
         }
+    }
+
+    private var expandedDragHandle: some View {
+        ZStack {
+            Capsule()
+                .fill(.secondary.opacity(0.28))
+                .frame(width: 34, height: 4)
+
+            WindowDragHandle(onClick: {}, contextMenuActions: nil)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 10)
+        .contentShape(Rectangle())
+        .help("Drag Mamachi")
     }
 
     private var transcriptSection: some View {
@@ -520,6 +544,9 @@ struct OverlayView: View {
     }
 
     private var compactIndicatorText: String {
+        if !model.daemonConnected {
+            return model.errorMessage == nil ? "Starting…" : "Offline"
+        }
         if taskNeedsAttention { return "Needs you" }
         if model.activeTask != nil { return "Coding" }
         if model.isEngaged { return model.voiceState.label }
@@ -528,6 +555,9 @@ struct OverlayView: View {
     }
 
     private var compactIndicatorColor: Color {
+        if !model.daemonConnected {
+            return model.errorMessage == nil ? .secondary : .red
+        }
         if taskNeedsAttention { return .orange }
         if let task = model.activeTask { return Theme.statusColor(task.state) }
         if model.voiceState == .error { return .red }
@@ -541,11 +571,7 @@ struct OverlayView: View {
     }
 
     private func compactOrbAction() {
-        if model.interactionMode == .text {
-            model.drawerExpanded = true
-        } else {
-            model.toggleEngagement()
-        }
+        model.drawerExpanded = true
     }
 
     private func expandedOrbAction() {
@@ -559,10 +585,16 @@ struct OverlayView: View {
         message = ""
     }
 
-    /// Focuses the composer once the panel has become key after expanding.
+    /// Focuses the composer on the next main-actor turn, once the expanded view exists.
     private func focusComposerSoon() {
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(420))
+        composerFocusTask?.cancel()
+        composerFocusTask = Task { @MainActor in
+            await Task.yield()
+            guard
+                !Task.isCancelled,
+                model.drawerExpanded,
+                surface == .conversation
+            else { return }
             composerFocused = true
         }
     }

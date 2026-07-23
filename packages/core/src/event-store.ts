@@ -61,6 +61,7 @@ export class EventStore {
     if (path !== ":memory:") this.#db.run("PRAGMA journal_mode = WAL");
     migrateStorage(this.#db);
     this.#encryptLegacyPayloads();
+    this.#migrateLegacyCodingSessions();
   }
 
 
@@ -203,6 +204,42 @@ export class EventStore {
     transaction.immediate();
   }
 
+
+  #migrateLegacyCodingSessions(): void {
+    const rows = this.#db
+      .query<{ id: string; payload_json: string }, []>(
+        "SELECT id, payload_json FROM events WHERE type = 'coder.sessionBound'",
+      )
+      .all();
+    if (rows.length === 0) return;
+
+    const update = this.#db.query("UPDATE events SET payload_json = ? WHERE id = ?");
+    const transaction = this.#db.transaction(() => {
+      for (const row of rows) {
+        const serialized = this.#codec.decode(
+          row.payload_json,
+          `events.payload_json:${row.id}`,
+        );
+        const payload: unknown = JSON.parse(serialized);
+        if (
+          typeof payload !== "object"
+          || payload === null
+          || Array.isArray(payload)
+          || "backend" in payload
+        ) {
+          continue;
+        }
+        update.run(
+          this.#codec.encode(
+            JSON.stringify({ ...payload, backend: "omp" }),
+            `events.payload_json:${row.id}`,
+          ),
+          row.id,
+        );
+      }
+    });
+    transaction.immediate();
+  }
 
   close(): void {
     this.#db.close();
