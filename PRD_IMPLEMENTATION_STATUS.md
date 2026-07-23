@@ -32,8 +32,10 @@ The implementation is local-first and keeps one mutating coding job active at a 
 - Backend-qualified session IDs are persisted and resumed in the original repository after accepted pauses and restart recovery.
 - User-selectable primary/fast model selectors, thinking level, and automatic routing remain available; provider-qualified model names map only to matching direct CLIs.
 - Structured tool and external-turn events normalize into task/run evidence. Completion requires persisted successful evidence; file changes require later successful verification.
+- Explicit commit tasks start direct Codex/Claude turns with repository-local `.git` write access and a commit-authorizing prompt; non-commit tasks retain the no-commit sandbox. A resumed turn receives the user’s exact answer instead of an acknowledgement paraphrase, and the voice bridge rejects any coder answer not grounded verbatim in the current user turn.
 - OMP reuses discovered provider auth storage. Explicit provider keys remain optional for coding and are passed only to the selected adapter.
 - Provider keys, the encryption key, and daemon IPC token are removed from the general tool process environment.
+- Equivalent in-flight web research is deduplicated, research prompts are bounded to the requested facts, and substantive coding jobs move ahead of queued fast/research tasks.
 
 ### Policy, attribution, and observation
 
@@ -46,23 +48,30 @@ The implementation is local-first and keeps one mutating coding job active at a 
 - Deterministic fact projection separates implementation, verification, blocker, decision, file, and progress state.
 - A read-only passive OMP observer receives bounded projected facts, cannot call tools, and cannot mutate controller state.
 
-### Realtime voice bridge
+### Voice bridges
 
-- OpenAI Realtime WebSocket adapter with duplex 24 kHz PCM, text mode, server VAD, interruption, provider-history truncation using exact played-audio metadata, bounded reconnect, and response/tool-chain state.
+- OpenAI Realtime WebSocket adapter with duplex 24 kHz PCM, text mode, server VAD, interruption, provider-history truncation using exact played-audio metadata, bounded reconnect, response/tool-chain state, and inactivity/cancellation watchdogs that replace wedged provider sessions automatically.
 - The provider connection remains open while the microphone sleeps.
-- Completion, failure, and attention briefs queue durably while sleeping and are delivered only after re-engagement.
+- Completion, failure, and attention briefs queue durably while sleeping and are delivered only after re-engagement. Open coder questions are restored from controller state and proactively relayed after app/provider reconnection.
 - Realtime failures do not stop coding; coding failures do not terminate the voice session.
 - Complete strict tool surface from PRD section 16, including workspace/profile discovery, explicit editor capture, task submission/status/artifacts, exact coder answers, safe task changes, queue control, memories, configurable computer control, overlay control, and microphone sleep.
 - Consequential changes pause at a safe boundary, persist a revised specification, and resume; low-risk clarifications use direct steering.
+- User-selectable secondary cascaded engine: ElevenLabs Scribe v2 Realtime STT (`pcm_24000`, VAD end-of-utterance commit, partial transcripts as pending text) → GPT-5.5 through the streaming Responses API with reasoning effort `none` and the full section-16 tool loop → ElevenLabs Flash v2.5 websocket TTS (`pcm_24000`, default voice Rachel) with chunk-relative character alignment accumulated into an absolute timeline so barge-in truncates the conversation to exactly the audio the user heard.
+- The cascade's tool surface lives in a shared `voice-toolkit` module (canonical going forward; the realtime bridge migrates onto it once its in-flight reconnect work lands) with identical tool schemas, validation, confirmation flows, and instructions.
+- Engine choice is a runtime setting (`voiceEngine`, default speech-to-speech) synced from the app; the daemon retires the outgoing engine's provider session on switch while conversation state stays in-process. The ElevenLabs key is Keychain-stored and travels only in `voice.connect`.
 - Casual conversation is not durable memory. Only confirmed task facts and explicit remember/forget actions persist.
+- Provider speech transcriptions remain provisional and are only committed to the visible transcript when the turn is accepted; disengaged/background speech and `wait_for_user` turns are discarded.
 
 ### macOS product surface
 
 - Menu-bar lifecycle, Wispr-style wake gestures on a configurable bare modifier (double-tap Fn for hands-free, hold for push-to-talk, tap again to barge in or sleep) that survive terminal Secure Keyboard Entry, the global `⌥Space` hotkey as a fallback needing no Accessibility trust, explicit Open/Hide/Quit controls, and live idle/working/attention status.
 - Exact-size 116×28 non-activating collapsed pill with a live microphone waveform while listening, a playout-timed speech waveform while the assistant talks, shimmer/pulse thinking and connecting states, concise status text while dormant, whole-surface drag/open behavior, right-click recovery controls, and expandable Task/Chat surface.
-- Expanded Task/Chat drawer with live transcript, composer, current objective/step, queue, confirmations, coder questions, revision history, changed files, evidence, verification, and controls.
+- Expanded Task/Chat drawer with a non-overlapping live transcript, composer, current objective/step, queue, confirmations, verbatim coder questions, revision history, changed files, evidence, verification, and controls. The header prioritizes the active question over stale transcript/activity text.
 - Animated collapse/expand morph from the shared bottom-center anchor (easeOut frame animation with synchronized content crossfade), sub-150 ms wake acknowledgment pop, and reduce-motion fallbacks throughout.
 - Accessibility-gated wake-key monitoring with live status in Settings, plus Globe-key conflict detection (emoji, input-source, and dictation bindings) with keyboard-settings deep links in Settings and onboarding.
+- Audio-route resilience: `AVAudioEngineConfigurationChange` recovery (acting only on a genuinely stopped engine, with intent-driven watchdog retries) rebuilds the input tap/converter against the new device format and resets stranded playback completions, so device switches (AirPods, headphones, sleep/wake) can no longer wedge the microphone gate shut mid-session.
+- Capture wire conversion pins the converter channel map to channel 0: multi-channel voice-processing mic arrays carry inverted beamforming residue in the extra channels, and the previous blind downmix phase-cancelled speech into zero-RMS silence while the level meter looked alive.
+- Permanent single-line stderr voice diagnostics across the daemon dispatch and cascade bridge (engagement, connect, audio forwarding with sampled RMS, Scribe lifecycle/unhandled types, turn/TTS lifecycle; never transcript content) — invisible in the bundled app, captured when launched with a wrapper daemon.
 - Native notifications and optional reaction sounds for attention/completion.
 - Repository picker plus focused VS Code workspace handoff.
 - First-run onboarding requires a working coding agent, detects existing OMP/Codex/Claude logins, and offers one-click terminal installation/login. An OMP API key is an optional fallback, not a duplicate requirement.
@@ -85,19 +94,21 @@ The implementation is local-first and keeps one mutating coding job active at a 
 ## Verification
 
 - `bun run typecheck`: passed.
-- `bun test`: 92 passed, 0 failed across protocol, core, backend-runner, computer-control, and VS Code tests.
+- `bun test`: 121 passed, 0 failed across protocol, core, backend-runner, computer-control, cascade-voice, and VS Code tests.
 - `apps/vscode`: typecheck and production bundle passed as part of the workspace checks/build.
-- `cd apps/macos && swift test`: 39 passed, 0 failed, including the wake-gesture recognizer (double-tap, hold, combo poisoning, engagement mapping), audio-level history, rapid overlay transitions, anchor invariants, OMP-login parsing, snapshots, audio, privacy, and encryption.
+- `cd apps/macos && swift test`: 43 passed, 0 failed, including phase-cancelling channel conversion, voice-engine persistence, the wake-gesture recognizer (double-tap, hold, combo poisoning, engagement mapping), audio route-change recovery with benign-notification immunity, audio-level history, rapid overlay transitions, anchor invariants, OMP-login parsing, snapshots, audio, privacy, and encryption.
+- Live cascade smoke on this machine: wake → Scribe v2 realtime session established → partial and committed transcripts → GPT-5.5 turn → Flash v2.5 TTS reply, verified end-to-end through daemon stderr diagnostics with real provider keys.
 - `apps/macos/build-app.sh`: produced `apps/macos/dist/Mamachi.app` with the embedded daemon and VS Code extension.
 - `codesign --verify --deep --strict --verbose=2 apps/macos/dist/Mamachi.app`: valid on disk and satisfies its designated requirement.
 - Live backend smokes: Codex completed a supervised repository task and OMP completed an authenticated provider turn. Claude’s authenticated CLI emitted the expected structured session protocol, then the local account rejected model work for insufficient credit; deterministic Claude stream/resume coverage passes.
+- Live conversation smokes: three consecutive production Realtime turns delivered 16 audio chunks with exact final transcripts, no interruptions, no errors, and no accepted microphone/echo transcript. A temporary Codex `workspace-write` run with repository-local `.git` access created the requested commit and left its worktree clean.
 - Native UI smoke: onboarding detected the existing Codex login and completed without a coding API key; the final overlay held an identical bottom-center anchor across drag, 440×540 expansion, and 116×28 collapse. Fifty immediate expand/collapse cycles completed with zero frame or input failures. Repeated launches, including after a rebuild, reached Ready with no SecurityAgent prompt. Chrome, Calendar, and Discord launched; named Chrome UI inspection and Reload activation succeeded. Outlook was not installed and returned that exact macOS error.
 
 ## External release validation still required
 
 These are environment/release gates, not missing implementation:
 
-1. Run the full voice-to-verified-change golden path with production OpenAI Realtime and each supported coding backend on clean accounts.
+1. Run the full voice-to-verified-change golden path with production OpenAI Realtime and each supported coding backend on clean accounts, plus the cascaded engine (Scribe v2 Realtime, GPT-5.5, Flash v2.5) with production ElevenLabs and OpenAI keys, including live barge-in truncation and Turkish/English dictation.
 2. Exercise microphone permission, the Fn/Globe wake gestures (including macOS double-Fn Dictation and Globe-key conflicts plus terminal Secure Keyboard Entry), `⌥Space`, VoiceOver, real speaker playback/truncation, and focused VS Code handoff on clean physical Macs.
 3. Run the documented 10-minute conversation/reconnect and concurrent-save acceptance matrix with production providers.
 4. Sign with the team’s Developer ID certificate, submit with its notary profile, staple, and install the resulting invited-alpha artifact on a clean machine.
@@ -106,10 +117,12 @@ These are environment/release gates, not missing implementation:
 
 - Added explicit OMP, Codex, and Claude backend routing, backend-qualified session recovery, structured event normalization, and existing-login reuse.
 - Repaired legacy encrypted `coder.sessionBound` events that predate backend-qualified sessions, allowing existing local databases to start under the current protocol.
+- Added the user-selectable cascaded voice profile (Scribe v2 Realtime → GPT-5.5 reasoning-none → Flash v2.5), the shared voice toolkit that both engines will converge on, engine dispatch in the daemon, ElevenLabs key onboarding/settings, and mock-provider pipeline tests covering the turn loop, tool round-trips, alignment-based truncation, text mode, briefs, and error taxonomy.
 - Reworked onboarding so setup cannot finish without a working coder, coding API keys are optional fallbacks, and setup/install/login controls are visible without scrolling.
 - Replaced the conflicting shortcut and circular collapsed orb with `⌥Space`, menu-bar activity state, explicit Open/Hide/Quit controls, and a slim state capsule.
 - Rebuilt overlay sizing around one persisted anchor and exact fixed frames; deferred `@Published` transitions avoid stale SwiftUI state, and a persistent native collapse target accepts the first click even during immediate mode changes.
 - Added arbitrary application launch aliases, accessibility UI inspection, named in-app actions, and multi-step voice-control guidance with visible-result verification.
 - Added backend/control regression coverage, protocol generation/consumer checks, reconnect replay, focused editor capture, release packaging, and end-to-end smoke coverage.
+- Repaired conversation reliability end to end: response-stall recovery, conservative transcript acceptance, proactive/restored coder questions, exact answer propagation, duplicate research suppression, substantive-work queue priority, explicit Git commit authorization, and immediate transcript reflow.
 - Defaulted local packaging to a stable signing identity so Keychain trusts the same designated requirement across rebuilds; ad-hoc fallback remains explicit and warns about repeated authorization. Hardened Developer ID builds apply the Bun runtime entitlements and launch the embedded daemon successfully.
 - Adopted the Wispr Flow interaction model: bare-modifier wake gestures (double-tap hands-free, hold-to-talk, tap-to-stop) recognized by a clock-injected state machine, a live waveform pill fed by real playout-time audio levels, an animated overlay morph, and wake-key conflict guidance in Settings and onboarding.

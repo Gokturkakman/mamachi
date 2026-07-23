@@ -20,10 +20,13 @@ final class AppModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var hasAPIKey = false
     @Published var needsAPIKey = false
+    @Published var hasElevenLabsKey = false
+    @Published var needsElevenLabsKey = false
     @Published var drawerExpanded = false
     @Published var collapsedOverlaySize: OverlaySizePreset
     @Published var expandedOverlaySize: OverlaySizePreset
     @Published var interactionMode: InteractionMode
+    @Published var voiceEngine: VoiceEngine
     @Published var activationKey: ActivationKey
     @Published var activationMonitorActive = false
     @Published var codingAgentBackend: CodingAgentBackend
@@ -151,6 +154,7 @@ final class AppModel: ObservableObject {
         ) ?? .medium
         defaults.removeObject(forKey: "overlayCompactSize")
         interactionMode = InteractionMode(rawValue: defaults.string(forKey: "interactionMode") ?? "") ?? .voice
+        voiceEngine = VoiceEngine(rawValue: defaults.string(forKey: "voiceEngine") ?? "") ?? .realtime
         activationKey = ActivationKey(
             rawValue: defaults.string(forKey: "activationKey") ?? ""
         ) ?? .fn
@@ -185,6 +189,7 @@ final class AppModel: ObservableObject {
         transcriptStore = try? TranscriptStore()
         transcripts = (try? transcriptStore?.load()) ?? []
         hasAPIKey = ((try? keychain.loadAPIKey()) ?? nil) != nil
+        hasElevenLabsKey = ((try? keychain.loadElevenLabsKey()) ?? nil) != nil
         workspace = UserDefaults.standard.string(forKey: "workspace")
             ?? ProcessInfo.processInfo.environment["MAMACHI_WORKSPACE"]
             ?? (try? DaemonProcess.projectRoot().path)
@@ -363,6 +368,16 @@ final class AppModel: ObservableObject {
         onActivationKeyChange?()
     }
 
+    func setVoiceEngine(_ engine: VoiceEngine) {
+        let changed = engine != voiceEngine
+        voiceEngine = engine
+        UserDefaults.standard.set(engine.rawValue, forKey: "voiceEngine")
+        syncRuntimeSettings()
+        // The daemon swaps bridges on settings.update; drop the live session
+        // so the next engagement reconnects on the newly selected engine.
+        if changed && voiceState != .disconnected { disconnectVoice() }
+    }
+
     /// Maps recognizer verdicts onto engagement transitions. Wake gestures
     /// also raise the overlay, mirroring the legacy `⌥Space` behavior.
     func handleActivation(_ verdict: ActivationVerdict) {
@@ -432,9 +447,23 @@ final class AppModel: ObservableObject {
                 return
             }
             needsAPIKey = false
+            var payload: [String: Any] = ["apiKey": apiKey]
+            if voiceEngine == .cascade {
+                guard let elevenLabsKey = try keychain.loadElevenLabsKey(), !elevenLabsKey.isEmpty else {
+                    resumeEngagementAfterKey = isEngaged
+                    isEngaged = false
+                    ipc.reportVoiceEngagement(false, playback: nil)
+                    needsElevenLabsKey = true
+                    errorMessage = "Add an ElevenLabs API key to use the cascaded voice."
+                    openSettings()
+                    return
+                }
+                needsElevenLabsKey = false
+                payload["elevenLabsApiKey"] = elevenLabsKey
+            }
             voiceState = .connecting
             ipc.reportVoiceEngagement(isEngaged, playback: nil)
-            ipc.sendRequest(type: "voice.connect", payload: ["apiKey": apiKey])
+            ipc.sendRequest(type: "voice.connect", payload: payload)
         } catch {
             isEngaged = false
             ipc.reportVoiceEngagement(false, playback: nil)
@@ -480,6 +509,35 @@ final class AppModel: ObservableObject {
                 if shouldEngage { isEngaged = true }
                 if shouldEngage || pendingText != nil { connectVoice() }
             }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func saveElevenLabsKey(_ rawKey: String) {
+        let key = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            removeElevenLabsKey()
+            return
+        }
+        do {
+            try keychain.saveElevenLabsKey(key)
+            hasElevenLabsKey = true
+            needsElevenLabsKey = false
+            let shouldEngage = resumeEngagementAfterKey
+            resumeEngagementAfterKey = false
+            if shouldEngage { isEngaged = true }
+            if shouldEngage || pendingText != nil { connectVoice() }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func removeElevenLabsKey() {
+        do {
+            try keychain.deleteElevenLabsKey()
+            hasElevenLabsKey = false
+            if voiceEngine == .cascade { disconnectVoice() }
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -801,6 +859,9 @@ final class AppModel: ObservableObject {
                 "automaticRouting": automaticModelRouting,
                 "computerCapabilities": computerCapabilities.map(\.rawValue).sorted(),
                 "computerConfirmationMode": computerConfirmationMode.rawValue,
+                "voiceEngine": voiceEngine.rawValue,
+                "cascadeReasoningEffort": "none",
+                "cascadeVoiceId": "",
             ]
         )
         ipc.sendRequest(type: "voice.mode", payload: ["mode": interactionMode.rawValue])

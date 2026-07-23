@@ -43,6 +43,9 @@ const configured: RuntimeSettings = {
   automaticRouting: true,
   computerCapabilities: ["applications", "keyboard"],
   computerConfirmationMode: "sensitive",
+  voiceEngine: "realtime",
+  cascadeReasoningEffort: "none",
+  cascadeVoiceId: "",
 };
 
 describe("model router", () => {

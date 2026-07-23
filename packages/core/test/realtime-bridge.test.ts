@@ -337,6 +337,70 @@ describe("RealtimeBridge", () => {
     expect(connectionCount).toBe(2);
   });
 
+  test("reconnects automatically when a provider response stalls", async () => {
+    const emitted: Array<{ type: string; payload: unknown }> = [];
+    const reconnected = Promise.withResolvers<void>();
+    let connectionCount = 0;
+    server = Bun.serve<MockClientData>({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request, bunServer) {
+        const upgraded = bunServer.upgrade(request, { data: { authenticated: true } });
+        return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
+      },
+      websocket: {
+        open() {
+          connectionCount += 1;
+          if (connectionCount === 2) reconnected.resolve();
+        },
+        message(socket, message) {
+          if (typeof message !== "string") return;
+          const event = JSON.parse(message) as Record<string, unknown>;
+          if (event["type"] === "session.update") {
+            socket.send(JSON.stringify({
+              type: "session.updated",
+              session: { id: `session_watchdog_${connectionCount}` },
+            }));
+          }
+          // Deliberately leave response.create unanswered on the first socket.
+        },
+      },
+    });
+    const bridge = new RealtimeBridge({
+      apiKey: "test-realtime-key",
+      endpoint: `ws://127.0.0.1:${server.port}/realtime`,
+      reconnectDelaysMs: [1],
+      responseTimeoutMs: 10,
+      getWorkspace: () => "/tmp/mamachi-workspace",
+      getSnapshot: () => ({
+        seq: 0,
+        activeTaskId: null,
+        queue: [],
+        tasks: [],
+        runs: [],
+        confirmations: [],
+        questions: [],
+      }),
+      executeCommand: async () => ({ status: "accepted", eventId: Bun.randomUUIDv7() }),
+      emit: (type, payload) => emitted.push({ type, payload }),
+      emitAudio: () => {},
+    });
+
+    await bridge.connect();
+    await Bun.sleep(20);
+    bridge.sendText("This response will stall");
+    await reconnected.promise;
+    await Bun.sleep(20);
+    expect(
+      emitted.some((event) =>
+        event.type === "voice.error" &&
+        isRecord(event.payload) &&
+        String(event.payload["error"]).includes("stopped responding")
+      ),
+    ).toBe(true);
+    await bridge.disconnect();
+  });
+
   test("wait_for_user ends the response chain", async () => {
     let client: ServerWebSocket<MockClientData> | undefined;
     const idle = Promise.withResolvers<void>();
@@ -1607,6 +1671,7 @@ test("section 16 handlers enforce correlation, ownership, revisions, queue comma
   const commands: Array<Record<string, unknown>> = [];
   const pendingCalls = new Map<string, (value: Record<string, unknown>) => void>();
   let client: ServerWebSocket<MockClientData> | undefined;
+  let suppressAutomaticResponse = false;
   const connected = Promise.withResolvers<void>();
   const handlerServer = Bun.serve<MockClientData>({
     hostname: "127.0.0.1",
@@ -1632,7 +1697,7 @@ test("section 16 handlers enforce correlation, ownership, revisions, queue comma
             pendingCalls.get(item["call_id"])?.(output);
             pendingCalls.delete(item["call_id"]);
           }
-        } else if (event["type"] === "response.create") {
+        } else if (event["type"] === "response.create" && !suppressAutomaticResponse) {
           queueMicrotask(() => socket.send(JSON.stringify({
             type: "response.done",
             response: { status: "completed", output: [] },
@@ -1810,9 +1875,19 @@ test("section 16 handlers enforce correlation, ownership, revisions, queue comma
     artifactId: "artifact-1",
     view: "summary",
   })).toMatchObject({ status: "rejected", code: "artifact_not_found" });
+  suppressAutomaticResponse = true;
+  expect(await invoke("answer_task_question", { requestId: "question-1", answer: "Use v2" })).toMatchObject({
+    status: "rejected",
+    code: "user_answer_required",
+  });
+  bridge.sendText("Use v2");
   expect(await invoke("answer_task_question", { requestId: "stale-question", answer: "Use v2" })).toMatchObject({
     status: "rejected",
     code: "question_not_open",
+  });
+  expect(await invoke("answer_task_question", { requestId: "question-1", answer: "Use version 2" })).toMatchObject({
+    status: "rejected",
+    code: "answer_not_verbatim",
   });
   await invoke("answer_task_question", { requestId: "question-1", answer: "Use v2" });
   expect(commands.at(-1)).toMatchObject({

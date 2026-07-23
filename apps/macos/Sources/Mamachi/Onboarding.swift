@@ -33,6 +33,8 @@ final class OnboardingModel: ObservableObject {
     @Published var step: OnboardingStep
     @Published var statusMessage = ""
     @Published var realtimeKey = ""
+    @Published var elevenLabsKey = ""
+    @Published var selectedVoiceEngine: VoiceEngine
     @Published var codingCredential = ""
     @Published var codingProvider: CodingProvider = .anthropic
     @Published var selectedBackend: CodingAgentBackend
@@ -47,6 +49,7 @@ final class OnboardingModel: ObservableObject {
     init(appModel: AppModel, keychain: KeychainStore = KeychainStore(), onComplete: @escaping () -> Void) {
         let previousVersion = UserDefaults.standard.integer(forKey: Self.completionDefaultsKey)
         step = previousVersion >= 1 ? .codingAgent : .microphone
+        selectedVoiceEngine = appModel.voiceEngine
         selectedBackend = appModel.codingAgentBackend
         self.appModel = appModel
         self.keychain = keychain
@@ -146,13 +149,33 @@ final class OnboardingModel: ObservableObject {
         }
     }
 
+    /// Whether the realtime-credential step can complete: the OpenAI key is
+    /// required for both engines (GPT-5.5 uses it); the cascade additionally
+    /// requires an ElevenLabs key.
+    var canSaveRealtimeCredential: Bool {
+        guard !realtimeKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        guard selectedVoiceEngine == .cascade else { return true }
+        return !elevenLabsKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     func saveRealtimeCredential() {
         let value = realtimeKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return }
+        let elevenLabsValue = elevenLabsKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if selectedVoiceEngine == .cascade && elevenLabsValue.isEmpty { return }
         do {
             try keychain.saveAPIKey(value)
             appModel.hasAPIKey = true
+            if selectedVoiceEngine == .cascade {
+                appModel.saveElevenLabsKey(elevenLabsValue)
+                guard appModel.hasElevenLabsKey else {
+                    statusMessage = appModel.errorMessage ?? "The ElevenLabs key could not be saved."
+                    return
+                }
+            }
+            appModel.setVoiceEngine(selectedVoiceEngine)
             realtimeKey = ""
+            elevenLabsKey = ""
             advance()
         } catch {
             statusMessage = error.localizedDescription
@@ -317,15 +340,27 @@ struct OnboardingView: View {
 
     private var realtimeStep: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Label("OpenAI Realtime key", systemImage: "waveform.badge.mic")
+            Label("Voice engine and keys", systemImage: "waveform.badge.mic")
                 .font(.title2.bold())
-            Text("Required for Mamachi voice and chat. The key is saved only in your macOS Keychain and sent directly to OpenAI.")
-            SecureField("Realtime API key", text: $onboarding.realtimeKey)
+            Picker("Voice engine", selection: $onboarding.selectedVoiceEngine) {
+                ForEach(VoiceEngine.allCases) { engine in
+                    Text(engine.label).tag(engine)
+                }
+            }
+            Text(onboarding.selectedVoiceEngine.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("An OpenAI key is required for both engines. Keys are saved only in your macOS Keychain and sent directly to each provider.")
+            SecureField("OpenAI API key", text: $onboarding.realtimeKey)
                 .textContentType(.password)
+            if onboarding.selectedVoiceEngine == .cascade {
+                SecureField("ElevenLabs API key", text: $onboarding.elevenLabsKey)
+                    .textContentType(.password)
+            }
             HStack {
                 Spacer()
                 Button("Save in Keychain") { onboarding.saveRealtimeCredential() }
-                    .disabled(onboarding.realtimeKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(!onboarding.canSaveRealtimeCredential)
                     .buttonStyle(.borderedProminent)
             }
         }

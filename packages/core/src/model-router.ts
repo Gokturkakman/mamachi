@@ -9,6 +9,12 @@ import type {
   ComputerCapability,
   ComputerConfirmationMode,
 } from "./computer-control.ts";
+import {
+  cascadeReasoningEfforts,
+  voiceEngines,
+  type CascadeReasoningEffort,
+  type VoiceEngine,
+} from "./voice-bridge.ts";
 
 export const codingBackends = ["omp", "codex", "claude"] as const;
 export type CodingBackend = (typeof codingBackends)[number];
@@ -25,6 +31,9 @@ export interface RuntimeSettings {
   automaticRouting: boolean;
   computerCapabilities: ComputerCapability[];
   computerConfirmationMode: ComputerConfirmationMode;
+  voiceEngine: VoiceEngine;
+  cascadeReasoningEffort: CascadeReasoningEffort;
+  cascadeVoiceId: string;
 }
 
 export const defaultRuntimeSettings: RuntimeSettings = {
@@ -35,6 +44,9 @@ export const defaultRuntimeSettings: RuntimeSettings = {
   automaticRouting: true,
   computerCapabilities: [...assistiveComputerCapabilities],
   computerConfirmationMode: "sensitive",
+  voiceEngine: "realtime",
+  cascadeReasoningEffort: "none",
+  cascadeVoiceId: "",
 };
 
 export interface TaskRoute {
@@ -98,6 +110,9 @@ export function parseRuntimeSettings(input: unknown): RuntimeSettings {
     "automaticRouting",
     "computerCapabilities",
     "computerConfirmationMode",
+    "voiceEngine",
+    "cascadeReasoningEffort",
+    "cascadeVoiceId",
   ];
   if (keys.length !== expected.length || keys.some((key) => !expected.includes(key))) {
     throw new Error("settings.update payload has unexpected fields");
@@ -141,6 +156,23 @@ export function parseRuntimeSettings(input: unknown): RuntimeSettings {
       `computerConfirmationMode must be one of: ${computerConfirmationModes.join(", ")}`,
     );
   }
+  const voiceEngine = value["voiceEngine"];
+  const cascadeReasoningEffort = value["cascadeReasoningEffort"];
+  const cascadeVoiceId = value["cascadeVoiceId"];
+  if (typeof voiceEngine !== "string" || !voiceEngines.includes(voiceEngine as VoiceEngine)) {
+    throw new Error(`voiceEngine must be one of: ${voiceEngines.join(", ")}`);
+  }
+  if (
+    typeof cascadeReasoningEffort !== "string" ||
+    !cascadeReasoningEfforts.includes(cascadeReasoningEffort as CascadeReasoningEffort)
+  ) {
+    throw new Error(
+      `cascadeReasoningEffort must be one of: ${cascadeReasoningEfforts.join(", ")}`,
+    );
+  }
+  if (typeof cascadeVoiceId !== "string" || cascadeVoiceId.length > 100) {
+    throw new Error("cascadeVoiceId must be a string of at most 100 characters");
+  }
   return {
     codingBackend: codingBackend as CodingBackend,
     primaryModel: primaryModel.trim(),
@@ -149,5 +181,8 @@ export function parseRuntimeSettings(input: unknown): RuntimeSettings {
     automaticRouting,
     computerCapabilities: configuredComputerCapabilities as ComputerCapability[],
     computerConfirmationMode: computerConfirmationMode as ComputerConfirmationMode,
+    voiceEngine: voiceEngine as VoiceEngine,
+    cascadeReasoningEffort: cascadeReasoningEffort as CascadeReasoningEffort,
+    cascadeVoiceId: cascadeVoiceId.trim(),
   };
 }

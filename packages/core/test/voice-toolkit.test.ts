@@ -1,0 +1,492 @@
+import { describe, expect, setSystemTime, test } from "bun:test";
+import type { ActionResult } from "@mamachi/protocol";
+import type { ControllerSnapshot, TaskRecord } from "../src/domain.ts";
+import type { CapturedContext } from "../src/artifact-store.ts";
+import type { ComputerControlResult } from "../src/computer-control.ts";
+import type { TaskFacts } from "../src/fact-projector.ts";
+import type { VoiceToolHost } from "../src/voice-bridge.ts";
+import { createVoiceToolkit } from "../src/voice-toolkit.ts";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) throw new Error("expected an object result");
+  return value;
+}
+
+function stringField(value: unknown, key: string): string {
+  const field = asRecord(value)[key];
+  if (typeof field !== "string") throw new Error(`expected string field ${key}`);
+  return field;
+}
+
+function makeTask(overrides: Partial<TaskRecord> = {}): TaskRecord {
+  return {
+    id: "task-1",
+    repositoryId: "/repo",
+    state: "running",
+    spec: {
+      repositoryId: "/repo",
+      objective: "Fix the flaky login test",
+      acceptanceCriteria: ["Login test passes ten times in a row"],
+      constraints: ["No production config changes"],
+      attachmentIds: [],
+      codingProfileId: null,
+    },
+    revision: 3,
+    activeRunId: null,
+    runIds: [],
+    evidenceIds: [],
+    createdAt: "2026-07-23T00:00:00.000Z",
+    updatedAt: "2026-07-23T00:00:00.000Z",
+    terminalSummary: null,
+    workspaceConflict: null,
+    pendingQuestion: null,
+    specHistory: [],
+    ...overrides,
+  };
+}
+
+function makeSnapshot(tasks: TaskRecord[] = [makeTask()]): ControllerSnapshot {
+  return {
+    seq: 1,
+    activeTaskId: tasks[0]?.id ?? null,
+    queue: tasks.map((task) => task.id),
+    tasks,
+    runs: [],
+    confirmations: [],
+    questions: [],
+  };
+}
+
+function makeFacts(taskId: string): TaskFacts {
+  return {
+    taskId,
+    phase: "implementation",
+    progress: 0.5,
+    currentStep: "Editing auth.ts",
+    implementationState: "changed",
+    verificationState: "pending",
+    changedFiles: ["src/auth.ts"],
+    verificationSummaries: [],
+    recentActivity: [],
+    evidenceIds: [],
+    observerInterpretation: null,
+    groundedAt: "2026-07-23T00:00:00.000Z",
+    groundedAtSeq: 1,
+  };
+}
+
+interface HostHarness {
+  host: VoiceToolHost;
+  emitted: Array<{ type: string; payload: unknown }>;
+  commands: Array<Record<string, unknown>>;
+  sleepCalls: { count: number };
+}
+
+function makeHost(overrides: Partial<VoiceToolHost> = {}): HostHarness {
+  const emitted: Array<{ type: string; payload: unknown }> = [];
+  const commands: Array<Record<string, unknown>> = [];
+  const sleepCalls = { count: 0 };
+  const host: VoiceToolHost = {
+    getWorkspace: () => "/repo",
+    getSnapshot: () => makeSnapshot(),
+    executeCommand: async (command) => {
+      commands.push(asRecord(command));
+      return { status: "accepted", eventId: Bun.randomUUIDv7() } satisfies ActionResult;
+    },
+    emit: (type, payload) => {
+      emitted.push({ type, payload });
+    },
+    isEngaged: () => true,
+    getResponseMode: () => "voice",
+    sleepMicrophone: () => {
+      sleepCalls.count += 1;
+    },
+    ...overrides,
+  };
+  return { host, emitted, commands, sleepCalls };
+}
+
+function makeContext(id: string): CapturedContext {
+  return {
+    id,
+    kind: "selection",
+    workspace: "/repo",
+    summary: "selected auth handler",
+    payload: { text: "function login() {}" },
+    createdAt: "2026-07-23T00:00:00.000Z",
+  };
+}
+
+describe("createVoiceToolkit", () => {
+  test("exposes the full PRD-16 tool surface and grounded instructions", () => {
+    const { host } = makeHost({
+      getComputerCapabilities: () => ["applications", "shell"],
+      getComputerConfirmationMode: () => "always",
+    });
+    const toolkit = createVoiceToolkit(host);
+    expect(toolkit.tools().map((tool) => tool.name)).toEqual([
+      "wait_for_user",
+      "get_workspace",
+      "list_coding_profiles",
+      "capture_editor_context",
+      "submit_task",
+      "get_task_status",
+      "get_task_artifact",
+      "answer_task_question",
+      "ask_coder",
+      "propose_task_change",
+      "control_task",
+      "manage_queue",
+      "resolve_confirmation",
+      "remember_fact",
+      "forget_fact",
+      "inspect_workspace",
+      "research_web",
+      "set_overlay",
+      "control_computer",
+      "resolve_computer_control",
+      "mute_mamachi",
+    ]);
+    expect(toolkit.tools().every((tool) => tool.type === "function" && tool.parameters["type"] === "object")).toBe(true);
+    const instructions = toolkit.instructions();
+    expect(instructions).toContain("# Current workspace\n/repo");
+    expect(instructions).toContain("Enabled capability categories: applications, shell.");
+    expect(instructions).toContain("Confirmation policy: always.");
+    toolkit.dispose();
+  });
+
+  test("answers task status views from the snapshot, facts, and noted harness activity", async () => {
+    const { host } = makeHost({ getTaskFacts: makeFacts });
+    const toolkit = createVoiceToolkit(host);
+    toolkit.noteHarnessEvent("coder.tool", { taskId: "task-1", toolName: "bash" });
+
+    expect(await toolkit.execute("get_task_status", { taskId: "task-1", view: "brief" })).toEqual({
+      id: "task-1",
+      state: "running",
+      revision: 3,
+      objective: "Fix the flaky login test",
+      repositoryId: "/repo",
+      summary: null,
+      queuePosition: 0,
+    });
+
+    // taskId null resolves the active task, as in the realtime executor.
+    const step = asRecord(await toolkit.execute("get_task_status", { taskId: null, view: "current_step" }));
+    expect(step["currentStep"]).toBe("Editing auth.ts");
+    expect(stringField(step["recentActivity"], "summary")).toBe("coder.tool: bash");
+
+    expect(await toolkit.execute("get_task_status", { taskId: "missing", view: "brief" })).toEqual({
+      status: "idle",
+      queue: ["task-1"],
+    });
+    toolkit.dispose();
+  });
+
+  test("enforces the exact realtime validation error messages", async () => {
+    const toolkit = createVoiceToolkit(makeHost().host);
+    await expect(toolkit.execute("get_task_status", "brief")).rejects.toThrow("get_task_status arguments must be an object");
+    await expect(toolkit.execute("wait_for_user", { stray: 1 })).rejects.toThrow("wait_for_user does not accept stray");
+    await expect(toolkit.execute("get_workspace", { view: "all" })).rejects.toThrow("view must be active or available");
+    await expect(toolkit.execute("ask_coder", { taskId: "", question: "q" })).rejects.toThrow(
+      "taskId must be a non-empty string",
+    );
+    await expect(
+      toolkit.execute("submit_task", {
+        repositoryId: "/repo",
+        objective: "x",
+        acceptanceCriteria: [],
+        constraints: [],
+        attachmentIds: [],
+        codingProfileId: null,
+      }),
+    ).rejects.toThrow("acceptanceCriteria must contain at least one item");
+    await expect(
+      toolkit.execute("submit_task", {
+        repositoryId: "/repo",
+        objective: "x",
+        acceptanceCriteria: [1],
+        constraints: [],
+        attachmentIds: [],
+        codingProfileId: null,
+      }),
+    ).rejects.toThrow("acceptanceCriteria must be an array of non-empty strings");
+    await expect(toolkit.execute("get_task_status", { taskId: 42, view: "brief" })).rejects.toThrow(
+      "taskId must be a task ID or null",
+    );
+    await expect(toolkit.execute("get_task_status", { taskId: null, view: "bogus" })).rejects.toThrow(
+      "get_task_status view is invalid",
+    );
+    await expect(toolkit.execute("resolve_computer_control", { requestId: "r", decision: "maybe" })).rejects.toThrow(
+      "decision must be approve or reject",
+    );
+    await expect(toolkit.execute("manage_queue", { taskId: "task-1", operation: "shuffle", anchorTaskId: null })).rejects.toThrow(
+      "manage_queue operation is invalid",
+    );
+    await expect(toolkit.execute("control_computer", { action: "levitate" })).rejects.toThrow(
+      "control_computer action is invalid",
+    );
+    await expect(toolkit.execute("bogus_tool", {})).rejects.toThrow("Unknown voice tool: bogus_tool");
+    toolkit.dispose();
+  });
+
+  test("wait_for_user returns a silent waiting result for the bridge", async () => {
+    const toolkit = createVoiceToolkit(makeHost().host);
+    expect(await toolkit.execute("wait_for_user", {})).toEqual({ status: "waiting" });
+    toolkit.dispose();
+  });
+
+  test("requires confirmation for sensitive computer actions and runs on approval", async () => {
+    const controlled: string[] = [];
+    const { host, emitted } = makeHost({
+      getComputerConfirmationMode: () => "sensitive",
+      controlComputer: async (request) => {
+        controlled.push(request.action);
+        return { status: "ok", action: request.action, target: "Safari" } satisfies ComputerControlResult;
+      },
+    });
+    const toolkit = createVoiceToolkit(host);
+
+    // Non-sensitive action under "sensitive" mode runs immediately.
+    const direct = asRecord(await toolkit.execute("control_computer", { action: "open_application", application: "Safari" }));
+    expect(direct["status"]).toBe("ok");
+    expect(controlled).toEqual(["open_application"]);
+    expect(emitted.filter((event) => event.type === "computer.control")).toHaveLength(1);
+
+    // Sensitive action parks a pending confirmation instead of running.
+    const pending = asRecord(await toolkit.execute("control_computer", { action: "quit_application", application: "Safari" }));
+    expect(pending["status"]).toBe("confirmation_required");
+    expect(pending["summary"]).toBe("quit_application on Safari");
+    const requestId = stringField(pending, "requestId");
+    expect(requestId.length).toBeGreaterThan(0);
+    expect(emitted.find((event) => event.type === "computer.confirmation_required")?.payload).toEqual(pending);
+    expect(controlled).toEqual(["open_application"]);
+
+    // Unknown request id resolves as expired.
+    expect(await toolkit.execute("resolve_computer_control", { requestId: "nope", decision: "approve" })).toEqual({
+      status: "rejected",
+      code: "computer_confirmation_expired",
+      explanation: "That computer-control request is no longer pending",
+    });
+
+    // Approval runs the parked request exactly once.
+    expect(await toolkit.execute("resolve_computer_control", { requestId, decision: "approve" })).toEqual({
+      status: "ok",
+      action: "quit_application",
+      target: "Safari",
+    });
+    expect(controlled).toEqual(["open_application", "quit_application"]);
+    expect(emitted.find((event) => event.type === "computer.confirmation_resolved")?.payload).toEqual({
+      requestId,
+      action: "quit_application",
+      decision: "approve",
+    });
+
+    // A second resolve of the same id is no longer pending.
+    expect(await toolkit.execute("resolve_computer_control", { requestId, decision: "approve" })).toMatchObject({
+      status: "rejected",
+      code: "computer_confirmation_expired",
+    });
+    toolkit.dispose();
+  });
+
+  test("rejects a parked computer action on user rejection without running it", async () => {
+    const controlled: string[] = [];
+    const { host, emitted } = makeHost({
+      getComputerConfirmationMode: () => "always",
+      controlComputer: async (request) => {
+        controlled.push(request.action);
+        return { status: "ok", action: request.action, target: "this Mac" } satisfies ComputerControlResult;
+      },
+    });
+    const toolkit = createVoiceToolkit(host);
+    const requestId = stringField(await toolkit.execute("control_computer", { action: "show_desktop" }), "requestId");
+    expect(await toolkit.execute("resolve_computer_control", { requestId, decision: "reject" })).toEqual({
+      status: "rejected",
+      action: "show_desktop",
+      code: "user_rejected",
+      explanation: "The user rejected the computer action",
+    });
+    expect(controlled).toEqual([]);
+    expect(emitted.find((event) => event.type === "computer.confirmation_resolved")?.payload).toEqual({
+      requestId,
+      action: "show_desktop",
+      decision: "reject",
+    });
+    toolkit.dispose();
+  });
+
+  test("expires a parked confirmation after 120 seconds of fake time", async () => {
+    const { host } = makeHost({
+      getComputerConfirmationMode: () => "always",
+      controlComputer: async (request) => ({ status: "ok", action: request.action, target: "this Mac" }),
+    });
+    const toolkit = createVoiceToolkit(host);
+    try {
+      const requestId = stringField(await toolkit.execute("control_computer", { action: "show_desktop" }), "requestId");
+      setSystemTime(new Date(Date.now() + 121_000));
+      expect(await toolkit.execute("resolve_computer_control", { requestId, decision: "approve" })).toEqual({
+        status: "rejected",
+        code: "computer_confirmation_expired",
+        explanation: "That computer-control request is no longer pending",
+      });
+    } finally {
+      setSystemTime();
+      toolkit.dispose();
+    }
+  });
+
+  test("clears pending confirmations on settings changes and supersession", async () => {
+    const { host, emitted } = makeHost({
+      getComputerConfirmationMode: () => "always",
+      controlComputer: async (request) => ({ status: "ok", action: request.action, target: "this Mac" }),
+    });
+    const toolkit = createVoiceToolkit(host);
+    const firstId = stringField(await toolkit.execute("control_computer", { action: "show_desktop" }), "requestId");
+
+    // A newer sensitive request supersedes the parked one.
+    const secondId = stringField(await toolkit.execute("control_computer", { action: "mission_control" }), "requestId");
+    expect(emitted.find((event) => event.type === "computer.confirmation_cleared")?.payload).toEqual({
+      reason: "superseded",
+    });
+    expect(await toolkit.execute("resolve_computer_control", { requestId: firstId, decision: "approve" })).toMatchObject({
+      status: "rejected",
+      code: "computer_confirmation_expired",
+    });
+
+    // Settings changes clear whatever is pending.
+    toolkit.clearPendingComputerControls("settings_changed");
+    expect(emitted.filter((event) => event.type === "computer.confirmation_cleared").at(-1)?.payload).toEqual({
+      reason: "settings_changed",
+    });
+    expect(await toolkit.execute("resolve_computer_control", { requestId: secondId, decision: "approve" })).toMatchObject({
+      status: "rejected",
+      code: "computer_confirmation_expired",
+    });
+
+    // Clearing an empty store emits nothing further.
+    const clearedCount = emitted.filter((event) => event.type === "computer.confirmation_cleared").length;
+    toolkit.clearPendingComputerControls("settings_changed");
+    expect(emitted.filter((event) => event.type === "computer.confirmation_cleared")).toHaveLength(clearedCount);
+    toolkit.dispose();
+  });
+
+  test("dispose cancels pending confirmation timers silently", async () => {
+    const { host, emitted } = makeHost({
+      getComputerConfirmationMode: () => "always",
+      controlComputer: async (request) => ({ status: "ok", action: request.action, target: "this Mac" }),
+    });
+    const toolkit = createVoiceToolkit(host);
+    const requestId = stringField(await toolkit.execute("control_computer", { action: "show_desktop" }), "requestId");
+    toolkit.dispose();
+    expect(emitted.some((event) => event.type === "computer.confirmation_cleared")).toBe(false);
+    expect(await toolkit.execute("resolve_computer_control", { requestId, decision: "approve" })).toMatchObject({
+      status: "rejected",
+      code: "computer_confirmation_expired",
+    });
+  });
+
+  test("reports computer control unavailable without a host controller", async () => {
+    const toolkit = createVoiceToolkit(makeHost().host);
+    expect(await toolkit.execute("control_computer", { action: "open_application", application: "Safari" })).toEqual({
+      status: "rejected",
+      action: "open_application",
+      code: "computer_control_unavailable",
+      explanation: "Computer control is unavailable in this Mamachi runtime",
+    });
+    toolkit.dispose();
+  });
+
+  test("consumes captured contexts on accepted submit_task and emits context.consumed", async () => {
+    const commands: Array<Record<string, unknown>> = [];
+    const { host, emitted } = makeHost({
+      executeCommand: async (command) => {
+        commands.push(asRecord(command));
+        return { status: "accepted", eventId: Bun.randomUUIDv7(), taskId: "task-9" };
+      },
+    });
+    const toolkit = createVoiceToolkit(host);
+    toolkit.captureContext(makeContext("ctx-1"));
+    toolkit.captureContext(makeContext("ctx-2"));
+    expect(toolkit.pendingContexts().map((context) => context.id)).toEqual(["ctx-1", "ctx-2"]);
+
+    toolkit.discardContext("ctx-2");
+    expect(toolkit.pendingContexts().map((context) => context.id)).toEqual(["ctx-1"]);
+
+    const result = asRecord(await toolkit.execute("submit_task", {
+      repositoryId: "/repo",
+      objective: "Wire the new login flow",
+      acceptanceCriteria: ["Login works"],
+      constraints: [],
+      attachmentIds: ["ctx-1"],
+      codingProfileId: null,
+    }));
+    expect(result["status"]).toBe("accepted");
+    expect(commands[0]).toMatchObject({ type: "task.submit", actor: "voice" });
+    expect(emitted.find((event) => event.type === "context.consumed")?.payload).toEqual({
+      ids: ["ctx-1"],
+      taskId: "task-9",
+    });
+    expect(toolkit.pendingContexts()).toEqual([]);
+    toolkit.dispose();
+  });
+
+  test("remember_fact and forget_fact enforce scope and availability", async () => {
+    const remembered: Array<{ scope: string; projectId: string | null; fact: string }> = [];
+    const { host } = makeHost({
+      rememberFact: (scope, projectId, fact) => {
+        remembered.push({ scope, projectId, fact });
+        return { id: "mem-1", scope, projectId, fact };
+      },
+      forgetFact: (memoryId) => memoryId === "mem-1",
+    });
+    const toolkit = createVoiceToolkit(host);
+
+    expect(await toolkit.execute("remember_fact", { scope: "global", projectId: "/repo", fact: "prefers tabs" })).toEqual({
+      status: "rejected",
+      code: "memory_scope_mismatch",
+      explanation: "Global facts require projectId null; project facts require the active repository ID",
+    });
+    expect(await toolkit.execute("remember_fact", { scope: "project", projectId: "/repo", fact: "prefers tabs" })).toEqual({
+      status: "accepted",
+      eventId: "mem-1",
+      memoryId: "mem-1",
+      scope: "project",
+      projectId: "/repo",
+    });
+    expect(remembered).toEqual([{ scope: "project", projectId: "/repo", fact: "prefers tabs" }]);
+
+    expect(await toolkit.execute("forget_fact", { memoryId: "mem-1" })).toMatchObject({
+      status: "accepted",
+      memoryId: "mem-1",
+    });
+    expect(await toolkit.execute("forget_fact", { memoryId: "mem-2" })).toEqual({
+      status: "rejected",
+      code: "memory_not_found",
+      explanation: "The memory does not exist or is outside the active project scope",
+    });
+
+    const bare = createVoiceToolkit(makeHost().host);
+    expect(await bare.execute("remember_fact", { scope: "global", projectId: null, fact: "x" })).toMatchObject({
+      status: "rejected",
+      code: "memory_unavailable",
+    });
+    expect(await bare.execute("forget_fact", { memoryId: "mem-1" })).toMatchObject({
+      status: "rejected",
+      code: "memory_unavailable",
+    });
+    bare.dispose();
+    toolkit.dispose();
+  });
+
+  test("mute_mamachi puts the microphone to sleep through the host", async () => {
+    const { host, sleepCalls } = makeHost();
+    const toolkit = createVoiceToolkit(host);
+    expect(await toolkit.execute("mute_mamachi", {})).toEqual({ status: "ok", muted: true });
+    expect(sleepCalls.count).toBe(1);
+    toolkit.dispose();
+  });
+});

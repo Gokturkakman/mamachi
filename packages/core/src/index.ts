@@ -36,6 +36,26 @@ export {
 } from "./external-cli-runner.ts";
 export { OmpRunner, type OmpRunnerOptions } from "./omp-runner.ts";
 export { RealtimeBridge } from "./realtime-bridge.ts";
+export { CascadeBridge } from "./cascade-bridge.ts";
+export { createVoiceToolkit } from "./voice-toolkit.ts";
+export {
+  cascadeReasoningEfforts,
+  defaultCascadeLlmModel,
+  defaultCascadeReasoningEffort,
+  defaultCascadeVoiceId,
+  voiceEngines,
+  type CascadeBridgeOptions,
+  type CascadeReasoningEffort,
+  type PlaybackCursor,
+  type VoiceBridge,
+  type VoiceConnectKeys,
+  type VoiceEngine,
+  type VoiceFunctionTool,
+  type VoiceResponseMode,
+  type VoiceToolHost,
+  type VoiceToolkit,
+  type VoiceToolkitFactory,
+} from "./voice-bridge.ts";
 export {
   FactProjector,
   type FactActivity,

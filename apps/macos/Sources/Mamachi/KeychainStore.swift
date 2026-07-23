@@ -29,6 +29,7 @@ struct KeychainStore {
     private let service = "com.mamachi.app"
     private let realtimeAccount = "openai-realtime-api-key"
     private let legacyRealtimeAccount = "openai-api-key"
+    private let elevenLabsAccount = "elevenlabs-api-key"
     private let encryptionAccount = "application-encryption-key-v1"
 
     func loadAPIKey() throws -> String? {
@@ -44,6 +45,18 @@ struct KeychainStore {
     func deleteAPIKey() throws {
         try delete(account: realtimeAccount)
         try delete(account: legacyRealtimeAccount)
+    }
+
+    func loadElevenLabsKey() throws -> String? {
+        try loadString(account: elevenLabsAccount)
+    }
+
+    func saveElevenLabsKey(_ key: String) throws {
+        try save(Data(key.utf8), account: elevenLabsAccount)
+    }
+
+    func deleteElevenLabsKey() throws {
+        try delete(account: elevenLabsAccount)
     }
 
     func loadCodingCredential(for provider: CodingProvider) throws -> String? {

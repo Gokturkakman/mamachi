@@ -61,6 +61,28 @@ final class AppModelControlTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testVoiceEnginePersistsAndSyncs() {
+        let defaults = UserDefaults.standard
+        let previous = defaults.string(forKey: "voiceEngine")
+        defer {
+            if let previous {
+                defaults.set(previous, forKey: "voiceEngine")
+            } else {
+                defaults.removeObject(forKey: "voiceEngine")
+            }
+        }
+        defaults.removeObject(forKey: "voiceEngine")
+
+        let model = AppModel()
+        XCTAssertEqual(model.voiceEngine, .realtime, "Speech-to-speech is the default engine")
+
+        model.setVoiceEngine(.cascade)
+        XCTAssertEqual(model.voiceEngine, .cascade)
+        XCTAssertEqual(defaults.string(forKey: "voiceEngine"), "cascade")
+        XCTAssertEqual(AppModel().voiceEngine, .cascade)
+    }
+
     func testOMPLoginDetectionAcceptsUsageAndNonUsageAccounts() {
         XCTAssertTrue(CodingAgentDiscovery.ompLoginAvailable(
             exitCode: 0,

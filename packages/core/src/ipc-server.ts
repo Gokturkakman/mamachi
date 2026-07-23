@@ -62,7 +62,7 @@ export interface DaemonHooks {
   onContextRemoved?: (id: string) => void;
   onEditorState?: (state: EditorDocumentState) => void;
   onSettingsUpdate?: (settings: RuntimeSettings) => void;
-  onVoiceConnect?: (apiKey?: string) => void | Promise<void>;
+  onVoiceConnect?: (keys: { apiKey?: string; elevenLabsApiKey?: string }) => void | Promise<void>;
   onVoiceDisconnect?: () => void | Promise<void>;
   onVoiceEngagement?: (engaged: boolean, playback: RealtimePlaybackCursor | null) => void;
   onVoiceInterrupt?: (playback: RealtimePlaybackCursor | null) => void;
@@ -535,14 +535,24 @@ export class MamachiIpcServer {
         return settings;
       }
       case "voice.connect": {
-        if (!isObject(request.payload) || !hasOnlyKeys(request.payload, ["apiKey"])) {
+        if (!isObject(request.payload) || !hasOnlyKeys(request.payload, ["apiKey", "elevenLabsApiKey"])) {
           throw new Error("voice.connect payload is invalid");
         }
         const apiKey = request.payload["apiKey"];
         if (apiKey !== undefined && (typeof apiKey !== "string" || apiKey.length === 0)) {
           throw new Error("voice.connect apiKey must be a non-empty string");
         }
-        await this.#hooks.onVoiceConnect?.(apiKey);
+        const elevenLabsApiKey = request.payload["elevenLabsApiKey"];
+        if (
+          elevenLabsApiKey !== undefined &&
+          (typeof elevenLabsApiKey !== "string" || elevenLabsApiKey.length === 0)
+        ) {
+          throw new Error("voice.connect elevenLabsApiKey must be a non-empty string");
+        }
+        await this.#hooks.onVoiceConnect?.({
+          ...(typeof apiKey === "string" ? { apiKey } : {}),
+          ...(typeof elevenLabsApiKey === "string" ? { elevenLabsApiKey } : {}),
+        });
         return { connected: true };
       }
       case "voice.mode": {

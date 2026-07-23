@@ -5,6 +5,7 @@ struct SettingsView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var diagnostics: DiagnosticsService
     @State private var apiKey = ""
+    @State private var elevenLabsKey = ""
     @State private var codingProvider: CodingProvider = .anthropic
     @State private var codingCredential = ""
     @State private var primaryModel: String
@@ -59,7 +60,15 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("OpenAI Realtime — voice and chat") {
+            Section("Voice — engine and credentials") {
+                Picker("Voice engine", selection: voiceEngine) {
+                    ForEach(VoiceEngine.allCases) { engine in
+                        Text(engine.label).tag(engine)
+                    }
+                }
+                Text(model.voiceEngine.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 SecureField(model.hasAPIKey ? "Key stored in Keychain" : "OpenAI API key", text: $apiKey)
                     .textContentType(.password)
                 HStack {
@@ -75,6 +84,36 @@ struct SettingsView: View {
                     Text(model.hasAPIKey ? "Stored in macOS Keychain" : "Required")
                         .font(.caption)
                         .foregroundStyle(model.hasAPIKey ? .green : .orange)
+                }
+
+                if model.voiceEngine == .cascade {
+                    SecureField(
+                        model.hasElevenLabsKey ? "ElevenLabs key stored in Keychain" : "ElevenLabs API key",
+                        text: $elevenLabsKey
+                    )
+                    .textContentType(.password)
+                    HStack {
+                        Button(model.hasElevenLabsKey ? "Replace Key" : "Save Key") {
+                            model.saveElevenLabsKey(elevenLabsKey)
+                            elevenLabsKey = ""
+                        }
+                        .disabled(elevenLabsKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        if model.hasElevenLabsKey {
+                            Button("Remove", role: .destructive) { model.removeElevenLabsKey() }
+                        }
+                        Spacer()
+                        Text(model.hasElevenLabsKey ? "Stored in macOS Keychain" : "Required")
+                            .font(.caption)
+                            .foregroundStyle(model.hasElevenLabsKey ? .green : .orange)
+                    }
+                    if !model.hasElevenLabsKey {
+                        Label(
+                            "Cascaded voice cannot connect until an ElevenLabs API key is added.",
+                            systemImage: "exclamationmark.triangle"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    }
                 }
             }
 
@@ -377,6 +416,10 @@ struct SettingsView: View {
 
     private var interactionMode: Binding<InteractionMode> {
         Binding(get: { model.interactionMode }, set: model.setInteractionMode)
+    }
+
+    private var voiceEngine: Binding<VoiceEngine> {
+        Binding(get: { model.voiceEngine }, set: model.setVoiceEngine)
     }
 
     private var activationKey: Binding<ActivationKey> {

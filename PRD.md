@@ -76,7 +76,7 @@ The alpha does not require accounts, hosted billing, a cloud control plane, or m
 | Memory | Persist confirmed task facts and explicit memories; full local transcript remains until manually cleared |
 | Workspace targeting | Focused VS Code workspace, pinned repository fallback, visible repository chip |
 | Prototype goal | Request-to-change, concurrent conversation/status, and safe course correction in one demo |
-| Workspace mutation | Edit the current working tree directly; never auto-commit or switch branches |
+| Workspace mutation | Edit the current working tree directly; never commit or switch branches unless the accepted task explicitly asks for that exact effect |
 | Editor context | Workspace may be inferred; file/selection/diagnostic/terminal content requires explicit capture |
 | Credentials | Reuse existing coding-agent subscription logins; optional provider keys and the required voice key are stored in macOS Keychain |
 | Voice posture | Adaptive companion |
@@ -100,7 +100,7 @@ The alpha does not require accounts, hosted billing, a cloud control plane, or m
 - Native macOS menu-bar app
 - Bare-modifier wake gesture (double-tap, hold-to-talk) with `⌥Space` fallback and resumable duplex voice session
 - Floating overlay and task drawer
-- OpenAI Realtime 2.1 voice adapter
+- OpenAI Realtime 2.1 voice adapter (default) plus a user-selectable cascaded engine: ElevenLabs Scribe v2 Realtime STT → GPT-5.5 (Responses API, reasoning effort `none`) → ElevenLabs Flash v2.5 TTS
 - Local Bun/TypeScript orchestration daemon
 - Embedded OMP `AgentSession` plus structured Codex CLI and Claude Code adapters
 - Explicit coding-backend selection, authenticated-account detection, and resumable backend sessions
@@ -167,6 +167,8 @@ Requirements:
 - Barge-in stops playback immediately and removes unheard assistant audio from provider conversation history.
 - Background events never trigger speech automatically while disengaged.
 - A completed task or blocker while sleeping creates a native notification and queues a spoken brief for resume.
+- A provider response that stops producing events is timed out and the Realtime socket reconnects automatically; cancelling a turn has a shorter watchdog so the next wake cannot remain blocked behind stale provider state.
+- Provider transcription is provisional until Mamachi accepts the turn. Transcripts heard while disengaged or discarded by `wait_for_user` are never shown as user speech.
 - Raw audio is never persisted.
 - Full text transcripts remain local until the user clears them.
 
@@ -180,6 +182,7 @@ Collapsed overlay content:
 - Whole-capsule drag target and right-click Open/Settings/Hide/Quit recovery controls
 
 The collapsed frame contains no invisible drawer-sized hit area. Collapsed and expanded modes share one persisted bottom-center anchor, so resizing never teleports the overlay. Expand and collapse are single-click state transitions even when the non-activating panel is not the frontmost application.
+The expanded header prioritizes the active coder question over stale activity or transcript text. Transcript rows reflow immediately and remain readable while the live message is finalized; no two message rows may overlap during that transition.
 
 The overlay must be non-activating where possible and must not steal focus from the editor for routine use.
 
@@ -200,6 +203,7 @@ Expanded content:
 - Open-in-VS-Code links to files and ranges
 
 The drawer is not an IDE and does not attempt to reproduce a raw coding-agent terminal interface.
+An open coder question is restored from controller state after app or provider reconnection, shown verbatim, and proactively relayed. `answer_task_question` accepts only the current user turn copied verbatim; Mamachi-authored, stale, or paraphrased answers are rejected before the controller. The accepted answer is injected verbatim into the resumed coding turn. Equivalent in-flight research requests are reused, and substantive coding work is ordered ahead of queued fast/research tasks.
 
 ### 8.4 Workspace targeting
 

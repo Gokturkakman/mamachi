@@ -24,6 +24,12 @@ final class AudioService {
     private var pendingPlaybackBuffers = 0
     private var scheduledPlaybackFrames: AVAudioFramePosition = 0
     private var playbackOriginFrame: AVAudioFramePosition = 0
+    private var configurationObserver: (any NSObjectProtocol)?
+    private var captureWatchdog: Task<Void, Never>?
+    /// True from `startCapture` until `stopCapture`: recovery rebuilds
+    /// capture from this intent, never from the transient `capturing` state.
+    private var captureIntended = false
+    private var recoveryErrorReported = false
     var isPlaying: Bool { player.isPlaying }
     var hasPendingPlayback: Bool { pendingPlaybackBuffers > 0 }
     var playbackPositionMilliseconds: Int {
@@ -51,12 +57,34 @@ final class AudioService {
             let level = Self.normalizedLevel(buffer)
             Task { @MainActor in self?.onPlaybackLevel?(level) }
         }
+        // Device/route changes (AirPods, headphones, sleep/wake) stop the
+        // engine silently; without recovery the session goes deaf until the
+        // next disengage/engage cycle.
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handleAudioEngineConfigurationChange() }
+        }
     }
 
     func startCapture() async throws {
         guard !capturing else { return }
         guard await microphoneAccess() else { throw AudioError.microphoneDenied }
+        captureIntended = true
+        do {
+            try activateCapture()
+        } catch {
+            captureIntended = false
+            throw error
+        }
+    }
 
+    /// Installs the input tap against the CURRENT device format and starts
+    /// the engine. Split from `startCapture` so route-change recovery can
+    /// re-arm capture without repeating the permission check.
+    private func activateCapture() throws {
         let input = engine.inputNode
         if !voiceProcessingConfigured {
             try input.setVoiceProcessingEnabled(true)
@@ -66,7 +94,7 @@ final class AudioService {
         guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
             throw AudioError.noInputDevice
         }
-        guard let converter = AVAudioConverter(from: inputFormat, to: wireFormat) else {
+        guard let converter = Self.makeWireConverter(from: inputFormat) else {
             throw AudioError.converterUnavailable
         }
         self.converter = converter
@@ -78,14 +106,79 @@ final class AudioService {
             try engine.start()
         }
         capturing = true
+        startCaptureWatchdog()
     }
 
     func stopCapture() {
+        captureIntended = false
+        recoveryErrorReported = false
+        captureWatchdog?.cancel()
+        captureWatchdog = nil
         guard capturing else { return }
         engine.inputNode.removeTap(onBus: 0)
         converter = nil
         capturing = false
         onLevel?(0)
+    }
+
+    /// Notification entry point. Configuration changes also fire for benign
+    /// reconfigurations (voice-processing enable during the first capture,
+    /// format renegotiation) while the engine keeps running — tearing down a
+    /// healthy tap on those made engagement go deaf. Only a stopped engine
+    /// is a real death.
+    func handleAudioEngineConfigurationChange() {
+        guard !engine.isRunning else { return }
+        recoverStoppedEngine()
+    }
+
+    /// Repairs a dead engine. Two failure modes:
+    /// 1. Scheduled playback completions never fire once the engine stops,
+    ///    so `pendingPlaybackBuffers` wedges above zero and the microphone
+    ///    PCM gate in AppModel stays closed forever.
+    /// 2. The input tap and converter hold the OLD device format, so capture
+    ///    silently delivers nothing on the new device.
+    /// Rebuild is driven by INTENT, not by `capturing`: a failed attempt
+    /// (formats are transiently unusable mid-transition) leaves the watchdog
+    /// retrying until the route settles.
+    func recoverStoppedEngine() {
+        let hadPlayback = pendingPlaybackBuffers > 0 || player.isPlaying
+        if hadPlayback { clearPlayback() }
+        if captureIntended {
+            if capturing {
+                engine.inputNode.removeTap(onBus: 0)
+                converter = nil
+                capturing = false
+            }
+            do {
+                try activateCapture()
+                recoveryErrorReported = false
+            } catch {
+                // Report the first failure only; the 3 s watchdog keeps
+                // retrying silently until the device settles.
+                if !recoveryErrorReported {
+                    recoveryErrorReported = true
+                    onError?(error)
+                }
+            }
+        }
+        // After capture is re-armed: lets AppModel resume its normal
+        // microphone flow (the pending-playback gate is now open).
+        if hadPlayback { onPlaybackDrained?() }
+    }
+
+    /// Some engine deaths never post a configuration change (observed with
+    /// device unplug races); poll cheaply while capture is supposed to run.
+    private func startCaptureWatchdog() {
+        captureWatchdog?.cancel()
+        captureWatchdog = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                guard let self, !Task.isCancelled else { return }
+                if self.captureIntended, !self.capturing || !self.engine.isRunning {
+                    self.recoverStoppedEngine()
+                }
+            }
+        }
     }
 
     func beginPlaybackItem() {
@@ -151,7 +244,37 @@ final class AudioService {
         }
     }
 
+    /// Builds the capture-side converter to the 24 kHz int16 mono wire
+    /// format. The channel map is pinned to channel 0: multi-channel
+    /// voice-processing inputs (Mac mic arrays) carry beamforming residue in
+    /// the other channels, and the converter's default downmix averages them
+    /// — near-inverted phases cancel to digital silence, which shipped
+    /// zero-RMS audio to STT while the channel-0-based level meter looked
+    /// perfectly alive.
+    nonisolated static func makeWireConverter(from inputFormat: AVAudioFormat) -> AVAudioConverter? {
+        let wire = AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: 24_000,
+            channels: 1,
+            interleaved: true
+        )!
+        guard let converter = AVAudioConverter(from: inputFormat, to: wire) else { return nil }
+        converter.channelMap = [0]
+        return converter
+    }
+
     nonisolated private func consumeInput(_ input: AVAudioPCMBuffer, converter: AVAudioConverter) {
+        guard let data = Self.convertToWire(input, using: converter) else { return }
+        let level = Self.normalizedLevel(input)
+        Task { @MainActor [weak self] in
+            self?.onMicrophonePCM?(data)
+            self?.onLevel?(level)
+        }
+    }
+
+    /// Converts one tap buffer to wire PCM. Pure and static so the
+    /// channel-pinning regression test exercises the exact production path.
+    nonisolated static func convertToWire(_ input: AVAudioPCMBuffer, using converter: AVAudioConverter) -> Data? {
         let ratio = 24_000 / input.format.sampleRate
         let capacity = AVAudioFrameCount((Double(input.frameLength) * ratio).rounded(.up)) + 16
         guard
@@ -162,7 +285,7 @@ final class AudioService {
                 interleaved: true
             ),
             let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity)
-        else { return }
+        else { return nil }
 
         var supplied = false
         var conversionError: NSError?
@@ -175,16 +298,11 @@ final class AudioService {
             inputStatus.pointee = .haveData
             return input
         }
-        guard status != .error, conversionError == nil, output.frameLength > 0 else { return }
+        guard status != .error, conversionError == nil, output.frameLength > 0 else { return nil }
         let audioBuffer = output.audioBufferList.pointee.mBuffers
-        guard let bytes = audioBuffer.mData else { return }
+        guard let bytes = audioBuffer.mData else { return nil }
         let byteCount = Int(output.frameLength) * Int(outputFormat.streamDescription.pointee.mBytesPerFrame)
-        let data = Data(bytes: bytes, count: byteCount)
-        let level = Self.normalizedLevel(input)
-        Task { @MainActor [weak self] in
-            self?.onMicrophonePCM?(data)
-            self?.onLevel?(level)
-        }
+        return Data(bytes: bytes, count: byteCount)
     }
 
     nonisolated private static func normalizedLevel(_ buffer: AVAudioPCMBuffer) -> Double {

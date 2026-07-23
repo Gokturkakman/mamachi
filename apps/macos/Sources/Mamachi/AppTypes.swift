@@ -193,6 +193,30 @@ enum InteractionMode: String, CaseIterable, Identifiable {
     var systemImage: String { self == .voice ? "waveform" : "text.bubble" }
 }
 
+/// Which pipeline serves voice sessions. `realtime` is OpenAI's native
+/// speech-to-speech model; `cascade` chains dedicated STT, LLM, and TTS
+/// providers for lower cost and swappable voices.
+enum VoiceEngine: String, CaseIterable, Identifiable {
+    case realtime
+    case cascade
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .realtime: "Speech-to-speech (OpenAI Realtime)"
+        case .cascade: "Cascaded (Scribe v2 → GPT-5.5 → ElevenLabs)"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .realtime: "One OpenAI Realtime model listens and speaks over a single WebSocket."
+        case .cascade: "ElevenLabs Scribe v2 Realtime → GPT-5.5 (reasoning: none) → ElevenLabs Flash v2.5 · voice: Rachel"
+        }
+    }
+}
+
 enum ComputerCapability: String, CaseIterable, Identifiable {
     case applications
     case screenObservation = "screen_observation"
