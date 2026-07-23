@@ -74,7 +74,7 @@ struct MenuBarView: View {
 
             Divider()
 
-            Button("Quit Mamachi") { NSApp.terminate(nil) }
+            Button("Quit Mamachi", action: model.quitApplication)
                 .keyboardShortcut("q")
         }
     }

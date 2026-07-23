@@ -46,7 +46,19 @@ struct OverlayView: View {
             ZStack {
                 WindowDragHandle(
                     onClick: compactOrbAction,
-                    onRightClick: { model.drawerExpanded = true }
+                    contextMenuActions: OrbContextMenuActions(
+                        openTaskDrawer: {
+                            surface = .task
+                            model.drawerExpanded = true
+                        },
+                        openChat: {
+                            surface = .conversation
+                            model.drawerExpanded = true
+                        },
+                        openSettings: model.openSettings,
+                        hideOverlay: model.hideOverlay,
+                        quitApplication: model.quitApplication
+                    )
                 )
                 .clipShape(Circle())
 
@@ -86,58 +98,13 @@ struct OverlayView: View {
                 .help("Open current conversation")
             }
             .overlay(alignment: .topLeading) { orbBadgeStack }
-            .overlay(alignment: .trailing) {
-                compactSizeControls.offset(x: 10)
-            }
             .overlay(alignment: .bottom) {
                 compactStatusBadge.offset(y: 12)
             }
             .shadow(color: .black.opacity(colorScheme == .dark ? 0.30 : 0.12), radius: 9, y: 3)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .help(compactOrbHelp)
-    }
-
-    /// Obvious alternative to the borderless window's narrow native resize
-    /// zone. Each click changes the compact orb by a useful 32-point step.
-    private var compactSizeControls: some View {
-        VStack(spacing: 0) {
-            compactSizeButton(
-                systemImage: "plus",
-                label: "Make orb larger",
-                delta: 32
-            )
-            Rectangle()
-                .fill(Color.primary.opacity(0.12))
-                .frame(width: 13, height: 1)
-            compactSizeButton(
-                systemImage: "minus",
-                label: "Make orb smaller",
-                delta: -32
-            )
-        }
-        .padding(.vertical, 2)
-        .background(.regularMaterial, in: Capsule())
-        .overlay {
-            Capsule().strokeBorder(Theme.specularEdge, lineWidth: 1)
-        }
-        .shadow(color: .black.opacity(colorScheme == .dark ? 0.24 : 0.10), radius: 4, y: 2)
-    }
-
-    private func compactSizeButton(systemImage: String, label: String, delta: CGFloat) -> some View {
-        Button {
-            model.adjustCompactOrbSize(by: delta)
-        } label: {
-            Image(systemName: systemImage)
-                .font(.system(size: 9, weight: .bold))
-                .foregroundStyle(.secondary)
-                .frame(width: 25, height: 23)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(label)
-        .accessibilityLabel(label)
-        .accessibilityHint("Changes the compact orb size by 32 points")
+        .help("\(compactOrbHelp). Right-click for app menu and Quit.")
     }
 
     /// Vertical badge cluster on the orb's leading edge: queued spoken
@@ -371,6 +338,9 @@ struct OverlayView: View {
             .frame(width: 84)
 
             GlassIconButton(systemImage: "gearshape", help: "Settings", action: model.openSettings)
+
+            GlassIconButton(systemImage: "power", help: "Quit Mamachi", action: model.quitApplication)
+                .keyboardShortcut("q", modifiers: .command)
 
             GlassIconButton(systemImage: "chevron.down", help: "Collapse to orb") {
                 model.drawerExpanded = false

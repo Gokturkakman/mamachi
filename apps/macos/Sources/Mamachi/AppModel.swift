@@ -21,11 +21,15 @@ final class AppModel: ObservableObject {
     @Published var hasAPIKey = false
     @Published var needsAPIKey = false
     @Published var drawerExpanded = false
+    @Published var collapsedOverlaySize: OverlaySizePreset
+    @Published var expandedOverlaySize: OverlaySizePreset
     @Published var interactionMode: InteractionMode
     @Published var primaryCodingModel: String
     @Published var fastCodingModel: String
     @Published var codingThinkingLevel: String
     @Published var automaticModelRouting: Bool
+    @Published var computerCapabilities: Set<ComputerCapability>
+    @Published var computerConfirmationMode: ComputerConfirmationMode
     @Published var notifyOnAttention: Bool
     @Published var notifyOnCompletion: Bool
     @Published var reactionSoundsEnabled: Bool
@@ -36,7 +40,9 @@ final class AppModel: ObservableObject {
     var onOpenSettings: (() -> Void)?
     var onShowOverlay: (() -> Void)?
     var onResetOverlayFrame: (() -> Void)?
-    var onAdjustCompactOrbSize: ((CGFloat) -> Void)?
+    var onOverlaySizeChange: ((_ collapsed: OverlaySizePreset, _ expanded: OverlaySizePreset) -> Void)?
+    var onHideOverlay: (() -> Void)?
+    var onQuitApplication: (() -> Void)?
 
     private let daemon = DaemonProcess()
     private let ipc = IpcClient()
@@ -77,6 +83,13 @@ final class AppModel: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
+        collapsedOverlaySize = OverlaySizePreset(
+            rawValue: defaults.string(forKey: "collapsedOverlaySizePreset") ?? ""
+        ) ?? .medium
+        expandedOverlaySize = OverlaySizePreset(
+            rawValue: defaults.string(forKey: "expandedOverlaySizePreset") ?? ""
+        ) ?? .medium
+        defaults.removeObject(forKey: "overlayCompactSize")
         interactionMode = InteractionMode(rawValue: defaults.string(forKey: "interactionMode") ?? "") ?? .voice
         primaryCodingModel = defaults.string(forKey: "primaryCodingModel") ?? ""
         fastCodingModel = defaults.string(forKey: "fastCodingModel") ?? "openai-codex/gpt-5.4-mini"
@@ -84,6 +97,14 @@ final class AppModel: ObservableObject {
         automaticModelRouting = defaults.object(forKey: "automaticModelRouting") == nil
             ? true
             : defaults.bool(forKey: "automaticModelRouting")
+        if let storedCapabilities = defaults.stringArray(forKey: "computerCapabilities") {
+            computerCapabilities = Set(storedCapabilities.compactMap(ComputerCapability.init(rawValue:)))
+        } else {
+            computerCapabilities = ComputerCapability.assistive
+        }
+        computerConfirmationMode = ComputerConfirmationMode(
+            rawValue: defaults.string(forKey: "computerConfirmationMode") ?? ""
+        ) ?? .sensitive
         notifyOnAttention = defaults.object(forKey: "notifyOnAttention") == nil
             ? true
             : defaults.bool(forKey: "notifyOnAttention")
@@ -183,6 +204,25 @@ final class AppModel: ObservableObject {
         defaults.set(codingThinkingLevel, forKey: "codingThinkingLevel")
         defaults.set(automaticModelRouting, forKey: "automaticModelRouting")
         syncRuntimeSettings()
+    }
+
+    func updateComputerControlSettings(
+        capabilities: Set<ComputerCapability>,
+        confirmationMode: ComputerConfirmationMode
+    ) {
+        computerCapabilities = capabilities
+        computerConfirmationMode = confirmationMode
+        let defaults = UserDefaults.standard
+        defaults.set(capabilities.map(\.rawValue).sorted(), forKey: "computerCapabilities")
+        defaults.set(confirmationMode.rawValue, forKey: "computerConfirmationMode")
+        syncRuntimeSettings()
+    }
+
+    func openAccessibilitySettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        ) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     func updateReactionSettings(attention: Bool, completion: Bool, sounds: Bool) {
@@ -376,8 +416,26 @@ final class AppModel: ObservableObject {
         onResetOverlayFrame?()
     }
 
-    func adjustCompactOrbSize(by points: CGFloat) {
-        onAdjustCompactOrbSize?(points)
+    func hideOverlay() {
+        onHideOverlay?()
+    }
+
+    func quitApplication() {
+        onQuitApplication?()
+    }
+
+    func setCollapsedOverlaySize(_ size: OverlaySizePreset) {
+        guard size != collapsedOverlaySize else { return }
+        collapsedOverlaySize = size
+        UserDefaults.standard.set(size.rawValue, forKey: "collapsedOverlaySizePreset")
+        onOverlaySizeChange?(collapsedOverlaySize, expandedOverlaySize)
+    }
+
+    func setExpandedOverlaySize(_ size: OverlaySizePreset) {
+        guard size != expandedOverlaySize else { return }
+        expandedOverlaySize = size
+        UserDefaults.standard.set(size.rawValue, forKey: "expandedOverlaySizePreset")
+        onOverlaySizeChange?(collapsedOverlaySize, expandedOverlaySize)
     }
 
     private func sendCommand(type: String, expectedRevision: Int?, payload: [String: Any]) {
@@ -579,6 +637,12 @@ final class AppModel: ObservableObject {
                 drawerExpanded = expanded
                 if expanded { onShowOverlay?() }
             }
+        case "computer.confirmation_required":
+            attentionMessage = payload["summary"] as? String ?? "A computer action needs confirmation."
+        case "computer.confirmation_resolved",
+             "computer.confirmation_cleared",
+             "computer.confirmation_expired":
+            attentionMessage = nil
         case "ui.mute":
             muteMicrophone()
         case "voice.interrupt":
@@ -616,6 +680,8 @@ final class AppModel: ObservableObject {
                 "fastModel": fastCodingModel,
                 "thinkingLevel": codingThinkingLevel,
                 "automaticRouting": automaticModelRouting,
+                "computerCapabilities": computerCapabilities.map(\.rawValue).sorted(),
+                "computerConfirmationMode": computerConfirmationMode.rawValue,
             ]
         )
         ipc.sendRequest(type: "voice.mode", payload: ["mode": interactionMode.rawValue])

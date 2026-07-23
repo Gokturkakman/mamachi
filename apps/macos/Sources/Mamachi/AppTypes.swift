@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 struct TranscriptEntry: Codable, Identifiable, Equatable {
@@ -143,6 +144,46 @@ struct ConfirmationViewState: Identifiable, Equatable {
 }
 
 
+enum OverlaySizePreset: String, CaseIterable, Identifiable {
+    case small
+    case medium
+    case large
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .small: "Small"
+        case .medium: "Medium"
+        case .large: "Large"
+        }
+    }
+
+    var collapsedSide: CGFloat {
+        switch self {
+        case .small: 112
+        case .medium: 144
+        case .large: 184
+        }
+    }
+
+    var expandedSize: CGSize {
+        switch self {
+        case .small: CGSize(width: 440, height: 540)
+        case .medium: CGSize(width: 512, height: 652)
+        case .large: CGSize(width: 640, height: 800)
+        }
+    }
+
+    var collapsedDimensions: String {
+        "\(Int(collapsedSide)) × \(Int(collapsedSide))"
+    }
+
+    var expandedDimensions: String {
+        "\(Int(expandedSize.width)) × \(Int(expandedSize.height))"
+    }
+}
+
 enum InteractionMode: String, CaseIterable, Identifiable {
     case voice
     case text
@@ -150,6 +191,118 @@ enum InteractionMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var label: String { self == .voice ? "Voice" : "Chat" }
     var systemImage: String { self == .voice ? "waveform" : "text.bubble" }
+}
+
+enum ComputerCapability: String, CaseIterable, Identifiable {
+    case applications
+    case screenObservation = "screen_observation"
+    case windows
+    case keyboard
+    case pointer
+    case clipboardRead = "clipboard_read"
+    case clipboardWrite = "clipboard_write"
+    case system
+    case appleScript = "apple_script"
+    case shell
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .applications: "Applications and media"
+        case .screenObservation: "Screen and UI inspection"
+        case .windows: "Window management"
+        case .keyboard: "Keyboard and text entry"
+        case .pointer: "Pointer, clicks, and scrolling"
+        case .clipboardRead: "Read clipboard"
+        case .clipboardWrite: "Write clipboard"
+        case .system: "System controls"
+        case .appleScript: "Raw AppleScript"
+        case .shell: "Raw shell commands"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .applications: "Open, activate, hide, quit, and control supported media apps."
+        case .screenObservation: "List apps and windows, inspect accessibility UI, and take screenshots."
+        case .windows: "Move, resize, minimize, maximize, fullscreen, and close windows."
+        case .keyboard: "Type text and send keys or shortcuts to the active app."
+        case .pointer: "Move, click, drag, right-click, and scroll by screen coordinate."
+        case .clipboardRead: "Allows clipboard contents to enter the voice model's tool context."
+        case .clipboardWrite: "Replace the current clipboard contents."
+        case .system: "Volume, lock screen, display sleep, Mission Control, and Show Desktop."
+        case .appleScript: "Execute unrestricted AppleScript. This can control other applications."
+        case .shell: "Execute unrestricted zsh commands outside the coding agent sandbox."
+        }
+    }
+
+    var isElevated: Bool {
+        self == .clipboardRead || self == .appleScript || self == .shell
+    }
+
+    static let basic: Set<Self> = [.applications, .screenObservation, .system]
+    static let assistive: Set<Self> = [
+        .applications,
+        .screenObservation,
+        .windows,
+        .keyboard,
+        .pointer,
+        .clipboardWrite,
+        .system,
+    ]
+    static let full = Set(allCases)
+}
+
+enum ComputerControlProfile: String, CaseIterable, Identifiable {
+    case off
+    case basic
+    case assistive
+    case full
+    case custom
+
+    var id: String { rawValue }
+    static let selectable: [Self] = [.off, .basic, .assistive, .full]
+
+    var label: String {
+        switch self {
+        case .off: "Off"
+        case .basic: "Basic"
+        case .assistive: "Assistive"
+        case .full: "Full"
+        case .custom: "Custom"
+        }
+    }
+
+    var capabilities: Set<ComputerCapability>? {
+        switch self {
+        case .off: []
+        case .basic: ComputerCapability.basic
+        case .assistive: ComputerCapability.assistive
+        case .full: ComputerCapability.full
+        case .custom: nil
+        }
+    }
+
+    static func matching(_ capabilities: Set<ComputerCapability>) -> Self {
+        selectable.first(where: { $0.capabilities == capabilities }) ?? .custom
+    }
+}
+
+enum ComputerConfirmationMode: String, CaseIterable, Identifiable {
+    case always
+    case sensitive
+    case never
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .always: "Always ask"
+        case .sensitive: "Ask for sensitive actions"
+        case .never: "Never ask"
+        }
+    }
 }
 
 enum VoiceConnectionState: String {

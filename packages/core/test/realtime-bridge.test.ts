@@ -3,6 +3,7 @@ import type { Server, ServerWebSocket } from "bun";
 import type { ActionResult, DomainEvent } from "@mamachi/protocol";
 import { RealtimeBridge } from "../src/realtime-bridge.ts";
 import type { ControllerSnapshot, TaskRecord } from "../src/domain.ts";
+import type { ComputerConfirmationMode } from "../src/computer-control.ts";
 
 interface MockClientData {
   authenticated: boolean;
@@ -147,6 +148,7 @@ describe("RealtimeBridge", () => {
       "research_web",
       "set_overlay",
       "control_computer",
+      "resolve_computer_control",
       "mute_mamachi",
     ]);
     expect(
@@ -1072,9 +1074,9 @@ describe("RealtimeBridge", () => {
       executeCommand: async () => {
         throw new Error("computer and app controls must not execute a coding command");
       },
-      controlComputer: async (action) => {
-        controlledAction = action;
-        return { status: "ok", action, target: "System Settings" };
+      controlComputer: async (request) => {
+        controlledAction = request.action;
+        return { status: "ok", action: request.action, target: "System Settings" };
       },
       emit: (type, payload) => {
         emitted.push({ type, payload });
@@ -1329,6 +1331,8 @@ test("section 16 handlers enforce correlation, ownership, revisions, queue comma
     }],
   };
   let coderAvailable = true;
+  const computerCalls: string[] = [];
+  let computerConfirmationMode: ComputerConfirmationMode = "sensitive";
   const memories = new Set<string>();
   const bridge = new RealtimeBridge({
     apiKey: "section-16-key",
@@ -1336,6 +1340,8 @@ test("section 16 handlers enforce correlation, ownership, revisions, queue comma
     getWorkspace: () => "/tmp/mamachi-workspace",
     getAvailableWorkspaces: () => ["/tmp/mamachi-workspace", "/tmp/other"],
     getCodingProfiles: () => ["auto", "fast"],
+    getComputerCapabilities: () => ["shell"],
+    getComputerConfirmationMode: () => computerConfirmationMode,
     getSnapshot: () => snapshot,
     getTaskFacts: () => ({
       taskId: task.id,
@@ -1386,6 +1392,10 @@ test("section 16 handlers enforce correlation, ownership, revisions, queue comma
       return { id, scope, projectId, fact };
     },
     forgetFact: (memoryId) => memories.delete(memoryId),
+    controlComputer: async (request) => {
+      computerCalls.push(request.command ?? request.action);
+      return { status: "ok", action: request.action, target: "shell", output: "approved" };
+    },
     emit: () => {},
     emitAudio: () => {},
   });
@@ -1483,6 +1493,33 @@ test("section 16 handlers enforce correlation, ownership, revisions, queue comma
     status: "rejected",
     code: "memory_not_found",
   });
+  const pendingComputerAction = await invoke("control_computer", {
+    action: "run_shell_command",
+    command: "printf approved",
+  });
+  expect(pendingComputerAction).toMatchObject({
+    status: "confirmation_required",
+    action: "run_shell_command",
+  });
+  expect(computerCalls).toEqual([]);
+  expect(await invoke("resolve_computer_control", {
+    requestId: pendingComputerAction["requestId"],
+    decision: "approve",
+  })).toMatchObject({
+    status: "ok",
+    action: "run_shell_command",
+    output: "approved",
+  });
+  expect(computerCalls).toEqual(["printf approved"]);
+  computerConfirmationMode = "never";
+  expect(await invoke("control_computer", {
+    action: "run_shell_command",
+    command: "printf direct",
+  })).toMatchObject({
+    status: "ok",
+    action: "run_shell_command",
+  });
+  expect(computerCalls).toEqual(["printf approved", "printf direct"]);
   await bridge.disconnect();
   handlerServer.stop(true);
 });

@@ -2,7 +2,18 @@ import WebSocket, { type RawData } from "ws";
 import type { ActionResult, DomainEvent } from "@mamachi/protocol";
 import type { ControllerSnapshot, TaskRecord } from "./domain.ts";
 import type { CapturedContext, ContextKind, EvidenceArtifact } from "./artifact-store.ts";
-import { computerActions, type ComputerAction, type ComputerControlResult } from "./computer-control.ts";
+import {
+  computerActions,
+  parseComputerControlRequest,
+  sensitiveComputerActions,
+} from "./computer-control.ts";
+import type {
+  ComputerAction,
+  ComputerCapability,
+  ComputerConfirmationMode,
+  ComputerControlRequest,
+  ComputerControlResult,
+} from "./computer-control.ts";
 import type { TaskFacts } from "./fact-projector.ts";
 import type { MemoryScope } from "./memory-store.ts";
 import type { VoiceBrief, VoiceBriefKind } from "./voice-brief-store.ts";
@@ -25,6 +36,8 @@ interface RealtimeBridgeOptions {
   getWorkspace: () => string;
   getAvailableWorkspaces?: () => readonly string[];
   getCodingProfiles?: () => readonly string[];
+  getComputerCapabilities?: () => readonly ComputerCapability[];
+  getComputerConfirmationMode?: () => ComputerConfirmationMode;
   getSnapshot: () => ControllerSnapshot;
   getTaskFacts?: (taskId: string) => TaskFacts | undefined;
   getTaskArtifact?: (taskId: string, artifactId: string) => EvidenceArtifact | null;
@@ -46,7 +59,7 @@ interface RealtimeBridgeOptions {
   initialBriefs?: readonly VoiceBrief[];
   onBriefQueued?: (brief: VoiceBrief) => void;
   onBriefDelivered?: (taskIds: readonly string[]) => void;
-  controlComputer?: (action: ComputerAction) => Promise<ComputerControlResult>;
+  controlComputer?: (request: ComputerControlRequest) => Promise<ComputerControlResult>;
   emit: (type: string, payload: unknown) => void;
   emitAudio: (pcm: Uint8Array, playback: { itemId: string; contentIndex: number }) => void;
   initiallyEngaged?: boolean;
@@ -56,6 +69,12 @@ interface FunctionCall {
   callId: string;
   name: string;
   arguments: string;
+}
+
+interface PendingComputerControl {
+  request: ComputerControlRequest;
+  expiresAt: number;
+  timeout: ReturnType<typeof setTimeout>;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -93,6 +112,7 @@ export class RealtimeBridge {
   readonly #endpoint: string;
   readonly #recentActivity = new Map<string, { type: string; summary: string; at: string }>();
   readonly #pendingContext = new Map<string, CapturedContext>();
+  readonly #pendingComputerControls = new Map<string, PendingComputerControl>();
   #engaged: boolean;
   readonly #queuedBriefs = new Map<string, QueuedBrief>();
   #activeAssistantAudio: { itemId: string; contentIndex: number } | null = null;
@@ -151,6 +171,7 @@ export class RealtimeBridge {
       this.#cancellationRequested = false;
       this.#activeAssistantAudio = null;
       this.#lastTruncation = null;
+      this.#clearPendingComputerControls("provider_connection_closed");
       if (!this.#manualClose) {
         this.#options.emit("voice.state", { state: "disconnected", reason: "provider_connection_closed" });
       }
@@ -211,6 +232,7 @@ export class RealtimeBridge {
     this.#activeAssistantAudio = null;
     this.#lastTruncation = null;
     this.#socket = null;
+    this.#clearPendingComputerControls("voice_disconnected");
     if (socket.readyState === WebSocket.CLOSED) return;
     const { promise, resolve } = Promise.withResolvers<void>();
     const timeout = setTimeout(resolve, 2_000);
@@ -275,6 +297,11 @@ export class RealtimeBridge {
     this.#pendingResponseMode = null;
     if (this.#socket?.readyState === WebSocket.OPEN) this.#send(this.#sessionUpdate());
     this.#options.emit("voice.mode", { mode });
+  }
+
+  refreshComputerControlConfiguration(): void {
+    this.#clearPendingComputerControls("settings_changed");
+    if (this.#socket?.readyState === WebSocket.OPEN) this.#send(this.#sessionUpdate());
   }
 
   sendText(text: string): void {
@@ -555,7 +582,7 @@ Do not speak before any tool call. Status checks, interface controls, workspace 
 When the user says "expand", asks to open the orb, or asks to show the conversation or current task, call set_overlay with action "expand". When the user asks to collapse, minimize, or return to the orb, call set_overlay with action "collapse".
 
 # Computer control
-For an explicit request to open Google Chrome, open System Settings, or play or pause a song in a running Spotify or Music app, call control_computer immediately and silently. These are the only computer actions available. Use media_play_pause for music playback, never control_task. Report a rejected result accurately.
+Use control_computer only for an explicit user request to operate this Mac. Enabled capability categories: ${(this.#options.getComputerCapabilities?.() ?? []).join(", ") || "none"}. Confirmation policy: ${this.#options.getComputerConfirmationMode?.() ?? "sensitive"}. Prefer a structured action; use raw AppleScript or shell only when enabled and no structured action can do the job. If a call returns confirmation_required, briefly name the action and ask for confirmation, then call resolve_computer_control with that exact request ID after the user's explicit decision. Never repeat a pending action, invent approval, expose clipboard contents unless requested, or claim success before an ok result.
 
 # Microphone control
 When the user says "mute", "go to sleep", "stop listening", or otherwise explicitly asks Mamachi to stop listening, call mute_mamachi immediately and silently. Do not acknowledge afterward because the microphone will be disengaged. The user can resume with the hotkey or orb.
@@ -830,12 +857,52 @@ ${this.#options.getWorkspace()}
       {
         type: "function",
         name: "control_computer",
-        description: "Perform one explicit allowlisted macOS action.",
+        description: "Perform one explicitly requested macOS action using the user's configured capability policy.",
         parameters: {
           type: "object",
           additionalProperties: false,
-          properties: { action: { type: "string", enum: computerActions } },
+          properties: {
+            action: { type: "string", enum: computerActions },
+            application: { type: "string", minLength: 1 },
+            url: { type: "string", minLength: 1 },
+            path: { type: "string", minLength: 1 },
+            text: { type: "string", minLength: 1 },
+            key: { type: "string", minLength: 1 },
+            keys: {
+              type: "array",
+              items: { type: "string", minLength: 1 },
+              minItems: 1,
+              maxItems: 5,
+            },
+            x: { type: "number" },
+            y: { type: "number" },
+            toX: { type: "number" },
+            toY: { type: "number" },
+            width: { type: "number" },
+            height: { type: "number" },
+            deltaX: { type: "number" },
+            deltaY: { type: "number" },
+            volume: { type: "number", minimum: 0, maximum: 100 },
+            script: { type: "string", minLength: 1 },
+            command: { type: "string", minLength: 1 },
+            cwd: { type: "string", minLength: 1 },
+            timeoutSeconds: { type: "number", minimum: 1, maximum: 300 },
+          },
           required: ["action"],
+        },
+      },
+      {
+        type: "function",
+        name: "resolve_computer_control",
+        description: "Approve or reject one exact pending computer action after the user's explicit decision.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            requestId: { type: "string", minLength: 1 },
+            decision: { type: "string", enum: ["approve", "reject"] },
+          },
+          required: ["requestId", "decision"],
         },
       },
       {
@@ -1356,19 +1423,71 @@ ${this.#options.getWorkspace()}
         return { status: "ok", expanded };
       }
       case "control_computer": {
-        assertOnlyKeys(input, ["action"], name);
-        const action = requireString(input["action"], "action");
-        if (!computerActions.includes(action as ComputerAction)) throw new Error(`Unsupported computer action: ${action}`);
+        const request = parseComputerControlRequest(input);
         if (!this.#options.controlComputer) {
           return {
             status: "rejected",
+            action: request.action,
             code: "computer_control_unavailable",
             explanation: "Computer control is unavailable in this Mamachi runtime",
           };
         }
-        const result = await this.#options.controlComputer(action as ComputerAction);
-        this.#options.emit("computer.control", result);
-        return result;
+        if (this.#computerControlNeedsConfirmation(request.action)) {
+          this.#clearPendingComputerControls("superseded");
+          const requestId = Bun.randomUUIDv7();
+          const expiresAt = Date.now() + 120_000;
+          const timeout = setTimeout(() => {
+            const expired = this.#pendingComputerControls.get(requestId);
+            if (!expired) return;
+            this.#pendingComputerControls.delete(requestId);
+            this.#options.emit("computer.confirmation_expired", {
+              requestId,
+              action: expired.request.action,
+            });
+          }, 120_000);
+          this.#pendingComputerControls.set(requestId, { request, expiresAt, timeout });
+          const result = {
+            status: "confirmation_required",
+            requestId,
+            action: request.action,
+            summary: this.#computerControlSummary(request),
+          };
+          this.#options.emit("computer.confirmation_required", result);
+          return result;
+        }
+        return this.#runComputerControl(request);
+      }
+      case "resolve_computer_control": {
+        assertOnlyKeys(input, ["requestId", "decision"], name);
+        const requestId = requireString(input["requestId"], "requestId");
+        const decision = requireString(input["decision"], "decision");
+        if (decision !== "approve" && decision !== "reject") {
+          throw new Error("decision must be approve or reject");
+        }
+        const pending = this.#pendingComputerControls.get(requestId);
+        this.#pendingComputerControls.delete(requestId);
+        if (pending) clearTimeout(pending.timeout);
+        if (!pending || pending.expiresAt < Date.now()) {
+          return {
+            status: "rejected",
+            code: "computer_confirmation_expired",
+            explanation: "That computer-control request is no longer pending",
+          };
+        }
+        this.#options.emit("computer.confirmation_resolved", {
+          requestId,
+          action: pending.request.action,
+          decision,
+        });
+        if (decision === "reject") {
+          return {
+            status: "rejected",
+            action: pending.request.action,
+            code: "user_rejected",
+            explanation: "The user rejected the computer action",
+          };
+        }
+        return this.#runComputerControl(pending.request);
       }
       case "mute_mamachi":
         assertOnlyKeys(input, [], name);
@@ -1377,6 +1496,45 @@ ${this.#options.getWorkspace()}
       default:
         throw new Error(`Unknown voice tool: ${name}`);
     }
+  }
+
+  #clearPendingComputerControls(reason: string): void {
+    if (this.#pendingComputerControls.size === 0) return;
+    for (const pending of this.#pendingComputerControls.values()) clearTimeout(pending.timeout);
+    this.#pendingComputerControls.clear();
+    this.#options.emit("computer.confirmation_cleared", { reason });
+  }
+
+  #computerControlNeedsConfirmation(action: ComputerAction): boolean {
+    const mode = this.#options.getComputerConfirmationMode?.() ?? "sensitive";
+    return mode === "always" || (mode === "sensitive" && sensitiveComputerActions.includes(action));
+  }
+
+  #computerControlSummary(request: ComputerControlRequest): string {
+    const target =
+      request.application ??
+      request.url ??
+      request.path ??
+      (request.action === "run_shell_command"
+        ? "a shell command"
+        : request.action === "run_applescript"
+          ? "an AppleScript"
+          : "this Mac");
+    return `${request.action} on ${target}`.slice(0, 500);
+  }
+
+  async #runComputerControl(request: ComputerControlRequest): Promise<ComputerControlResult> {
+    if (!this.#options.controlComputer) {
+      return {
+        status: "rejected",
+        action: request.action,
+        code: "computer_control_unavailable",
+        explanation: "Computer control is unavailable in this Mamachi runtime",
+      };
+    }
+    const result = await this.#options.controlComputer(request);
+    this.#options.emit("computer.control", result);
+    return result;
   }
 
   async #proposeTaskChange(input: Record<string, unknown>): Promise<unknown> {

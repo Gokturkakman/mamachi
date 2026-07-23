@@ -40,6 +40,8 @@ const configured: RuntimeSettings = {
   fastModel: "openai-codex/gpt-5.4-mini",
   thinkingLevel: "medium",
   automaticRouting: true,
+  computerCapabilities: ["applications", "keyboard"],
+  computerConfirmationMode: "sensitive",
 };
 
 describe("model router", () => {
@@ -66,5 +68,17 @@ describe("model router", () => {
   test("validates complete runtime settings payloads", () => {
     expect(parseRuntimeSettings(defaultRuntimeSettings)).toEqual(defaultRuntimeSettings);
     expect(() => parseRuntimeSettings({ ...defaultRuntimeSettings, thinkingLevel: "reckless" })).toThrow();
+    expect(() =>
+      parseRuntimeSettings({
+        ...defaultRuntimeSettings,
+        computerCapabilities: ["applications", "applications"],
+      })
+    ).toThrow("unique values");
+    expect(() =>
+      parseRuntimeSettings({
+        ...defaultRuntimeSettings,
+        computerConfirmationMode: "sometimes",
+      })
+    ).toThrow("computerConfirmationMode");
   });
 });

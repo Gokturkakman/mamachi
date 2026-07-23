@@ -5,7 +5,7 @@ import { MamachiIpcServer } from "./ipc-server.ts";
 import { OmpRunner } from "./omp-runner.ts";
 import { RealtimeBridge } from "./realtime-bridge.ts";
 import { defaultRuntimeSettings, type RuntimeSettings } from "./model-router.ts";
-import { controlMacComputer } from "./computer-control.ts";
+import { MacComputerController } from "./computer-control.ts";
 import { OmpObserverBackend, PassiveObserver } from "./observer.ts";
 import { VoiceBriefStore } from "./voice-brief-store.ts";
 
@@ -47,6 +47,10 @@ const initialRuntimeSettings: RuntimeSettings = {
   ...defaultRuntimeSettings,
   primaryModel: process.env["MAMACHI_CODING_MODEL"] ?? defaultRuntimeSettings.primaryModel,
 };
+let runtimeSettings = initialRuntimeSettings;
+const computerController = new MacComputerController({
+  capabilities: initialRuntimeSettings.computerCapabilities,
+});
 const daemon = new MamachiIpcServer({
   token,
   port,
@@ -95,8 +99,11 @@ const daemon = new MamachiIpcServer({
       }
     },
     onSettingsUpdate: (settings) => {
+      runtimeSettings = settings;
       runner?.configure(settings);
       observerBackend?.configure(process.env["MAMACHI_OBSERVER_MODEL"] ?? settings.fastModel);
+      computerController.configure(settings.computerCapabilities);
+      realtime?.refreshComputerControlConfiguration();
     },
     onVoiceConnect: (apiKey) => realtime?.connect(apiKey),
     onVoiceDisconnect: () => realtime?.disconnect(),
@@ -112,6 +119,8 @@ realtime = new RealtimeBridge({
   getWorkspace: () => daemon.workspace,
   getAvailableWorkspaces: () => [daemon.workspace],
   getCodingProfiles: () => ["auto", "primary", "fast"],
+  getComputerCapabilities: () => runtimeSettings.computerCapabilities,
+  getComputerConfirmationMode: () => runtimeSettings.computerConfirmationMode,
   getSnapshot: () => daemon.snapshot(),
   getTaskFacts: (taskId) => daemon.taskFacts(taskId),
   getTaskArtifact: (taskId, artifactId) => daemon.getTaskArtifact(taskId, artifactId),
@@ -125,7 +134,7 @@ realtime = new RealtimeBridge({
   initialBriefs: briefStore.pending(),
   onBriefQueued: (brief) => briefStore.save(brief),
   onBriefDelivered: (taskIds) => briefStore.markDelivered(taskIds),
-  controlComputer: controlMacComputer,
+  controlComputer: (request) => computerController.control(request),
   emit: (type, payload) => daemon.emit(type, payload),
   emitAudio: (pcm) => daemon.emitAudio(pcm),
   initiallyEngaged: false,

@@ -52,7 +52,7 @@ The implementation is local-first and keeps one mutating coding job active at a 
 - The provider connection remains open while the microphone sleeps.
 - Completion, failure, and attention briefs queue durably while sleeping and are delivered only after re-engagement.
 - Realtime failures do not stop coding; coding failures do not terminate the voice session.
-- Complete strict tool surface from PRD section 16, including workspace/profile discovery, explicit editor capture, task submission/status/artifacts, exact coder answers, safe task changes, queue control, memories, constrained computer control, overlay control, and microphone sleep.
+- Complete strict tool surface from PRD section 16, including workspace/profile discovery, explicit editor capture, task submission/status/artifacts, exact coder answers, safe task changes, queue control, memories, configurable computer control, overlay control, and microphone sleep.
 - Consequential changes pause at a safe boundary, persist a revised specification, and resume; low-risk clarifications use direct steering.
 - Casual conversation is not durable memory. Only confirmed task facts and explicit remember/forget actions persist.
 
@@ -67,6 +67,7 @@ The implementation is local-first and keeps one mutating coding job active at a 
 - Realtime and coding credentials plus the application encryption key are stored in macOS Keychain.
 - Preview-before-export diagnostics with an allowlisted, bounded schema that excludes source, transcripts, prompts, tool arguments, credentials, and audio.
 - Privacy controls for transcript retention, credential replacement/removal, diagnostics preview/export, and overlay reset.
+- Computer-control settings provide Off, Basic, Assistive, Full, and custom capability sets, per-category toggles, and always/sensitive/never confirmation modes.
 
 ### VS Code integration and distribution
 

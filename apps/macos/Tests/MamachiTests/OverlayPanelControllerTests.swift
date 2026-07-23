@@ -4,97 +4,145 @@ import XCTest
 
 @MainActor
 final class OverlayPanelControllerTests: XCTestCase {
-    func testCompactResizeStepsStaySquareClampAndPreserveCenter() {
-        let current = NSRect(x: 100, y: 200, width: 144, height: 144)
+    func testModelPersistsCollapsedAndExpandedPresetSelections() {
+        preservingOverlayDefaults {
+            let model = AppModel()
+            var received: (OverlaySizePreset, OverlaySizePreset)?
+            model.onOverlaySizeChange = { received = ($0, $1) }
 
-        let larger = OverlayPanelController.compactFrame(from: current, resizingBy: 32)
-        XCTAssertEqual(larger.width, 176, accuracy: 0.001)
-        XCTAssertEqual(larger.height, 176, accuracy: 0.001)
-        XCTAssertEqual(larger.midX, current.midX, accuracy: 0.001)
-        XCTAssertEqual(larger.midY, current.midY, accuracy: 0.001)
+            model.setCollapsedOverlaySize(.small)
+            model.setExpandedOverlaySize(.large)
 
-        let smallest = OverlayPanelController.compactFrame(from: current, resizingBy: -1_000)
-        XCTAssertEqual(smallest.width, 112, accuracy: 0.001)
-        XCTAssertEqual(smallest.height, 112, accuracy: 0.001)
-        XCTAssertEqual(smallest.midX, current.midX, accuracy: 0.001)
-        XCTAssertEqual(smallest.midY, current.midY, accuracy: 0.001)
+            XCTAssertEqual(model.collapsedOverlaySize, .small)
+            XCTAssertEqual(model.expandedOverlaySize, .large)
+            XCTAssertEqual(received?.0, .small)
+            XCTAssertEqual(received?.1, .large)
 
-        let largest = OverlayPanelController.compactFrame(from: current, resizingBy: 1_000)
-        XCTAssertEqual(largest.width, 300, accuracy: 0.001)
-        XCTAssertEqual(largest.height, 300, accuracy: 0.001)
-        XCTAssertEqual(largest.midX, current.midX, accuracy: 0.001)
-        XCTAssertEqual(largest.midY, current.midY, accuracy: 0.001)
-    }
-
-    func testAppModelForwardsCompactResizeRequest() {
-        let model = AppModel()
-        var received: CGFloat?
-        model.onAdjustCompactOrbSize = { received = $0 }
-
-        model.adjustCompactOrbSize(by: 32)
-
-        XCTAssertEqual(received, 32)
-    }
-
-    func testCompactResizeSurvivesExpandAndCollapseWithoutLargeIntermediateFrame() {
-        let model = AppModel()
-        let controller = OverlayPanelController(model: model)
-        controller.resetFrame()
-        defer {
-            controller.resetFrame()
-            controller.hide()
+            let replacement = AppModel()
+            XCTAssertEqual(replacement.collapsedOverlaySize, .small)
+            XCTAssertEqual(replacement.expandedOverlaySize, .large)
         }
-
-        controller.adjustCompactOrbSize(by: 32)
-        let compactFrame = panel(from: controller).frame
-
-        model.drawerExpanded = true
-        XCTAssertGreaterThanOrEqual(panel(from: controller).frame.width, 440)
-
-        model.drawerExpanded = false
-        let restoredFrame = panel(from: controller).frame
-        XCTAssertEqual(restoredFrame.width, compactFrame.width, accuracy: 0.001)
-        XCTAssertEqual(restoredFrame.height, compactFrame.height, accuracy: 0.001)
-        XCTAssertLessThanOrEqual(restoredFrame.width, 300)
     }
 
+    func testSettingsPresetsControlBothModesAndIgnoreSavedFrameDimensions() {
+        preservingOverlayDefaults {
+            let model = AppModel()
+            model.setCollapsedOverlaySize(.small)
+            model.setExpandedOverlaySize(.large)
 
-    func testCompactSizePersistsAcrossRepeatedCyclesAndControllerRecreation() async {
-        let model = AppModel()
-        let controller = OverlayPanelController(model: model)
-        var replacement: OverlayPanelController?
-        controller.resetFrame()
-        defer {
-            replacement?.resetFrame()
-            replacement?.hide()
+            let controller = OverlayPanelController(model: model)
             controller.resetFrame()
-            controller.hide()
-        }
+            defer { controller.hide() }
+            model.onOverlaySizeChange = { [weak controller] collapsed, expanded in
+                controller?.applySizePresets(collapsed: collapsed, expanded: expanded)
+            }
 
-        controller.adjustCompactOrbSize(by: -32)
-        let chosenSize = panel(from: controller).frame.width
+            XCTAssertFalse(panel(from: controller).styleMask.contains(.resizable))
+            assertPanel(controller, width: 112, height: 112)
 
-        for _ in 0..<3 {
             model.drawerExpanded = true
-            await Task.yield()
+            assertPanel(controller, width: 640, height: 800)
+
             model.drawerExpanded = false
-            await Task.yield()
+            assertPanel(controller, width: 112, height: 112)
+
+            model.setCollapsedOverlaySize(.large)
+            assertPanel(controller, width: 184, height: 184)
+
+            model.setExpandedOverlaySize(.small)
+            assertPanel(controller, width: 184, height: 184)
+
+            model.drawerExpanded = true
+            assertPanel(controller, width: 440, height: 540)
+            model.drawerExpanded = false
+            assertPanel(controller, width: 184, height: 184)
+
+            controller.hide()
+            UserDefaults.standard.set(
+                NSStringFromRect(NSRect(x: 100, y: 100, width: 300, height: 300)),
+                forKey: "overlayCompactFrame"
+            )
+            UserDefaults.standard.set(
+                NSStringFromRect(NSRect(x: 100, y: 100, width: 860, height: 1020)),
+                forKey: "overlayExpandedFrame"
+            )
+
+            let replacementModel = AppModel()
+            let replacement = OverlayPanelController(model: replacementModel)
+            replacement.show()
+            defer { replacement.hide() }
+
+            assertPanel(replacement, width: 184, height: 184)
+            replacementModel.drawerExpanded = true
+            assertPanel(replacement, width: 440, height: 540)
         }
-        XCTAssertEqual(panel(from: controller).frame.width, chosenSize, accuracy: 0.001)
+    }
 
-        // Position persistence must not be able to overwrite the explicit size
-        // selected with the plus/minus controls.
-        var staleFrame = panel(from: controller).frame
-        staleFrame.size = NSSize(width: 300, height: 300)
-        UserDefaults.standard.set(NSStringFromRect(staleFrame), forKey: "overlayCompactFrame")
+    func testOrbContextMenuProvidesRecoveryAndQuitActions() {
+        var openedSettings = false
+        var hidOverlay = false
+        var quitApplication = false
+        let view = WindowDragHandle.DragHandleView()
+        view.contextMenuActions = OrbContextMenuActions(
+            openTaskDrawer: {},
+            openChat: {},
+            openSettings: { openedSettings = true },
+            hideOverlay: { hidOverlay = true },
+            quitApplication: { quitApplication = true }
+        )
 
-        controller.hide()
-        let replacementModel = AppModel()
-        let nextController = OverlayPanelController(model: replacementModel)
-        replacement = nextController
-        nextController.show()
+        let menu = view.makeContextMenu()
+        XCTAssertEqual(
+            menu.items.filter { !$0.isSeparatorItem }.map(\.title),
+            ["Open Task Drawer", "Open Chat", "Settings…", "Hide Overlay", "Quit Mamachi"]
+        )
 
-        XCTAssertEqual(panel(from: nextController).frame.width, chosenSize, accuracy: 0.001)
+        for title in ["Settings…", "Hide Overlay", "Quit Mamachi"] {
+            guard
+                let item = menu.items.first(where: { $0.title == title }),
+                let action = item.action
+            else {
+                return XCTFail("Missing context-menu action for \(title)")
+            }
+            XCTAssertTrue(NSApplication.shared.sendAction(action, to: item.target, from: item))
+        }
+        XCTAssertTrue(openedSettings)
+        XCTAssertTrue(hidOverlay)
+        XCTAssertTrue(quitApplication)
+    }
+
+    private func assertPanel(
+        _ controller: OverlayPanelController,
+        width: CGFloat,
+        height: CGFloat,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let frame = panel(from: controller).frame
+        XCTAssertEqual(frame.width, width, accuracy: 0.001, file: file, line: line)
+        XCTAssertEqual(frame.height, height, accuracy: 0.001, file: file, line: line)
+    }
+
+    private func preservingOverlayDefaults(_ body: () -> Void) {
+        let defaults = UserDefaults.standard
+        let keys = [
+            "collapsedOverlaySizePreset",
+            "expandedOverlaySizePreset",
+            "overlayCompactFrame",
+            "overlayExpandedFrame",
+        ]
+        let previous = Dictionary(uniqueKeysWithValues: keys.map { ($0, defaults.object(forKey: $0)) })
+        keys.forEach(defaults.removeObject(forKey:))
+        defer {
+            for key in keys {
+                if let value = previous[key] {
+                    defaults.set(value, forKey: key)
+                } else {
+                    defaults.removeObject(forKey: key)
+                }
+            }
+        }
+        body()
     }
 
     private func panel(from controller: OverlayPanelController) -> NSPanel {

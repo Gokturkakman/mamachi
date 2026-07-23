@@ -7,17 +7,11 @@ private final class MamachiPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-/// Floating overlay window: borderless, non-activating, user-resizable.
-/// The compact orb keeps a square aspect; both modes remember their frame.
+/// Floating overlay window: borderless and movable. Its collapsed and
+/// expanded dimensions come only from persistent Settings presets.
 @MainActor
 final class OverlayPanelController: NSObject, NSWindowDelegate {
     private enum Metrics {
-        static let compactDefault = NSSize(width: 144, height: 144)
-        static let compactMin = NSSize(width: 112, height: 112)
-        static let compactMax = NSSize(width: 300, height: 300)
-        static let expandedDefault = NSSize(width: 512, height: 652)
-        static let expandedMin = NSSize(width: 440, height: 540)
-        static let expandedMax = NSSize(width: 860, height: 1020)
         static let compactFrameKey = "overlayCompactFrame"
         static let expandedFrameKey = "overlayExpandedFrame"
     }
@@ -25,13 +19,23 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
     private let panel: MamachiPanel
     private var expanded: Bool
     private var expansionSubscription: AnyCancellable?
+    private var collapsedSize: NSSize
+    private var expandedSize: NSSize
     private var restoringFrame = false
 
     init(model: AppModel) {
+        collapsedSize = NSSize(
+            width: model.collapsedOverlaySize.collapsedSide,
+            height: model.collapsedOverlaySize.collapsedSide
+        )
+        expandedSize = NSSize(
+            width: model.expandedOverlaySize.expandedSize.width,
+            height: model.expandedOverlaySize.expandedSize.height
+        )
         expanded = model.drawerExpanded
         panel = MamachiPanel(
-            contentRect: NSRect(origin: .zero, size: Metrics.compactDefault),
-            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView, .resizable],
+            contentRect: NSRect(origin: .zero, size: collapsedSize),
+            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
@@ -46,7 +50,7 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
         panel.delegate = self
 
         let hosting = NSHostingView(rootView: OverlayView(model: model))
-        // The window owns its size; SwiftUI must not fight user resizing.
+        // Settings owns both mode sizes; SwiftUI must not derive window dimensions.
         hosting.sizingOptions = []
         panel.contentView = hosting
 
@@ -73,7 +77,7 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
         panel.isVisible ? hide() : show()
     }
 
-    /// Forgets saved frames and recenters the overlay at its default size.
+    /// Forgets saved positions and recenters at the selected mode size.
     func resetFrame() {
         let defaults = UserDefaults.standard
         defaults.removeObject(forKey: Metrics.compactFrameKey)
@@ -83,30 +87,33 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
         if !panel.isVisible { panel.orderFrontRegardless() }
     }
 
-    /// Pure geometry used by the resize buttons and covered independently of
-    /// AppKit window animation.
-    static func compactFrame(from current: NSRect, resizingBy points: CGFloat) -> NSRect {
-        let side = min(
-            max(current.width + points, Metrics.compactMin.width),
-            Metrics.compactMax.width
+    func applySizePresets(
+        collapsed collapsedPreset: OverlaySizePreset,
+        expanded expandedPreset: OverlaySizePreset
+    ) {
+        collapsedSize = NSSize(
+            width: collapsedPreset.collapsedSide,
+            height: collapsedPreset.collapsedSide
         )
-        return NSRect(
-            x: current.midX - side / 2,
-            y: current.midY - side / 2,
-            width: side,
-            height: side
+        expandedSize = NSSize(
+            width: expandedPreset.expandedSize.width,
+            height: expandedPreset.expandedSize.height
         )
-    }
 
-    /// Resizes the compact orb in large, predictable steps while keeping its
-    /// center stable. Native edge resizing remains available as a fallback.
-    func adjustCompactOrbSize(by points: CGFloat) {
-        guard !expanded else { return }
-        let current = panel.frame
-        let resized = Self.compactFrame(from: current, resizingBy: points)
-        guard abs(resized.width - current.width) > 0.5 else { return }
-        let next = clamp(resized)
-        panel.setFrame(next, display: true)
+        let center = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
+        let size = defaultSize(for: expanded)
+        let frame = clamp(
+            NSRect(
+                x: center.x - size.width / 2,
+                y: center.y - size.height / 2,
+                width: size.width,
+                height: size.height
+            )
+        )
+        restoringFrame = true
+        applyModeConstraints()
+        panel.setFrame(frame, display: true)
+        restoringFrame = false
         persistFrame()
     }
 
@@ -126,9 +133,7 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
         persistFrame()
         let center = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
         expanded = nextExpanded
-        applyModeConstraints()
-
-        let size = savedFrame(for: nextExpanded)?.size ?? defaultSize(for: nextExpanded)
+        let size = defaultSize(for: nextExpanded)
         let frame = clamp(
             NSRect(
                 x: center.x - size.width / 2,
@@ -138,6 +143,7 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
             )
         )
         restoringFrame = true
+        applyModeConstraints()
         panel.setFrame(frame, display: true)
         restoringFrame = false
         persistFrame()
@@ -145,21 +151,16 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
     }
 
     private func applyModeConstraints() {
-        if expanded {
-            panel.contentAspectRatio = .zero
-            panel.contentMinSize = Metrics.expandedMin
-            panel.contentMaxSize = Metrics.expandedMax
-        } else {
-            panel.contentAspectRatio = NSSize(width: 1, height: 1)
-            panel.contentMinSize = Metrics.compactMin
-            panel.contentMaxSize = Metrics.compactMax
-        }
+        let size = defaultSize(for: expanded)
+        panel.contentAspectRatio = expanded ? .zero : NSSize(width: 1, height: 1)
+        panel.contentMinSize = size
+        panel.contentMaxSize = size
     }
 
     // MARK: - Frames
 
     private func defaultSize(for expanded: Bool) -> NSSize {
-        expanded ? Metrics.expandedDefault : Metrics.compactDefault
+        expanded ? expandedSize : collapsedSize
     }
 
     private func defaultFrame(for expanded: Bool) -> NSRect {
@@ -177,7 +178,16 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
     }
 
     private func initialFrame(for expanded: Bool) -> NSRect {
-        savedFrame(for: expanded) ?? defaultFrame(for: expanded)
+        guard let saved = savedFrame(for: expanded) else {
+            return defaultFrame(for: expanded)
+        }
+        let size = defaultSize(for: expanded)
+        return NSRect(
+            x: saved.midX - size.width / 2,
+            y: saved.midY - size.height / 2,
+            width: size.width,
+            height: size.height
+        )
     }
 
     private func savedFrame(for expanded: Bool) -> NSRect? {
@@ -187,6 +197,7 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
         guard frame.width >= 40, frame.height >= 40 else { return nil }
         return frame
     }
+
 
     private func persistFrame() {
         guard panel.isVisible, !restoringFrame else { return }
@@ -220,9 +231,14 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
         Task { @MainActor in self.persistFrame() }
     }
 
-    nonisolated func windowDidEndLiveResize(_ notification: Notification) {
-        Task { @MainActor in self.persistFrame() }
-    }
+}
+
+struct OrbContextMenuActions {
+    let openTaskDrawer: () -> Void
+    let openChat: () -> Void
+    let openSettings: () -> Void
+    let hideOverlay: () -> Void
+    let quitApplication: () -> Void
 }
 
 /// Transparent AppKit layer that makes its whole area a window drag handle
@@ -230,23 +246,23 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
 /// press that moves performs a native window drag. Right-click is separate.
 struct WindowDragHandle: NSViewRepresentable {
     var onClick: () -> Void
-    var onRightClick: (() -> Void)?
+    var contextMenuActions: OrbContextMenuActions?
 
     func makeNSView(context: Context) -> DragHandleView {
         let view = DragHandleView()
         view.onClick = onClick
-        view.onRightClick = onRightClick
+        view.contextMenuActions = contextMenuActions
         return view
     }
 
     func updateNSView(_ view: DragHandleView, context: Context) {
         view.onClick = onClick
-        view.onRightClick = onRightClick
+        view.contextMenuActions = contextMenuActions
     }
 
     final class DragHandleView: NSView {
         var onClick: (() -> Void)?
-        var onRightClick: (() -> Void)?
+        var contextMenuActions: OrbContextMenuActions?
 
         override func mouseDown(with event: NSEvent) {
             guard let window else { return }
@@ -258,11 +274,50 @@ struct WindowDragHandle: NSViewRepresentable {
         }
 
         override func rightMouseDown(with event: NSEvent) {
-            guard let onRightClick else {
+            guard contextMenuActions != nil else {
                 super.rightMouseDown(with: event)
                 return
             }
-            onRightClick()
+            NSMenu.popUpContextMenu(makeContextMenu(), with: event, for: self)
+        }
+
+        func makeContextMenu() -> NSMenu {
+            let menu = NSMenu(title: "Mamachi")
+            menu.autoenablesItems = false
+            menu.addItem(menuItem("Open Task Drawer", action: #selector(openTaskDrawer)))
+            menu.addItem(menuItem("Open Chat", action: #selector(openChat)))
+            menu.addItem(.separator())
+            menu.addItem(menuItem("Settings…", action: #selector(openSettings)))
+            menu.addItem(menuItem("Hide Overlay", action: #selector(hideOverlay)))
+            menu.addItem(.separator())
+            menu.addItem(menuItem("Quit Mamachi", action: #selector(quitApplication)))
+            return menu
+        }
+
+        private func menuItem(_ title: String, action: Selector) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            return item
+        }
+
+        @objc private func openTaskDrawer() {
+            contextMenuActions?.openTaskDrawer()
+        }
+
+        @objc private func openChat() {
+            contextMenuActions?.openChat()
+        }
+
+        @objc private func openSettings() {
+            contextMenuActions?.openSettings()
+        }
+
+        @objc private func hideOverlay() {
+            contextMenuActions?.hideOverlay()
+        }
+
+        @objc private func quitApplication() {
+            contextMenuActions?.quitApplication()
         }
     }
 }

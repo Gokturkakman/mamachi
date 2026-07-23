@@ -48,6 +48,91 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
             }
 
+            Section("Computer control") {
+                Picker("Access profile", selection: computerControlProfile) {
+                    ForEach(ComputerControlProfile.selectable) { profile in
+                        Text(profile.label).tag(profile)
+                    }
+                    if ComputerControlProfile.matching(model.computerCapabilities) == .custom {
+                        Text("Custom").tag(ComputerControlProfile.custom)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                DisclosureGroup("Individual capabilities") {
+                    ForEach(ComputerCapability.allCases) { capability in
+                        Toggle(isOn: capabilityBinding(capability)) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(capability.label)
+                                Text(capability.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(capability.isElevated ? Color.orange : Color.secondary)
+                            }
+                        }
+                    }
+                }
+
+                Picker("Confirmation", selection: computerConfirmationMode) {
+                    ForEach(ComputerConfirmationMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+
+                if model.computerCapabilities.contains(.appleScript)
+                    || model.computerCapabilities.contains(.shell)
+                {
+                    Label(
+                        "Full access can run unrestricted automation outside the coding workspace.",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                } else {
+                    Text("Only enabled categories can execute. Changes apply immediately.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Text("Keyboard, pointer, window, and UI inspection require Accessibility access.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Open Accessibility Settings") { model.openAccessibilitySettings() }
+                }
+            }
+
+            Section("Overlay") {
+                Picker("Collapsed orb", selection: collapsedOverlaySize) {
+                    ForEach(OverlaySizePreset.allCases) { preset in
+                        Text(preset.label).tag(preset)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Picker("Expanded panel", selection: expandedOverlaySize) {
+                    ForEach(OverlaySizePreset.allCases) { preset in
+                        Text(preset.label).tag(preset)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                HStack {
+                    Text(
+                        "Collapsed \(model.collapsedOverlaySize.collapsedDimensions) · "
+                            + "Expanded \(model.expandedOverlaySize.expandedDimensions)"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Reset Position") { model.resetOverlayFrame() }
+                }
+
+                Text("Sizes apply immediately and remain selected until you change them here.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Coding agent") {
                 TextField("Primary model — blank uses OMP default", text: $primaryModel)
                     .textFieldStyle(.roundedBorder)
@@ -118,16 +203,6 @@ struct SettingsView: View {
                 }
             }
 
-            Section("Overlay") {
-                HStack {
-                    Text("Drag the orb to move it; drag any edge to resize either surface.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Reset Position & Size") { model.resetOverlayFrame() }
-                }
-            }
-
             Section("Session") {
                 HStack {
                     Text("Realtime status")
@@ -150,6 +225,12 @@ struct SettingsView: View {
                     Button("Clear History", role: .destructive) { model.clearTranscripts() }
                         .disabled(model.transcripts.isEmpty)
                 }
+                HStack {
+                    Text("Application")
+                    Spacer()
+                    Button("Quit Mamachi", role: .destructive, action: model.quitApplication)
+                        .keyboardShortcut("q", modifiers: .command)
+                }
             }
 
             Section("Privacy & Diagnostics") {
@@ -169,6 +250,57 @@ struct SettingsView: View {
 
     private var interactionMode: Binding<InteractionMode> {
         Binding(get: { model.interactionMode }, set: model.setInteractionMode)
+    }
+
+    private var collapsedOverlaySize: Binding<OverlaySizePreset> {
+        Binding(get: { model.collapsedOverlaySize }, set: model.setCollapsedOverlaySize)
+    }
+
+    private var expandedOverlaySize: Binding<OverlaySizePreset> {
+        Binding(get: { model.expandedOverlaySize }, set: model.setExpandedOverlaySize)
+    }
+
+    private var computerControlProfile: Binding<ComputerControlProfile> {
+        Binding(
+            get: { ComputerControlProfile.matching(model.computerCapabilities) },
+            set: { profile in
+                guard let capabilities = profile.capabilities else { return }
+                model.updateComputerControlSettings(
+                    capabilities: capabilities,
+                    confirmationMode: model.computerConfirmationMode
+                )
+            }
+        )
+    }
+
+    private var computerConfirmationMode: Binding<ComputerConfirmationMode> {
+        Binding(
+            get: { model.computerConfirmationMode },
+            set: {
+                model.updateComputerControlSettings(
+                    capabilities: model.computerCapabilities,
+                    confirmationMode: $0
+                )
+            }
+        )
+    }
+
+    private func capabilityBinding(_ capability: ComputerCapability) -> Binding<Bool> {
+        Binding(
+            get: { model.computerCapabilities.contains(capability) },
+            set: { enabled in
+                var capabilities = model.computerCapabilities
+                if enabled {
+                    capabilities.insert(capability)
+                } else {
+                    capabilities.remove(capability)
+                }
+                model.updateComputerControlSettings(
+                    capabilities: capabilities,
+                    confirmationMode: model.computerConfirmationMode
+                )
+            }
+        )
     }
 
     private var attentionNotifications: Binding<Bool> {

@@ -40,9 +40,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onOpenSettings = { [weak self] in self?.showSettings() }
         model.onShowOverlay = { [weak self] in self?.showOverlay() }
         model.onResetOverlayFrame = { [weak self] in self?.overlay?.resetFrame() }
-        model.onAdjustCompactOrbSize = { [weak self] points in
-            self?.overlay?.adjustCompactOrbSize(by: points)
+        model.onOverlaySizeChange = { [weak self] collapsed, expanded in
+            self?.overlay?.applySizePresets(collapsed: collapsed, expanded: expanded)
         }
+        model.onHideOverlay = { [weak self] in self?.hideOverlay() }
+        model.onQuitApplication = { NSApp.terminate(nil) }
         do {
             try ApplicationEncryptionService().prepareKey()
         } catch {
@@ -61,7 +63,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startOperationalApp() {
-        NSApp.setActivationPolicy(.accessory)
+        // Info.plist's LSUIElement owns the normal accessory policy. Changing
+        // it after SwiftUI creates MenuBarExtra can tear down the status item.
         do {
             hotKey = try GlobalHotKey { [weak self] in
                 guard let self else { return }
@@ -69,6 +72,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 model.toggleEngagement()
             }
         } catch {
+            // If global recovery is unavailable, keep a Dock entry so the
+            // application can still be activated and quit.
+            _ = NSApp.setActivationPolicy(.regular)
             model.errorMessage = error.localizedDescription
             diagnostics.recordFailure(component: .application, error: error)
         }

@@ -1,4 +1,14 @@
 import type { TaskRecord } from "./domain.ts";
+import {
+  assistiveComputerCapabilities,
+  computerCapabilities,
+  computerConfirmationModes,
+  isComputerCapability,
+} from "./computer-control.ts";
+import type {
+  ComputerCapability,
+  ComputerConfirmationMode,
+} from "./computer-control.ts";
 
 export const thinkingLevels = ["inherit", "auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
@@ -9,6 +19,8 @@ export interface RuntimeSettings {
   fastModel: string;
   thinkingLevel: CodingThinkingLevel;
   automaticRouting: boolean;
+  computerCapabilities: ComputerCapability[];
+  computerConfirmationMode: ComputerConfirmationMode;
 }
 
 export const defaultRuntimeSettings: RuntimeSettings = {
@@ -16,6 +28,8 @@ export const defaultRuntimeSettings: RuntimeSettings = {
   fastModel: "openai-codex/gpt-5.4-mini",
   thinkingLevel: "inherit",
   automaticRouting: true,
+  computerCapabilities: [...assistiveComputerCapabilities],
+  computerConfirmationMode: "sensitive",
 };
 
 export interface TaskRoute {
@@ -71,7 +85,14 @@ export function parseRuntimeSettings(input: unknown): RuntimeSettings {
   }
   const value = input as Record<string, unknown>;
   const keys = Object.keys(value);
-  const expected = ["primaryModel", "fastModel", "thinkingLevel", "automaticRouting"];
+  const expected = [
+    "primaryModel",
+    "fastModel",
+    "thinkingLevel",
+    "automaticRouting",
+    "computerCapabilities",
+    "computerConfirmationMode",
+  ];
   if (keys.length !== expected.length || keys.some((key) => !expected.includes(key))) {
     throw new Error("settings.update payload has unexpected fields");
   }
@@ -79,6 +100,8 @@ export function parseRuntimeSettings(input: unknown): RuntimeSettings {
   const fastModel = value["fastModel"];
   const thinkingLevel = value["thinkingLevel"];
   const automaticRouting = value["automaticRouting"];
+  const configuredComputerCapabilities = value["computerCapabilities"];
+  const computerConfirmationMode = value["computerConfirmationMode"];
   if (typeof primaryModel !== "string" || primaryModel.length > 200) {
     throw new Error("primaryModel must be a string of at most 200 characters");
   }
@@ -91,10 +114,29 @@ export function parseRuntimeSettings(input: unknown): RuntimeSettings {
   if (typeof automaticRouting !== "boolean") {
     throw new Error("automaticRouting must be a boolean");
   }
+  if (
+    !Array.isArray(configuredComputerCapabilities) ||
+    configuredComputerCapabilities.some((capability) => !isComputerCapability(capability)) ||
+    new Set(configuredComputerCapabilities).size !== configuredComputerCapabilities.length
+  ) {
+    throw new Error(
+      `computerCapabilities must contain unique values from: ${computerCapabilities.join(", ")}`,
+    );
+  }
+  if (
+    typeof computerConfirmationMode !== "string" ||
+    !computerConfirmationModes.includes(computerConfirmationMode as ComputerConfirmationMode)
+  ) {
+    throw new Error(
+      `computerConfirmationMode must be one of: ${computerConfirmationModes.join(", ")}`,
+    );
+  }
   return {
     primaryModel: primaryModel.trim(),
     fastModel: fastModel.trim(),
     thinkingLevel: thinkingLevel as CodingThinkingLevel,
     automaticRouting,
+    computerCapabilities: configuredComputerCapabilities as ComputerCapability[],
+    computerConfirmationMode: computerConfirmationMode as ComputerConfirmationMode,
   };
 }
