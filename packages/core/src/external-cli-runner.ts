@@ -213,6 +213,17 @@ function commandFromInput(input: Record<string, unknown>): string {
   return nonEmptyString(input["command"]) ?? nonEmptyString(input["cmd"]) ?? "";
 }
 
+function taskAllowsGitMetadataWrite(task: TaskRecord): boolean {
+  if (task.spec.constraints.some((constraint) =>
+    /\b(?:do not|don't|must not|never)\s+(?:git\s+)?(?:commit|stage)\b/i.test(constraint)
+  )) {
+    return false;
+  }
+  return [task.spec.objective, ...task.spec.acceptanceCriteria].some((requirement) =>
+    /\b(?:commit|commits|committed|committing|stage|staged|staging)\b/i.test(requirement)
+  );
+}
+
 function taskPrompt(
   task: TaskRecord,
   resumed: boolean,
@@ -242,6 +253,7 @@ function taskPrompt(
         "The previous process may have stopped during a tool action. Do not replay an unknown action. Inspect current repository state first.",
       ]
     : [];
+  const gitMetadataWriteAllowed = taskAllowsGitMetadataWrite(task);
   return [
     resumed
       ? `Resume task ${task.id} under accepted specification revision ${task.revision}. Re-read affected files before editing.`
@@ -259,7 +271,9 @@ function taskPrompt(
     ...capturedContext,
     "",
     "Work autonomously inside this repository until the task is complete.",
-    "Preserve pre-existing user changes. Do not commit, switch branches, publish, deploy, or access credentials.",
+    gitMetadataWriteAllowed
+      ? "The accepted task explicitly authorizes staging and committing inside this repository. Do not switch branches, publish, deploy, or access credentials."
+      : "Preserve pre-existing user changes. Do not commit, switch branches, publish, deploy, or access credentials.",
     "Use the agent's repository tools and verify the changed behavior with the smallest authoritative command.",
     "If one missing user decision makes further work unsafe, end with exactly `MAMACHI_NEEDS_INPUT: <one concise question>`.",
     "Otherwise end with a concise evidence-based summary. Do not claim completion before verification succeeds.",
@@ -378,7 +392,11 @@ export class ExternalCliRunner {
     this.#pauseRequested = task.state === "pause_requested";
     this.#policyPauseReason = null;
     this.#sessionId =
-      resumed && task.codingSession?.backend === this.#backend ? task.codingSession.id : null;
+      resumed &&
+      !taskAllowsGitMetadataWrite(task) &&
+      task.codingSession?.backend === this.#backend
+        ? task.codingSession.id
+        : null;
     this.#evidenceIds.length = 0;
     await this.#workspaceGuard.start(task.id, task.activeRunId, task.repositoryId);
     if (this.#sessionId && this.#options.onSessionBound) {
@@ -433,7 +451,7 @@ export class ExternalCliRunner {
     }
     const route = resolveTaskRoute(task, this.#runtimeSettings);
     const model = modelForExternalBackend(this.#backend, route.modelPattern);
-    const argv = this.#arguments(executable, model);
+    const argv = this.#arguments(executable, model, task);
     const environment = this.#processEnvironment();
     this.#options.emit("coder.routed", {
       taskId: task.id,
@@ -566,7 +584,8 @@ export class ExternalCliRunner {
     }
   }
 
-  #arguments(executable: string, model: string | undefined): string[] {
+  #arguments(executable: string, model: string | undefined, task: TaskRecord): string[] {
+    const gitMetadataWriteAllowed = taskAllowsGitMetadataWrite(task);
     if (this.#backend === "codex") {
       if (this.#sessionId) {
         return [
@@ -586,6 +605,7 @@ export class ExternalCliRunner {
         "--json",
         "--sandbox",
         "workspace-write",
+        ...(gitMetadataWriteAllowed ? ["--add-dir", join(task.repositoryId, ".git")] : []),
         "--skip-git-repo-check",
         ...(model ? ["--model", model] : []),
         "-",
@@ -600,7 +620,9 @@ export class ExternalCliRunner {
       "--permission-mode",
       "auto",
       "--append-system-prompt",
-      "Mamachi is supervising this coding run. Stay inside the selected repository, preserve user changes, avoid commits and external side effects, and verify before finishing.",
+      gitMetadataWriteAllowed
+        ? "Mamachi is supervising this coding run. The accepted task authorizes staging and committing inside the selected repository. Preserve user changes, avoid other external side effects, and verify before finishing."
+        : "Mamachi is supervising this coding run. Stay inside the selected repository, preserve user changes, avoid commits and external side effects, and verify before finishing.",
       ...(model ? ["--model", model] : []),
       ...(this.#sessionId ? ["--resume", this.#sessionId] : []),
     ];

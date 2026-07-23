@@ -14,13 +14,17 @@ const spec = {
   codingProfileId: "gpt-5.6-sol",
 };
 
-function submit(controller: TaskController, id = Bun.randomUUIDv7()): string {
+function submit(
+  controller: TaskController,
+  id = Bun.randomUUIDv7(),
+  codingProfileId = spec.codingProfileId,
+): string {
   const result = controller.handle({
     id,
     type: "task.submit",
     actor: "voice",
     expectedRevision: null,
-    payload: spec,
+    payload: { ...spec, codingProfileId },
   });
   if (result.status !== "accepted" || !result.taskId) throw new Error("Task submission failed");
   return result.taskId;
@@ -61,6 +65,26 @@ describe("TaskController", () => {
       expect(controller.eventsAfter().map((event) => event.type).slice(-2)).toEqual([
         "task.completed",
         "task.started",
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("prioritizes substantive coding work ahead of queued fast research", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const activeTaskId = submit(controller);
+      const firstResearchId = submit(controller, Bun.randomUUIDv7(), "fast");
+      const secondResearchId = submit(controller, Bun.randomUUIDv7(), "fast");
+      const codingTaskId = submit(controller);
+
+      expect(controller.snapshot().activeTaskId).toBe(activeTaskId);
+      expect(controller.snapshot().queue).toEqual([
+        codingTaskId,
+        firstResearchId,
+        secondResearchId,
       ]);
     } finally {
       store.close();

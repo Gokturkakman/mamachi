@@ -199,7 +199,12 @@ final class AppModel: ObservableObject {
             if let error { errorMessage = error.localizedDescription }
         }
         audio.onMicrophonePCM = { [weak self] data in
-            guard let self, isEngaged else { return }
+            guard
+                let self,
+                isEngaged,
+                voiceState != .speaking,
+                !audio.hasPendingPlayback
+            else { return }
             ipc.sendAudio(data)
         }
         audio.onLevel = { [weak self] level in self?.handleMicrophoneLevel(level) }
@@ -768,6 +773,10 @@ final class AppModel: ObservableObject {
             }
         case "voice.transcript.assistant_delta":
             if let text = payload["text"] as? String { liveAssistantTranscript += text }
+        case "voice.transcript.user_pending":
+            if let text = payload["text"] as? String { liveUserTranscript = text }
+        case "voice.transcript.user_discarded":
+            liveUserTranscript = ""
         case "voice.transcript.assistant":
             if let text = payload["text"] as? String {
                 liveAssistantTranscript = ""
@@ -803,7 +812,7 @@ final class AppModel: ObservableObject {
         let detail = event["payload"] as? [String: Any] ?? [:]
         let objective = taskId.flatMap { id in tasks.first(where: { $0.id == id })?.objective } ?? "Coding task"
         switch type {
-        case "task.awaitingUser":
+        case "task.awaitingUser", "task.questionAsked":
             guard let question = detail["question"] as? String else { return }
             attentionMessage = question
             reactions.notify(
@@ -967,6 +976,12 @@ final class AppModel: ObservableObject {
                 toolName: toolName,
                 state: state
             )
+        }
+        if
+            let activeTaskId,
+            let question = tasks.first(where: { $0.id == activeTaskId })?.pendingQuestion
+        {
+            attentionMessage = question
         }
     }
 

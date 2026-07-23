@@ -117,6 +117,7 @@ export class RealtimeBridge {
   readonly #pendingComputerControls = new Map<string, PendingComputerControl>();
   #engaged: boolean;
   readonly #queuedBriefs = new Map<string, QueuedBrief>();
+  readonly #announcedQuestionIds = new Set<string>();
   #activeAssistantAudio: { itemId: string; contentIndex: number } | null = null;
   #lastTruncation: RealtimePlaybackCursor | null = null;
   #apiKey: string | undefined;
@@ -127,6 +128,7 @@ export class RealtimeBridge {
   #responseActive = false;
   #responsePending = false;
   #inputActive = false;
+  readonly #pendingUserTranscripts: string[] = [];
   #suppressAudio = false;
   #cancellationRequested = false;
   #responseMode: RealtimeResponseMode = "voice";
@@ -157,6 +159,7 @@ export class RealtimeBridge {
     this.#responseActive = false;
     this.#responsePending = false;
     this.#inputActive = false;
+    this.#discardPendingUserTranscripts();
     this.#suppressAudio = false;
     this.#cancellationRequested = false;
     this.#toolChainDepth = 0;
@@ -176,6 +179,7 @@ export class RealtimeBridge {
       this.#responseActive = false;
       this.#responsePending = false;
       this.#inputActive = false;
+      this.#discardPendingUserTranscripts();
       this.#suppressAudio = false;
       this.#cancellationRequested = false;
       this.#activeAssistantAudio = null;
@@ -227,6 +231,7 @@ export class RealtimeBridge {
     await promise;
     this.#reconnectAttempt = 0;
     for (const context of this.#pendingContext.values()) this.#injectContext(context);
+    this.#announceOpenQuestions();
     this.#flushBriefs();
   }
 
@@ -238,6 +243,7 @@ export class RealtimeBridge {
     this.#responseActive = false;
     this.#responsePending = false;
     this.#inputActive = false;
+    this.#discardPendingUserTranscripts();
     this.#suppressAudio = false;
     this.#cancellationRequested = false;
     this.#toolChainDepth = 0;
@@ -380,6 +386,7 @@ export class RealtimeBridge {
         "task.pauseRequested",
         "task.paused",
         "task.awaitingUser",
+        "task.questionAsked",
         "task.specRevised",
         "task.resumed",
         "task.completed",
@@ -390,8 +397,12 @@ export class RealtimeBridge {
       ].includes(event.type),
     );
     if (relevant.length === 0) return;
+    for (const event of relevant) {
+      if (event.type === "task.questionAsked") this.#announcedQuestionIds.add(event.payload.questionId);
+    }
     const announcements = relevant.filter((event) =>
       event.type === "task.awaitingUser" ||
+      event.type === "task.questionAsked" ||
       event.type === "task.completed" ||
       event.type === "task.failed" ||
       event.type === "workspace.conflictDetected"
@@ -440,6 +451,36 @@ export class RealtimeBridge {
       },
     });
   }
+  #announceOpenQuestions(): void {
+    if (this.#socket?.readyState !== WebSocket.OPEN || (this.#responseMode === "voice" && !this.#engaged)) return;
+    const questions = (this.#options.getSnapshot().questions ?? []).filter((question) =>
+      question.state === "open" &&
+      !this.#announcedQuestionIds.has(question.id) &&
+      !this.#queuedBriefs.has(question.taskId)
+    );
+    if (questions.length === 0) return;
+    this.#send({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "system",
+        content: [{
+          type: "input_text",
+          text: [
+            "The coding agent is already waiting for user input. Ask each exact open question now; do not call get_task_status first.",
+            JSON.stringify(questions.map((question) => ({
+              questionId: question.id,
+              taskId: question.taskId,
+              question: question.question,
+            }))),
+          ].join("\n"),
+        }],
+      },
+    });
+    for (const question of questions) this.#announcedQuestionIds.add(question.id);
+    this.#requestResponse();
+  }
+
 
   #queueBrief(event: DomainEvent): void {
     const brief = this.#briefFor(event);
@@ -576,12 +617,16 @@ export class RealtimeBridge {
         audio: {
           input: {
             format: { type: "audio/pcm", rate: 24_000 },
-            transcription: { model: "gpt-4o-mini-transcribe" },
+            transcription: {
+              model: "gpt-4o-mini-transcribe",
+              prompt: "The user speaks English or Turkish. Ignore music, streams, and background speech.",
+            },
+            noise_reduction: { type: "near_field" },
             turn_detection: {
               type: "server_vad",
-              threshold: 0.5,
+              threshold: 0.65,
               prefix_padding_ms: 300,
-              silence_duration_ms: 500,
+              silence_duration_ms: 650,
               create_response: false,
               interrupt_response: true,
             },
@@ -996,7 +1041,11 @@ ${this.#options.getWorkspace()}
       }
     } else if (type === "conversation.item.input_audio_transcription.completed") {
       if (this.#engaged && typeof event["transcript"] === "string") {
-        this.#options.emit("voice.transcript.user", { text: event["transcript"] });
+        const transcript = event["transcript"].trim();
+        if (transcript) {
+          this.#pendingUserTranscripts.push(transcript);
+          this.#options.emit("voice.transcript.user_pending", { text: transcript });
+        }
       }
     } else if (type === "response.output_audio.delta") {
       if (
@@ -1006,6 +1055,7 @@ ${this.#options.getWorkspace()}
         Number.isInteger(event["content_index"]) &&
         !this.#suppressAudio
       ) {
+        this.#flushPendingUserTranscripts();
         const playback = {
           itemId: event["item_id"],
           contentIndex: event["content_index"] as number,
@@ -1024,18 +1074,22 @@ ${this.#options.getWorkspace()}
       }
     } else if (type === "response.output_audio_transcript.delta") {
       if (!this.#suppressAudio && typeof event["delta"] === "string") {
+        this.#flushPendingUserTranscripts();
         this.#options.emit("voice.transcript.assistant_delta", { text: event["delta"] });
       }
     } else if (type === "response.output_audio_transcript.done") {
       if (!this.#suppressAudio && typeof event["transcript"] === "string") {
+        this.#flushPendingUserTranscripts();
         this.#options.emit("voice.transcript.assistant", { text: event["transcript"] });
       }
     } else if (type === "response.output_text.delta") {
       if (!this.#suppressAudio && typeof event["delta"] === "string") {
+        this.#flushPendingUserTranscripts();
         this.#options.emit("voice.transcript.assistant_delta", { text: event["delta"] });
       }
     } else if (type === "response.output_text.done") {
       if (!this.#suppressAudio && typeof event["text"] === "string") {
+        this.#flushPendingUserTranscripts();
         this.#options.emit("voice.transcript.assistant", { text: event["text"] });
       }
     } else if (type === "response.done") {
@@ -1065,6 +1119,7 @@ ${this.#options.getWorkspace()}
       this.#responsePending = false;
       this.#suppressAudio = !this.#engaged;
       this.#cancellationRequested = false;
+      this.#flushPendingUserTranscripts();
       this.#options.emit("voice.error", { error: message });
     }
   }
@@ -1086,6 +1141,11 @@ ${this.#options.getWorkspace()}
           arguments: item["arguments"],
         });
       }
+    }
+    if (calls.length > 0 && calls.every((call) => call.name === "wait_for_user")) {
+      this.#discardPendingUserTranscripts();
+    } else {
+      this.#flushPendingUserTranscripts();
     }
 
     if (calls.length === 0 && this.#responsePending) {
@@ -1144,6 +1204,17 @@ ${this.#options.getWorkspace()}
       return;
     }
     this.#requestResponse();
+  }
+
+  #flushPendingUserTranscripts(): void {
+    if (this.#pendingUserTranscripts.length === 0) return;
+    const transcripts = this.#pendingUserTranscripts.splice(0);
+    for (const text of transcripts) this.#options.emit("voice.transcript.user", { text });
+  }
+
+  #discardPendingUserTranscripts(): void {
+    this.#pendingUserTranscripts.length = 0;
+    this.#options.emit("voice.transcript.user_discarded", {});
   }
 
   async #executeTool(name: string, input: unknown): Promise<unknown> {
@@ -1440,6 +1511,20 @@ ${this.#options.getWorkspace()}
         assertOnlyKeys(input, ["query", "deliverable"], name);
         const query = requireString(input["query"], "query");
         const deliverable = requireString(input["deliverable"], "deliverable");
+        const objective = `Research the web for: ${query}`;
+        const duplicate = this.#options.getSnapshot().tasks.find((task) =>
+          !["completed", "failed", "cancelled"].includes(task.state) &&
+          task.repositoryId === this.#options.getWorkspace() &&
+          task.spec.objective.trim().toLocaleLowerCase() === objective.trim().toLocaleLowerCase()
+        );
+        if (duplicate) {
+          return {
+            status: "accepted",
+            taskId: duplicate.id,
+            state: duplicate.state,
+            deduplicated: true,
+          };
+        }
         return this.#options.executeCommand({
           id: Bun.randomUUIDv7(),
           type: "task.submit",
@@ -1447,7 +1532,7 @@ ${this.#options.getWorkspace()}
           expectedRevision: null,
           payload: {
             repositoryId: this.#options.getWorkspace(),
-            objective: `Research the web for: ${query}`,
+            objective,
             acceptanceCriteria: [
               deliverable,
               "Use current authoritative sources and include their URLs.",
@@ -1456,6 +1541,7 @@ ${this.#options.getWorkspace()}
             constraints: [
               "Research only; do not modify workspace files.",
               "Use the coding agent's web_search and read tools rather than relying on model memory.",
+              "Return as soon as the requested facts and source URLs are verified; do not broaden the research scope.",
             ],
             attachmentIds: [],
             codingProfileId: "fast",

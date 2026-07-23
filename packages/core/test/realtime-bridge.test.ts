@@ -255,6 +255,7 @@ describe("RealtimeBridge", () => {
     const turnAfterReconnect = Promise.withResolvers<void>();
     let firstClient: ServerWebSocket<MockClientData> | undefined;
     let connectionCount = 0;
+    let connectedCount = 0;
 
     server = Bun.serve<MockClientData>({
       hostname: "127.0.0.1",
@@ -278,7 +279,6 @@ describe("RealtimeBridge", () => {
               type: "session.updated",
               session: { id: `session_reconnect_${connectionId}` },
             }));
-            if (connectionId === 2) reconnected.resolve();
           } else if (
             connectionId === 2 &&
             event["type"] === "conversation.item.create" &&
@@ -307,28 +307,32 @@ describe("RealtimeBridge", () => {
         confirmations: [],
       }),
       executeCommand: async () => ({ status: "accepted", eventId: Bun.randomUUIDv7() }),
-      emit: (type, payload) => emitted.push({ type, payload }),
+      emit: (type, payload) => {
+        emitted.push({ type, payload });
+        if (type === "voice.state" && isRecord(payload) && payload["state"] === "connected") {
+          connectedCount += 1;
+          if (connectedCount === 2) reconnected.resolve();
+        }
+      },
       emitAudio: () => {},
     });
 
     await bridge.connect();
-    firstClient?.close(1012, "Provider session rotated");
-    await reconnected.promise;
-    bridge.sendText("Still listening after reconnect");
-    await turnAfterReconnect.promise;
+    try {
+      firstClient?.close(1012, "Provider session rotated");
+      await reconnected.promise;
+      bridge.sendText("Still listening after reconnect");
+      await turnAfterReconnect.promise;
 
-    expect(connectionCount).toBe(2);
-    expect(emitted).toContainEqual({
-      type: "voice.state",
-      payload: { state: "disconnected", reason: "provider_connection_closed" },
-    });
-    expect(
-      emitted.filter(
-        (event) => event.type === "voice.state" && isRecord(event.payload) && event.payload["state"] === "connected",
-      ),
-    ).toHaveLength(2);
-
-    await bridge.disconnect();
+      expect(connectionCount).toBe(2);
+      expect(emitted).toContainEqual({
+        type: "voice.state",
+        payload: { state: "disconnected", reason: "provider_connection_closed" },
+      });
+      expect(connectedCount).toBe(2);
+    } finally {
+      await bridge.disconnect();
+    }
     await Bun.sleep(20);
     expect(connectionCount).toBe(2);
   });
@@ -337,6 +341,7 @@ describe("RealtimeBridge", () => {
     let client: ServerWebSocket<MockClientData> | undefined;
     const idle = Promise.withResolvers<void>();
     const functionOutput = Promise.withResolvers<void>();
+    const emitted: Array<{ type: string; payload: unknown }> = [];
     server = Bun.serve<MockClientData>({
       hostname: "127.0.0.1",
       port: 0,
@@ -372,6 +377,7 @@ describe("RealtimeBridge", () => {
         throw new Error("wait_for_user must not execute a coding command");
       },
       emit: (type, payload) => {
+        emitted.push({ type, payload });
         if (type === "voice.state" && isRecord(payload) && payload["state"] === "idle") idle.resolve();
       },
       emitAudio: () => {},
@@ -379,6 +385,10 @@ describe("RealtimeBridge", () => {
 
     await bridge.connect();
     bridge.sendText("Hello");
+    client?.send(JSON.stringify({
+      type: "conversation.item.input_audio_transcription.completed",
+      transcript: "background television speech",
+    }));
     client?.send(
       JSON.stringify({
         type: "response.done",
@@ -397,6 +407,15 @@ describe("RealtimeBridge", () => {
     );
 
     await Promise.all([functionOutput.promise, idle.promise]);
+    expect(emitted).toContainEqual({
+      type: "voice.transcript.user_pending",
+      payload: { text: "background television speech" },
+    });
+    expect(emitted).toContainEqual({ type: "voice.transcript.user_discarded", payload: {} });
+    expect(emitted).not.toContainEqual({
+      type: "voice.transcript.user",
+      payload: { text: "background television speech" },
+    });
     await bridge.disconnect();
   });
 
@@ -767,6 +786,111 @@ describe("RealtimeBridge", () => {
     await bridge.disconnect();
   });
 
+
+  test("reuses an equivalent in-flight web search instead of clogging the queue", async () => {
+    const repositoryId = "/tmp/mamachi-workspace";
+    const taskId = Bun.randomUUIDv7();
+    const duplicateTask: TaskRecord = {
+      id: taskId,
+      repositoryId,
+      state: "queued",
+      spec: {
+        repositoryId,
+        objective: "Research the web for: confirmed upcoming fixtures",
+        acceptanceCriteria: ["Return a concise fixture list"],
+        constraints: ["Research only; do not modify workspace files."],
+        attachmentIds: [],
+        codingProfileId: "fast",
+      },
+      revision: 1,
+      activeRunId: null,
+      runIds: [],
+      evidenceIds: [],
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+      terminalSummary: null,
+      workspaceConflict: null,
+      codingSession: null,
+      pendingQuestion: null,
+      specHistory: [{
+        revision: 1,
+        objective: "Research the web for: confirmed upcoming fixtures",
+        revisedAt: new Date(0).toISOString(),
+      }],
+    };
+    const functionOutput = Promise.withResolvers<Record<string, unknown>>();
+    let responseCreates = 0;
+    server = Bun.serve<MockClientData>({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request, bunServer) {
+        const upgraded = bunServer.upgrade(request, { data: { authenticated: true } });
+        return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
+      },
+      websocket: {
+        open() {},
+        message(socket, message) {
+          if (typeof message !== "string") return;
+          const event = JSON.parse(message) as Record<string, unknown>;
+          if (event["type"] === "session.update") {
+            socket.send(JSON.stringify({ type: "session.updated", session: { id: "session_research_dedupe" } }));
+          } else if (event["type"] === "response.create" && responseCreates++ === 0) {
+            socket.send(JSON.stringify({
+              type: "response.done",
+              response: {
+                status: "completed",
+                output: [{
+                  type: "function_call",
+                  call_id: "research_duplicate",
+                  name: "research_web",
+                  arguments: JSON.stringify({
+                    query: "confirmed upcoming fixtures",
+                    deliverable: "Return a concise fixture list",
+                  }),
+                }],
+              },
+            }));
+          } else if (
+            event["type"] === "conversation.item.create" &&
+            JSON.stringify(event).includes("research_duplicate")
+          ) {
+            const item = event["item"];
+            if (isRecord(item) && typeof item["output"] === "string") {
+              functionOutput.resolve(JSON.parse(item["output"]) as Record<string, unknown>);
+            }
+          }
+        },
+      },
+    });
+    const bridge = new RealtimeBridge({
+      apiKey: "test-realtime-key",
+      endpoint: `ws://127.0.0.1:${server.port}/realtime`,
+      getWorkspace: () => repositoryId,
+      getSnapshot: () => ({
+        seq: 1,
+        activeTaskId: null,
+        queue: [taskId],
+        tasks: [duplicateTask],
+        runs: [],
+        confirmations: [],
+      }),
+      executeCommand: async () => {
+        throw new Error("Equivalent research must not submit another queued task");
+      },
+      emit: () => {},
+      emitAudio: () => {},
+    });
+
+    await bridge.connect();
+    bridge.sendText("Find the upcoming fixtures");
+    expect(await functionOutput.promise).toMatchObject({
+      status: "accepted",
+      taskId,
+      state: "queued",
+      deduplicated: true,
+    });
+    await bridge.disconnect();
+  });
   test("delegates repository questions to a read-only fast coding task", async () => {
     const commands: unknown[] = [];
     let responseCreates = 0;
@@ -1047,6 +1171,139 @@ describe("RealtimeBridge", () => {
     await proactiveResponse.promise;
     await announcementSpoken.promise;
     expect(responseCreates).toBe(2);
+    await bridge.disconnect();
+  });
+
+  test("proactively announces an explicit coder question", async () => {
+    const questionInjected = Promise.withResolvers<void>();
+    const responseRequested = Promise.withResolvers<void>();
+    server = Bun.serve<MockClientData>({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request, bunServer) {
+        const upgraded = bunServer.upgrade(request, { data: { authenticated: true } });
+        return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
+      },
+      websocket: {
+        open() {},
+        message(socket, message) {
+          if (typeof message !== "string") return;
+          const event = JSON.parse(message) as Record<string, unknown>;
+          if (event["type"] === "session.update") {
+            socket.send(JSON.stringify({ type: "session.updated", session: { id: "session_question" } }));
+          } else if (
+            event["type"] === "conversation.item.create" &&
+            JSON.stringify(event).includes("Which deployment target should I use?")
+          ) {
+            questionInjected.resolve();
+          } else if (event["type"] === "response.create") {
+            responseRequested.resolve();
+          }
+        },
+      },
+    });
+    const bridge = new RealtimeBridge({
+      apiKey: "test-realtime-key",
+      endpoint: `ws://127.0.0.1:${server.port}/realtime`,
+      getWorkspace: () => "/tmp/mamachi-workspace",
+      getSnapshot: () => ({ seq: 0, activeTaskId: null, queue: [], tasks: [], runs: [], confirmations: [] }),
+      executeCommand: async () => {
+        throw new Error("question announcements must not execute a command");
+      },
+      emit: () => {},
+      emitAudio: () => {},
+    });
+
+    await bridge.connect();
+    const taskId = Bun.randomUUIDv7();
+    const runId = Bun.randomUUIDv7();
+    const eventId = Bun.randomUUIDv7();
+    bridge.handleTaskEvents([{
+      version: 1,
+      id: eventId,
+      seq: 1,
+      at: new Date().toISOString(),
+      type: "task.questionAsked",
+      actor: "coder",
+      taskId,
+      runId,
+      correlationId: eventId,
+      payload: {
+        questionId: Bun.randomUUIDv7(),
+        runId,
+        revision: 1,
+        question: "Which deployment target should I use?",
+      },
+    }]);
+
+    await Promise.all([questionInjected.promise, responseRequested.promise]);
+    await bridge.disconnect();
+  });
+
+  test("announces an already-open coder question when voice reconnects", async () => {
+    const questionInjected = Promise.withResolvers<void>();
+    const responseRequested = Promise.withResolvers<void>();
+    const taskId = Bun.randomUUIDv7();
+    const runId = Bun.randomUUIDv7();
+    const questionId = Bun.randomUUIDv7();
+    server = Bun.serve<MockClientData>({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request, bunServer) {
+        const upgraded = bunServer.upgrade(request, { data: { authenticated: true } });
+        return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
+      },
+      websocket: {
+        open() {},
+        message(socket, message) {
+          if (typeof message !== "string") return;
+          const event = JSON.parse(message) as Record<string, unknown>;
+          if (event["type"] === "session.update") {
+            socket.send(JSON.stringify({ type: "session.updated", session: { id: "session_open_question" } }));
+          } else if (
+            event["type"] === "conversation.item.create" &&
+            JSON.stringify(event).includes("Can I overwrite the generated fixture?")
+          ) {
+            questionInjected.resolve();
+          } else if (event["type"] === "response.create") {
+            responseRequested.resolve();
+          }
+        },
+      },
+    });
+    const bridge = new RealtimeBridge({
+      apiKey: "test-realtime-key",
+      endpoint: `ws://127.0.0.1:${server.port}/realtime`,
+      getWorkspace: () => "/tmp/mamachi-workspace",
+      getSnapshot: () => ({
+        seq: 1,
+        activeTaskId: taskId,
+        queue: [],
+        tasks: [],
+        runs: [],
+        confirmations: [],
+        questions: [{
+          id: questionId,
+          taskId,
+          taskRevision: 1,
+          runId,
+          question: "Can I overwrite the generated fixture?",
+          state: "open",
+          resolution: null,
+          answer: null,
+          askedAt: new Date(0).toISOString(),
+          resolvedAt: null,
+        }],
+      }),
+      executeCommand: async () => {
+        throw new Error("reconnecting an open question must not execute a command");
+      },
+      emit: () => {},
+      emitAudio: () => {},
+    });
+
+    await bridge.connect();
+    await Promise.all([questionInjected.promise, responseRequested.promise]);
     await bridge.disconnect();
   });
 

@@ -83,6 +83,7 @@ const daemon = new MamachiIpcServer({
               event.type === "task.completed" ||
               event.type === "task.failed" ||
               event.type === "task.awaitingUser" ||
+              event.type === "task.questionAsked" ||
               (event.type === "artifact.created" &&
                 (event.payload.kind === "file_change" || event.payload.kind === "verification"))
             ) {

@@ -520,9 +520,14 @@ export class TaskController {
       command.id,
       { id: taskId, repositoryId: spec.repositoryId },
     );
+    const queuePosition = spec.codingProfileId === "fast"
+      ? this.#state.queue.length
+      : this.#state.queue.findIndex((queuedTaskId) =>
+        this.#requiredTask(queuedTaskId).spec.codingProfileId === "fast"
+      );
     const enqueued = this.#event(
       "task.enqueued",
-      { position: this.#state.queue.length },
+      { position: queuePosition < 0 ? this.#state.queue.length : queuePosition },
       command.id,
       { id: taskId, repositoryId: spec.repositoryId },
     );

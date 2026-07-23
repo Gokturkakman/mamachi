@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ActionResult, DomainEvent } from "@mamachi/protocol";
@@ -65,12 +65,22 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-function fakeExecutable(repository: string, events: readonly Record<string, unknown>[]): string {
+function fakeExecutable(
+  repository: string,
+  events: readonly Record<string, unknown>[],
+  capture?: { argumentsPath: string; promptPath: string },
+): string {
   const path = join(repository, "fake-coding-agent");
   const output = events
     .map((event) => `printf '%s\\n' ${shellQuote(JSON.stringify(event))}`)
     .join("\n");
-  writeFileSync(path, `#!/bin/sh\ncat >/dev/null\n${output}\n`);
+  const consumeInput = capture
+    ? [
+        `printf '%s\\n' "$@" > ${shellQuote(capture.argumentsPath)}`,
+        `cat > ${shellQuote(capture.promptPath)}`,
+      ].join("\n")
+    : "cat >/dev/null";
+  writeFileSync(path, `#!/bin/sh\n${consumeInput}\n${output}\n`);
   chmodSync(path, 0o755);
   return path;
 }
@@ -197,5 +207,88 @@ describe("ExternalCliRunner", () => {
     expect(result.evidenceIds).toEqual(["evidence-1"]);
     expect(result.emittedTypes).toContain("coder.ready");
     expect(result.emittedTypes).toContain("coder.running");
+  });
+
+  test("grants repository-local Git metadata access to explicit commit tasks", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "mamachi-codex-commit-"));
+    temporaryDirectories.push(repository);
+    const task = createTask(repository, "codex");
+    task.spec.objective = "Commit all current uncommitted changes";
+    task.spec.acceptanceCriteria = ["All current changes are committed with an agent-selected message"];
+    task.spec.constraints = ["Do not modify files beyond what is needed to commit existing changes"];
+    const argumentsPath = join(repository, "captured-arguments");
+    const promptPath = join(repository, "captured-prompt");
+    const executable = fakeExecutable(repository, [
+      { type: "thread.started", thread_id: "new-commit-session" },
+      {
+        type: "item.completed",
+        item: { id: "message-commit", type: "agent_message", text: "Commit completed" },
+      },
+      { type: "turn.completed" },
+    ], { argumentsPath, promptPath });
+    const completed = Promise.withResolvers<void>();
+    let ordinal = 0;
+    const runner = new ExternalCliRunner({
+      backend: "codex",
+      executable,
+      getTask: (taskId) => taskId === task.id ? task : undefined,
+      emit: () => {},
+      onSafePause: async () => accepted(),
+      onAuthorizeTool: async () => accepted(),
+      onWorkspaceConflict: async () => accepted(),
+      onRecordEvidence: async (input) => evidence(input, ++ordinal),
+      onComplete: async () => {
+        completed.resolve();
+        return accepted();
+      },
+      onFail: async (_taskId, error) => {
+        completed.reject(new Error(error));
+        return accepted();
+      },
+      onNeedInput: async () => {
+        throw new Error("An explicitly authorized commit must not ask for the same permission again");
+      },
+      onSessionBound: async () => accepted(),
+      runtimeSettings: {
+        ...defaultRuntimeSettings,
+        codingBackend: "codex",
+        primaryModel: "openai-codex/gpt-5.4-mini",
+        automaticRouting: false,
+      },
+    });
+
+    runner.handleEvents([
+      {
+        type: "task.questionAnswered",
+        taskId: task.id,
+        payload: {
+          questionId: Bun.randomUUIDv7(),
+          runId: task.activeRunId!,
+          revision: task.revision,
+          answer: "Yes, grant write access to .git and commit the changes.",
+        },
+      } as DomainEvent,
+      {
+        type: "task.resumed",
+        taskId: task.id,
+        payload: { runId: task.activeRunId!, revision: task.revision },
+      } as DomainEvent,
+    ]);
+    try {
+      await completed.promise;
+      const argumentsList = readFileSync(argumentsPath, "utf8").trim().split("\n");
+      expect(argumentsList).toContain("--sandbox");
+      expect(argumentsList).toContain("workspace-write");
+      expect(argumentsList).toContain("--add-dir");
+      expect(argumentsList[argumentsList.indexOf("--add-dir") + 1]).toBe(join(repository, ".git"));
+      expect(argumentsList).not.toContain("resume");
+      expect(argumentsList).not.toContain("codex-existing-session");
+      const prompt = readFileSync(promptPath, "utf8");
+      expect(prompt).toContain("explicitly authorizes staging and committing");
+      expect(prompt).toContain("The exact answer to your pending question is: Yes, grant write access to .git");
+      expect(prompt).not.toContain("Do not commit");
+    } finally {
+      await runner.dispose();
+    }
   });
 });

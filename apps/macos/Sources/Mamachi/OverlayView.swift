@@ -110,10 +110,6 @@ struct OverlayView: View {
             }
         }
         .help("Open Mamachi. Drag to move; right-click for app controls.")
-        .accessibilityLabel(
-            Text(verbatim: "\(model.pillState.accessibilityText), \(codingStatusLabel)")
-        )
-        .accessibilityAddTraits(.isButton)
     }
 
     private var expandedPanel: some View {
@@ -293,6 +289,7 @@ struct OverlayView: View {
             .buttonStyle(.plain)
             .help("Collapse Mamachi")
             .accessibilityLabel("Collapse Mamachi")
+            .accessibilityHidden(true)
         }
     }
 
@@ -532,6 +529,7 @@ struct OverlayView: View {
     }
 
     private var currentDetail: String {
+        if let question = model.activeTask?.pendingQuestion, !question.isEmpty { return question }
         if let activity = model.activeTask?.recentActivity { return activity }
         if !model.liveAssistantTranscript.isEmpty { return model.liveAssistantTranscript }
         if !model.liveUserTranscript.isEmpty { return model.liveUserTranscript }
