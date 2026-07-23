@@ -38,24 +38,24 @@ final class OverlayPanelControllerTests: XCTestCase {
             }
 
             XCTAssertFalse(panel(from: controller).styleMask.contains(.resizable))
-            assertPanel(controller, width: 112, height: 112)
+            assertPanel(controller, width: 116, height: 28)
 
             model.drawerExpanded = true
             assertPanel(controller, width: 640, height: 800)
 
             model.drawerExpanded = false
-            assertPanel(controller, width: 112, height: 112)
+            assertPanel(controller, width: 116, height: 28)
 
             model.setCollapsedOverlaySize(.large)
-            assertPanel(controller, width: 184, height: 184)
+            assertPanel(controller, width: 192, height: 38)
 
             model.setExpandedOverlaySize(.small)
-            assertPanel(controller, width: 184, height: 184)
+            assertPanel(controller, width: 192, height: 38)
 
             model.drawerExpanded = true
             assertPanel(controller, width: 440, height: 540)
             model.drawerExpanded = false
-            assertPanel(controller, width: 184, height: 184)
+            assertPanel(controller, width: 192, height: 38)
 
             controller.hide()
             UserDefaults.standard.set(
@@ -72,7 +72,7 @@ final class OverlayPanelControllerTests: XCTestCase {
             replacement.show()
             defer { replacement.hide() }
 
-            assertPanel(replacement, width: 184, height: 184)
+            assertPanel(replacement, width: 192, height: 38)
             replacementModel.drawerExpanded = true
             assertPanel(replacement, width: 440, height: 540)
         }

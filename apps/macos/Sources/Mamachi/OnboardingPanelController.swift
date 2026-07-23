@@ -10,7 +10,7 @@ final class OnboardingPanelController {
         var completion: (() -> Void)?
         onboarding = OnboardingModel(appModel: model) { completion?() }
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 620, height: 460),
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 620),
             styleMask: [.titled],
             backing: .buffered,
             defer: false

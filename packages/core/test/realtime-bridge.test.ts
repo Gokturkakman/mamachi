@@ -126,6 +126,8 @@ describe("RealtimeBridge", () => {
       output: { format: { type: "audio/pcm", rate: 24_000 }, voice: "marin" },
     });
     expect(session["instructions"]).toContain("Do not speak before any tool call.");
+    expect(session["instructions"]).toContain("inspect its accessibility UI");
+    expect(session["instructions"]).toContain("chain the smallest necessary actions");
     const tools = session["tools"];
     const toolList = Array.isArray(tools) ? tools.filter(isRecord) : [];
     expect(toolList.map((tool) => tool["name"])).toEqual([
@@ -151,6 +153,29 @@ describe("RealtimeBridge", () => {
       "resolve_computer_control",
       "mute_mamachi",
     ]);
+    const computerTool = toolList.find((tool) => tool["name"] === "control_computer");
+    if (!computerTool || !isRecord(computerTool["parameters"])) {
+      throw new Error("control_computer did not include parameters");
+    }
+    const computerProperties = computerTool["parameters"]["properties"];
+    if (!isRecord(computerProperties) || !isRecord(computerProperties["action"])) {
+      throw new Error("control_computer did not include an action schema");
+    }
+    expect(computerProperties["action"]["enum"]).toEqual(expect.arrayContaining([
+      "open_application",
+      "inspect_ui",
+      "click_ui_element",
+      "set_ui_value",
+      "select_menu_item",
+    ]));
+    expect(Object.keys(computerProperties)).toEqual(expect.arrayContaining([
+      "application",
+      "label",
+      "role",
+      "value",
+      "menu",
+      "menuItem",
+    ]));
     expect(
       toolList.every((tool) => isRecord(tool["parameters"]) && tool["parameters"]["additionalProperties"] === false),
     ).toBe(true);

@@ -4,6 +4,8 @@ struct SettingsView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var diagnostics: DiagnosticsService
     @State private var apiKey = ""
+    @State private var codingProvider: CodingProvider = .anthropic
+    @State private var codingCredential = ""
     @State private var primaryModel: String
     @State private var fastModel: String
     @State private var thinkingLevel: String
@@ -32,6 +34,120 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Section("Setup") {
+                HStack {
+                    Label(
+                        model.hasAPIKey ? "Voice and chat ready" : "OpenAI Realtime key required",
+                        systemImage: model.hasAPIKey ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
+                    )
+                    .foregroundStyle(model.hasAPIKey ? .green : .orange)
+                    Spacer()
+                    Label(
+                        model.selectedCodingAgentStatus.ready
+                            ? "\(model.codingAgentBackend.label) ready"
+                            : "Coding agent setup required",
+                        systemImage: model.selectedCodingAgentStatus.ready
+                            ? "checkmark.circle.fill"
+                            : "exclamationmark.circle.fill"
+                    )
+                    .foregroundStyle(model.selectedCodingAgentStatus.ready ? .green : .orange)
+                }
+                Text("Both services must show ready before Mamachi can handle a coding request end to end.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("OpenAI Realtime — voice and chat") {
+                SecureField(model.hasAPIKey ? "Key stored in Keychain" : "OpenAI API key", text: $apiKey)
+                    .textContentType(.password)
+                HStack {
+                    Button(model.hasAPIKey ? "Replace Key" : "Save Key") {
+                        model.saveAPIKey(apiKey)
+                        apiKey = ""
+                    }
+                    .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    if model.hasAPIKey {
+                        Button("Remove", role: .destructive) { model.saveAPIKey("") }
+                    }
+                    Spacer()
+                    Text(model.hasAPIKey ? "Stored in macOS Keychain" : "Required")
+                        .font(.caption)
+                        .foregroundStyle(model.hasAPIKey ? .green : .orange)
+                }
+            }
+
+            Section("Coding agent") {
+                Picker("Backend", selection: codingBackend) {
+                    ForEach(CodingAgentBackend.allCases) { backend in
+                        Text(backend.label).tag(backend)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                let status = model.selectedCodingAgentStatus
+                HStack {
+                    Label(status.detail, systemImage: status.ready ? "checkmark.circle.fill" : "exclamationmark.circle")
+                        .foregroundStyle(status.ready ? .green : .orange)
+                    Spacer()
+                    Button("Refresh") { Task { await model.refreshCodingAgentStatuses() } }
+                    if !status.ready {
+                        Button(status.executablePath == nil ? "Install and Log In" : "Log In") {
+                            model.openCodingAgentSetup(model.codingAgentBackend)
+                        }
+                    }
+                }
+
+                if model.codingAgentBackend == .omp {
+                    DisclosureGroup("Optional API-key fallback") {
+                        Picker("Provider", selection: $codingProvider) {
+                            ForEach(CodingProvider.allCases) { provider in Text(provider.label).tag(provider) }
+                        }
+                        SecureField("Provider API key", text: $codingCredential)
+                            .textContentType(.password)
+                        HStack {
+                            Text("Not needed when OMP already has a provider login.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Save Provider Key") {
+                                if model.saveCodingProviderCredential(codingCredential, for: codingProvider) {
+                                    codingCredential = ""
+                                }
+                            }
+                            .disabled(codingCredential.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+                    }
+                }
+
+                DisclosureGroup("Advanced model routing") {
+                    TextField("Primary model — blank uses backend default", text: $primaryModel)
+                        .textFieldStyle(.roundedBorder)
+                    TextField("Fast model", text: $fastModel)
+                        .textFieldStyle(.roundedBorder)
+                    Picker("Thinking level", selection: $thinkingLevel) {
+                        ForEach(thinkingLevels, id: \.0) { value, label in
+                            Text(label).tag(value)
+                        }
+                    }
+                    Toggle("Route easy and research tasks to the fast model", isOn: $automaticRouting)
+                    HStack {
+                        Text("Provider/model selectors apply to OMP; direct CLIs use matching or backend-default models.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Apply to next task") {
+                            model.updateRuntimeSettings(
+                                primaryModel: primaryModel,
+                                fastModel: fastModel,
+                                thinkingLevel: thinkingLevel,
+                                automaticRouting: automaticRouting
+                            )
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+            }
+
             Section("Interaction") {
                 Picker("Response mode", selection: interactionMode) {
                     ForEach(InteractionMode.allCases) { mode in
@@ -133,33 +249,6 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("Coding agent") {
-                TextField("Primary model — blank uses OMP default", text: $primaryModel)
-                    .textFieldStyle(.roundedBorder)
-                TextField("Fast model", text: $fastModel)
-                    .textFieldStyle(.roundedBorder)
-                Picker("Thinking level", selection: $thinkingLevel) {
-                    ForEach(thinkingLevels, id: \.0) { value, label in
-                        Text(label).tag(value)
-                    }
-                }
-                Toggle("Route easy and research tasks to the fast model", isOn: $automaticRouting)
-                HStack {
-                    Text("Model selectors use OMP's provider/model format.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Apply to next task") {
-                        model.updateRuntimeSettings(
-                            primaryModel: primaryModel,
-                            fastModel: fastModel,
-                            thinkingLevel: thinkingLevel,
-                            automaticRouting: automaticRouting
-                        )
-                    }
-                    .buttonStyle(.borderedProminent)
-                }
-            }
 
             Section("Task reactions") {
                 Toggle("Notify when the coder needs input", isOn: attentionNotifications)
@@ -170,27 +259,6 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("OpenAI Realtime") {
-                SecureField(model.hasAPIKey ? "Key stored in Keychain" : "sk-…", text: $apiKey)
-                    .textContentType(.password)
-                HStack {
-                    Button(model.hasAPIKey ? "Replace Key" : "Save Key") {
-                        model.saveAPIKey(apiKey)
-                        apiKey = ""
-                    }
-                    .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    if model.hasAPIKey {
-                        Button("Remove", role: .destructive) { model.saveAPIKey("") }
-                    }
-                    Spacer()
-                    Label(
-                        model.hasAPIKey ? "Stored locally" : "Not configured",
-                        systemImage: model.hasAPIKey ? "checkmark.shield.fill" : "exclamationmark.triangle"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(model.hasAPIKey ? .green : .secondary)
-                }
-            }
 
             Section("Workspace") {
                 HStack {
@@ -215,7 +283,7 @@ struct SettingsView: View {
                     Button("Disconnect") { model.disconnectVoice() }
                         .disabled(model.voiceState == .disconnected)
                     Spacer()
-                    Text("⌘⇧Space starts voice mode")
+                    Text("⌥Space starts voice mode")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -244,8 +312,14 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .scrollIndicators(.visible)
+        .task { await model.refreshCodingAgentStatuses() }
         .frame(width: 600, height: 760)
         .padding(8)
+    }
+
+    private var codingBackend: Binding<CodingAgentBackend> {
+        Binding(get: { model.codingAgentBackend }, set: model.selectCodingBackend)
     }
 
     private var interactionMode: Binding<InteractionMode> {

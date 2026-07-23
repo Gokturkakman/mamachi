@@ -11,7 +11,7 @@ enum OnboardingStep: Int, CaseIterable {
     case accessibility
     case vscode
     case realtimeCredential
-    case codingCredential
+    case codingAgent
 
     var title: String {
         switch self {
@@ -20,7 +20,7 @@ enum OnboardingStep: Int, CaseIterable {
         case .accessibility: "Accessibility"
         case .vscode: "VS Code integration"
         case .realtimeCredential: "OpenAI Realtime"
-        case .codingCredential: "Coding provider"
+        case .codingAgent: "Coding agent"
         }
     }
 }
@@ -28,13 +28,14 @@ enum OnboardingStep: Int, CaseIterable {
 @MainActor
 final class OnboardingModel: ObservableObject {
     static let completionDefaultsKey = "onboardingCompletedVersion"
-    static let currentVersion = 1
+    static let currentVersion = 2
 
-    @Published var step: OnboardingStep = .microphone
+    @Published var step: OnboardingStep
     @Published var statusMessage = ""
     @Published var realtimeKey = ""
     @Published var codingCredential = ""
     @Published var codingProvider: CodingProvider = .anthropic
+    @Published var selectedBackend: CodingAgentBackend
     @Published private(set) var isWorking = false
     @Published private(set) var vscodeInstalled = false
     @Published private(set) var vscodeExtensionInstalled = false
@@ -44,10 +45,14 @@ final class OnboardingModel: ObservableObject {
     private let onComplete: () -> Void
 
     init(appModel: AppModel, keychain: KeychainStore = KeychainStore(), onComplete: @escaping () -> Void) {
+        let previousVersion = UserDefaults.standard.integer(forKey: Self.completionDefaultsKey)
+        step = previousVersion >= 1 ? .codingAgent : .microphone
+        selectedBackend = appModel.codingAgentBackend
         self.appModel = appModel
         self.keychain = keychain
         self.onComplete = onComplete
         refreshVSCodeStatus()
+        Task { await appModel.refreshCodingAgentStatuses() }
     }
 
     static var isComplete: Bool {
@@ -148,17 +153,41 @@ final class OnboardingModel: ObservableObject {
         }
     }
 
+    var selectedCodingAgentStatus: CodingAgentStatus {
+        appModel.codingAgentStatuses.first(where: { $0.backend == selectedBackend })
+            ?? .unavailable(selectedBackend)
+    }
+
+    func refreshCodingAgentStatus() {
+        Task { await appModel.refreshCodingAgentStatuses() }
+    }
+
+    func openCodingAgentSetup() {
+        appModel.openCodingAgentSetup(selectedBackend)
+        statusMessage = "Setup opened in Terminal. Mamachi will detect the login automatically."
+    }
+
+    func finishCodingAgentSetup() {
+        guard selectedCodingAgentStatus.ready else {
+            statusMessage = "Finish setup for \(selectedBackend.label) before continuing."
+            return
+        }
+        appModel.selectCodingBackend(selectedBackend)
+        advance()
+    }
+
     func saveCodingProviderCredential() {
         let value = codingCredential.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return }
-        do {
-            try keychain.saveCodingCredential(value, for: codingProvider)
-            codingCredential = ""
-            statusMessage = "\(codingProvider.label) credential saved in Keychain."
-            advance()
-        } catch {
-            statusMessage = error.localizedDescription
+        guard appModel.saveCodingProviderCredential(value, for: codingProvider) else {
+            statusMessage = appModel.errorMessage ?? "The provider credential could not be saved."
+            return
         }
+        codingCredential = ""
+        selectedBackend = .omp
+        appModel.selectCodingBackend(.omp)
+        statusMessage = "\(codingProvider.label) credential saved in Keychain."
+        advance()
     }
 
     func advance() {
@@ -200,7 +229,7 @@ struct OnboardingView: View {
                 case .accessibility: accessibilityStep
                 case .vscode: vscodeStep
                 case .realtimeCredential: realtimeStep
-                case .codingCredential: codingStep
+                case .codingAgent: codingStep
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -210,7 +239,7 @@ struct OnboardingView: View {
             }
         }
         .padding(28)
-        .frame(width: 620, height: 460)
+        .frame(width: 620, height: 620)
     }
 
     private var microphoneStep: some View {
@@ -282,21 +311,62 @@ struct OnboardingView: View {
     }
 
     private var codingStep: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Label("Coding-provider credential", systemImage: "key.fill")
+        VStack(alignment: .leading, spacing: 14) {
+            Label("Choose the coding agent you already use", systemImage: "terminal.fill")
                 .font(.title2.bold())
-            Text("Optional. The selected provider credential is saved only in your macOS Keychain and supplied directly to the local coding runtime.")
-            Picker("Provider", selection: $onboarding.codingProvider) {
-                ForEach(CodingProvider.allCases) { provider in Text(provider.label).tag(provider) }
+            Text("Mamachi needs one installed, logged-in coding agent. It will not silently fall back to a different account.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Picker("Coding agent", selection: $onboarding.selectedBackend) {
+                ForEach(CodingAgentBackend.allCases) { backend in
+                    Text(backend.label).tag(backend)
+                }
             }
-            SecureField("Provider API key", text: $onboarding.codingCredential)
-                .textContentType(.password)
+            .pickerStyle(.segmented)
+
+            let status = onboarding.selectedCodingAgentStatus
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: status.ready ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                    .foregroundStyle(status.ready ? .green : .orange)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(status.ready ? "\(status.backend.label) is ready" : "Setup required").fontWeight(.semibold)
+                    Text(status.detail).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            if onboarding.selectedBackend == .omp && !status.ready {
+                DisclosureGroup("Use a provider API key instead") {
+                    Picker("Provider", selection: $onboarding.codingProvider) {
+                        ForEach(CodingProvider.allCases) { provider in Text(provider.label).tag(provider) }
+                    }
+                    SecureField("Optional provider API key", text: $onboarding.codingCredential)
+                        .textContentType(.password)
+                }
+            }
+
             HStack {
-                Button("Finish without a coding key") { onboarding.advance() }
+                Button("Refresh") { onboarding.refreshCodingAgentStatus() }
+                    .accessibilityLabel("Refresh coding agent status")
+                if !status.ready {
+                    Button(status.executablePath == nil ? "Install and Log In" : "Log In") {
+                        onboarding.openCodingAgentSetup()
+                    }
+                        .accessibilityLabel(status.executablePath == nil ? "Install and Log In" : "Log In")
+                }
                 Spacer()
-                Button("Save and Finish") { onboarding.saveCodingProviderCredential() }
-                    .disabled(onboarding.codingCredential.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if onboarding.selectedBackend == .omp && !status.ready {
+                    Button("Use API Key and Finish") { onboarding.saveCodingProviderCredential() }
+                        .accessibilityLabel("Use API Key and Finish")
+                        .disabled(onboarding.codingCredential.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .buttonStyle(.borderedProminent)
+                } else {
+                    Button("Use \(onboarding.selectedBackend.label) and Finish") {
+                        onboarding.finishCodingAgentSetup()
+                    }
+                    .accessibilityLabel("Use \(onboarding.selectedBackend.label) and Finish")
+                    .disabled(!status.ready)
                     .buttonStyle(.borderedProminent)
+                }
             }
         }
     }

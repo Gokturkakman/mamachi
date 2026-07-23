@@ -5,6 +5,8 @@ export {
   createEmptyState,
   replayEvents,
   snapshotState,
+  type CodingRecoveryBoundary,
+  type CodingSessionRecord,
   type ControllerSnapshot,
   type ControllerState,
   type RunRecord,
@@ -24,6 +26,14 @@ export {
   type DaemonHooks,
   type IpcServerOptions,
 } from "./ipc-server.ts";
+export { CodingRunner, type CodingRunnerOptions } from "./coding-runner.ts";
+export {
+  ExternalCliRunner,
+  modelForExternalBackend,
+  resolveCodingAgentExecutable,
+  type ExternalCliRunnerOptions,
+  type ExternalCodingBackend,
+} from "./external-cli-runner.ts";
 export { OmpRunner, type OmpRunnerOptions } from "./omp-runner.ts";
 export { RealtimeBridge } from "./realtime-bridge.ts";
 export {
@@ -50,3 +60,11 @@ export {
   type WorkspaceGuardDecision,
   type WorkspaceMutation,
 } from "./workspace-guard.ts";
+export {
+  codingBackends,
+  defaultRuntimeSettings,
+  parseRuntimeSettings,
+  resolveTaskRoute,
+  type CodingBackend,
+  type RuntimeSettings,
+} from "./model-router.ts";

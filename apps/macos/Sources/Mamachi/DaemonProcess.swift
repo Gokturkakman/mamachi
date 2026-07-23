@@ -13,7 +13,7 @@ final class DaemonProcess {
     private var outputPipe: Pipe?
     private var errorPipe: Pipe?
 
-    func start(workspace: String) async throws -> DaemonReady {
+    func start(workspace: String, codingBackend: CodingAgentBackend) async throws -> DaemonReady {
         if process?.isRunning == true { throw DaemonLaunchError.alreadyRunning }
         let daemon = try Self.daemonExecutable()
         let statePath = try Self.statePath()
@@ -23,6 +23,14 @@ final class DaemonProcess {
         process.executableURL = daemon
         process.currentDirectoryURL = URL(filePath: workspace, directoryHint: .isDirectory)
         var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = CodingAgentDiscovery.augmentedPath()
+        environment["MAMACHI_CODING_BACKEND"] = codingBackend.rawValue
+        if let codex = CodingAgentDiscovery.executable(for: .codex) {
+            environment["MAMACHI_CODEX_PATH"] = codex
+        }
+        if let claude = CodingAgentDiscovery.executable(for: .claude) {
+            environment["MAMACHI_CLAUDE_PATH"] = claude
+        }
         let keychain = KeychainStore()
         for (name, credential) in try keychain.codingCredentialEnvironment() {
             environment[name] = credential

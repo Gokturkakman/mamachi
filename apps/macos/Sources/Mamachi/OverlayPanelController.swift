@@ -25,8 +25,8 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
 
     init(model: AppModel) {
         collapsedSize = NSSize(
-            width: model.collapsedOverlaySize.collapsedSide,
-            height: model.collapsedOverlaySize.collapsedSide
+            width: model.collapsedOverlaySize.collapsedSize.width,
+            height: model.collapsedOverlaySize.collapsedSize.height
         )
         expandedSize = NSSize(
             width: model.expandedOverlaySize.expandedSize.width,
@@ -92,8 +92,8 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
         expanded expandedPreset: OverlaySizePreset
     ) {
         collapsedSize = NSSize(
-            width: collapsedPreset.collapsedSide,
-            height: collapsedPreset.collapsedSide
+            width: collapsedPreset.collapsedSize.width,
+            height: collapsedPreset.collapsedSize.height
         )
         expandedSize = NSSize(
             width: expandedPreset.expandedSize.width,
@@ -194,7 +194,7 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
         let key = expanded ? Metrics.expandedFrameKey : Metrics.compactFrameKey
         guard let stored = UserDefaults.standard.string(forKey: key) else { return nil }
         let frame = NSRectFromString(stored)
-        guard frame.width >= 40, frame.height >= 40 else { return nil }
+        guard frame.width >= 80, frame.height >= 20 else { return nil }
         return frame
     }
 

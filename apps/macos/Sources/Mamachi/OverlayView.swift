@@ -42,7 +42,6 @@ struct OverlayView: View {
 
     private var compactOrb: some View {
         GeometryReader { proxy in
-            let side = max(80, min(proxy.size.width, proxy.size.height))
             ZStack {
                 WindowDragHandle(
                     onClick: compactOrbAction,
@@ -60,124 +59,54 @@ struct OverlayView: View {
                         quitApplication: model.quitApplication
                     )
                 )
-                .clipShape(Circle())
+                .clipShape(Capsule())
 
-                ThinkingOrbView(
-                    state: model.voiceState,
-                    microphoneLevel: model.microphoneLevel,
-                    size: side * 0.82
-                )
-                .allowsHitTesting(false)
-            }
-            .frame(width: side, height: side)
-            .background(.ultraThinMaterial, in: Circle())
-            .overlay {
-                Circle().strokeBorder(Theme.specularEdge, lineWidth: 1)
-            }
-            .overlay {
-                CoderStateRing(
-                    taskState: model.activeTask?.state,
-                    completionFlash: model.lastTaskCompletionAt
-                )
-                .padding(0.5)
-            }
-            .overlay(alignment: .topTrailing) {
-                Button {
-                    model.drawerExpanded = true
-                } label: {
-                    Image(systemName: "arrow.up.left.and.arrow.down.right")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 25, height: 25)
-                        .background(.regularMaterial, in: Circle())
-                        .overlay {
-                            Circle().strokeBorder(.white.opacity(0.14), lineWidth: 1)
-                        }
+                HStack(spacing: 7) {
+                    Capsule()
+                        .fill(compactIndicatorColor)
+                        .frame(width: model.isEngaged || model.activeTask != nil ? 22 : 12, height: 3)
+                        .shadow(color: compactIndicatorColor.opacity(0.8), radius: 3)
+                        .animation(.snappy(duration: 0.2), value: model.isEngaged)
+                        .animation(.snappy(duration: 0.2), value: model.activeTaskId)
+                    Text(compactIndicatorText)
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    Button {
+                        model.drawerExpanded = true
+                    } label: {
+                        Image(systemName: "chevron.up")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 20, height: 20)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open Mamachi")
                 }
-                .buttonStyle(.plain)
-                .help("Open current conversation")
+                .padding(.leading, 10)
+                .padding(.trailing, 5)
+                .allowsHitTesting(true)
             }
-            .overlay(alignment: .topLeading) { orbBadgeStack }
+            .frame(width: proxy.size.width, height: proxy.size.height)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay {
+                Capsule().strokeBorder(Theme.specularEdge, lineWidth: 1)
+            }
             .overlay(alignment: .bottom) {
-                compactStatusBadge.offset(y: 12)
+                Capsule()
+                    .fill(model.activeTask.map { Theme.statusColor($0.state) } ?? .clear)
+                    .frame(height: 1.5)
+                    .padding(.horizontal, 12)
             }
-            .shadow(color: .black.opacity(colorScheme == .dark ? 0.30 : 0.12), radius: 9, y: 3)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .shadow(color: .black.opacity(colorScheme == .dark ? 0.26 : 0.12), radius: 7, y: 2)
         }
         .help("\(compactOrbHelp). Right-click for app menu and Quit.")
-    }
-
-    /// Vertical badge cluster on the orb's leading edge: queued spoken
-    /// updates, a sleeping microphone, and captured context attachments.
-    private var orbBadgeStack: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            if let brief = model.pendingBrief {
-                OrbBadge(
-                    systemImage: "bell.fill",
-                    text: brief.count > 1 ? "\(brief.count)" : nil,
-                    tint: Theme.accentA,
-                    help: brief.count == 1
-                        ? "A spoken update is waiting — click to listen"
-                        : "\(brief.count) spoken updates are waiting — click to listen"
-                ) {
-                    model.toggleEngagement()
-                }
-            }
-            if microphoneSleeping {
-                OrbBadge(
-                    systemImage: "mic.slash.fill",
-                    tint: .orange,
-                    help: "Microphone is sleeping — click or press ⌘⇧Space to talk"
-                ) {
-                    model.toggleEngagement()
-                }
-            }
-            if !model.pendingContexts.isEmpty {
-                OrbBadge(
-                    systemImage: "paperclip",
-                    text: "\(model.pendingContexts.count)",
-                    tint: .secondary,
-                    help: "\(model.pendingContexts.count) captured attachment(s) ride along with the next task"
-                ) {
-                    surface = .task
-                    model.drawerExpanded = true
-                }
-            }
-        }
+        .accessibilityLabel("\(compactIndicatorText), \(codingStatusLabel)")
     }
 
     private var microphoneSleeping: Bool {
         model.interactionMode == .voice && !model.isEngaged && model.voiceState == .connected
-    }
-
-    /// Always-visible repository + coding-status badge riding the orb's rim.
-    /// Clicking it opens the task drawer directly.
-    private var compactStatusBadge: some View {
-        Button {
-            surface = .task
-            model.drawerExpanded = true
-        } label: {
-            HStack(spacing: 4) {
-                Circle()
-                    .fill(model.activeTask.map { Theme.statusColor($0.state) } ?? Color.secondary)
-                    .frame(width: 4.5, height: 4.5)
-                Text(compactBadgeText)
-                    .font(.system(size: 8, weight: .semibold, design: .rounded))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background(.regularMaterial, in: Capsule())
-            .overlay {
-                Capsule().strokeBorder(.white.opacity(0.14), lineWidth: 1)
-            }
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .help("\(model.workspace) — \(codingStatusLabel). Click for task details.")
-        .accessibilityLabel("Repository \(repositoryName), \(codingStatusLabel)")
-        .accessibilityHint("Opens the task drawer")
     }
 
     private var expandedPanel: some View {
@@ -572,12 +501,12 @@ struct OverlayView: View {
         if !model.liveAssistantTranscript.isEmpty { return model.liveAssistantTranscript }
         if !model.liveUserTranscript.isEmpty { return model.liveUserTranscript }
         if let last = model.transcripts.last { return last.text }
-        return model.interactionMode == .text ? "Type below; responses stay silent." : "Press ⌘⇧Space to talk."
+        return model.interactionMode == .text ? "Type below; responses stay silent." : "Press ⌥Space to talk."
     }
 
     private var compactOrbHelp: String {
         if model.interactionMode == .text { return "Open silent chat" }
-        return model.isEngaged ? "Sleep microphone (⌘⇧Space)" : "Talk to Mamachi (⌘⇧Space)"
+        return model.isEngaged ? "Sleep microphone (⌥Space)" : "Talk to Mamachi (⌥Space)"
     }
 
     private var repositoryName: String {
@@ -590,12 +519,19 @@ struct OverlayView: View {
         return "coder \(task.state.replacingOccurrences(of: "_", with: " "))"
     }
 
-    private var compactBadgeText: String {
-        guard let task = model.activeTask else { return repositoryName }
-        let status = task.state == "awaiting_user"
-            ? "needs input"
-            : task.state.replacingOccurrences(of: "_", with: " ")
-        return "\(repositoryName) · \(status)"
+    private var compactIndicatorText: String {
+        if taskNeedsAttention { return "Needs you" }
+        if model.activeTask != nil { return "Coding" }
+        if model.isEngaged { return model.voiceState.label }
+        if model.pendingBrief != nil { return "Update ready" }
+        return microphoneSleeping ? "Sleeping" : "Ready"
+    }
+
+    private var compactIndicatorColor: Color {
+        if taskNeedsAttention { return .orange }
+        if let task = model.activeTask { return Theme.statusColor(task.state) }
+        if model.voiceState == .error { return .red }
+        return model.isEngaged ? Theme.accentA : .secondary
     }
 
     private var taskNeedsAttention: Bool {
@@ -632,95 +568,3 @@ struct OverlayView: View {
     }
 }
 
-/// Thin state ring around the compact orb reflecting the coder lifecycle:
-/// rotating brand arc while running, pulsing amber while blocked on the
-/// user, static orange while paused, and a green flash after completion.
-private struct CoderStateRing: View {
-    let taskState: String?
-    let completionFlash: Date?
-
-    private static let flashDuration: TimeInterval = 4
-
-    var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 30, paused: paused)) { timeline in
-            ring(at: timeline.date)
-        }
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-    }
-
-    private var flashActive: Bool {
-        guard let completionFlash else { return false }
-        return Date().timeIntervalSince(completionFlash) < Self.flashDuration
-    }
-
-    private var paused: Bool {
-        switch taskState {
-        case "running", "pause_requested", "awaiting_user":
-            false
-        default:
-            !flashActive
-        }
-    }
-
-    @ViewBuilder
-    private func ring(at date: Date) -> some View {
-        let time = date.timeIntervalSinceReferenceDate
-        switch taskState {
-        case "running", "pause_requested":
-            Circle()
-                .trim(from: 0, to: 0.3)
-                .stroke(Theme.brand, style: StrokeStyle(lineWidth: 1.8, lineCap: .round))
-                .rotationEffect(.radians(time.truncatingRemainder(dividingBy: 4) / 4 * 2 * .pi))
-                .opacity(0.9)
-        case "awaiting_user":
-            Circle()
-                .strokeBorder(.orange.opacity(0.45 + 0.35 * sin(time * 2 * .pi / 1.6)), lineWidth: 1.8)
-        case "paused":
-            Circle()
-                .strokeBorder(.orange.opacity(0.5), lineWidth: 1.5)
-        default:
-            if flashActive, let completionFlash {
-                let age = Date().timeIntervalSince(completionFlash)
-                Circle()
-                    .strokeBorder(
-                        .green.opacity(max(0, 0.8 * (1 - age / Self.flashDuration))),
-                        lineWidth: 1.8
-                    )
-            }
-        }
-    }
-}
-
-/// Miniature capsule badge riding the compact orb.
-private struct OrbBadge: View {
-    let systemImage: String
-    var text: String? = nil
-    var tint: Color = .secondary
-    var help: String
-    var action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 2.5) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 8, weight: .bold))
-                if let text {
-                    Text(text)
-                        .font(.system(size: 8, weight: .bold, design: .rounded))
-                }
-            }
-            .foregroundStyle(tint)
-            .padding(.horizontal, 5.5)
-            .padding(.vertical, 3.5)
-            .background(.regularMaterial, in: Capsule())
-            .overlay {
-                Capsule().strokeBorder(tint.opacity(0.35), lineWidth: 1)
-            }
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .help(help)
-        .accessibilityLabel(help)
-    }
-}

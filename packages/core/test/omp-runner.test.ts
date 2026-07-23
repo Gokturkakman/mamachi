@@ -45,7 +45,7 @@ function createTask(repositoryId: string, overrides: Partial<TaskRecord> = {}): 
     updatedAt: new Date(0).toISOString(),
     terminalSummary: null,
     workspaceConflict: null,
-    ompSession: null,
+    codingSession: null,
     pendingQuestion: null,
     specHistory: [{ revision: 1, objective: "Implement the requested behavior", revisedAt: new Date(0).toISOString() }],
     ...overrides,
@@ -172,8 +172,8 @@ describe("OmpRunner steering and recovery", () => {
           questionReady.resolve();
           return result;
         },
-        onSessionBound: async (candidate, runId, sessionId, sessionFile) =>
-          controller.recordCoderSession(Bun.randomUUIDv7(), candidate, runId, sessionId, sessionFile),
+        onSessionBound: async (candidate, runId, backend, sessionId, sessionFile) =>
+          controller.recordCoderSession(Bun.randomUUIDv7(), candidate, runId, backend, sessionId, sessionFile),
         onComplete: async (_candidate, summary) => {
           completion = summary;
           completionReady.resolve();
@@ -280,7 +280,8 @@ describe("OmpRunner steering and recovery", () => {
     try {
       const previousRunId = Bun.randomUUIDv7();
       const task = createTask(repository, {
-        ompSession: {
+        codingSession: {
+          backend: "omp",
           id: "omp-recovery-session",
           file: "/tmp/bound-session.jsonl",
           boundRunId: previousRunId,

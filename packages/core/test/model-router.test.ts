@@ -29,13 +29,14 @@ function task(objective: string, codingProfileId: string | null = null): TaskRec
     updatedAt: new Date(0).toISOString(),
     terminalSummary: null,
     workspaceConflict: null,
-    ompSession: null,
+    codingSession: null,
     pendingQuestion: null,
     specHistory: [{ revision: 1, objective, revisedAt: new Date(0).toISOString() }],
   };
 }
 
 const configured: RuntimeSettings = {
+  codingBackend: "omp",
   primaryModel: "openai-codex/gpt-5.6-sol",
   fastModel: "openai-codex/gpt-5.4-mini",
   thinkingLevel: "medium",

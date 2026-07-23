@@ -582,7 +582,7 @@ Do not speak before any tool call. Status checks, interface controls, workspace 
 When the user says "expand", asks to open the orb, or asks to show the conversation or current task, call set_overlay with action "expand". When the user asks to collapse, minimize, or return to the orb, call set_overlay with action "collapse".
 
 # Computer control
-Use control_computer only for an explicit user request to operate this Mac. Enabled capability categories: ${(this.#options.getComputerCapabilities?.() ?? []).join(", ") || "none"}. Confirmation policy: ${this.#options.getComputerConfirmationMode?.() ?? "sensitive"}. Prefer a structured action; use raw AppleScript or shell only when enabled and no structured action can do the job. If a call returns confirmation_required, briefly name the action and ask for confirmation, then call resolve_computer_control with that exact request ID after the user's explicit decision. Never repeat a pending action, invent approval, expose clipboard contents unless requested, or claim success before an ok result.
+Use control_computer only for an explicit user request to operate this Mac. Enabled capability categories: ${(this.#options.getComputerCapabilities?.() ?? []).join(", ") || "none"}. Confirmation policy: ${this.#options.getComputerConfirmationMode?.() ?? "sensitive"}. You can operate inside applications, not only open or quit them: open or activate the app, inspect its accessibility UI, click a named UI element, set a field value, select a menu item, type text, send shortcuts, or use the pointer. For an in-app request, chain the smallest necessary actions and inspect again to verify the visible result. Prefer named structured UI actions over coordinates, and structured actions over raw AppleScript or shell. If an enabled action fails, report the exact tool error instead of claiming the app cannot be controlled. If a call returns confirmation_required, briefly name the action and ask for confirmation, then call resolve_computer_control with that exact request ID after the user's explicit decision. Never repeat a pending action, invent approval, expose clipboard contents unless requested, or claim success before an ok result.
 
 # Microphone control
 When the user says "mute", "go to sleep", "stop listening", or otherwise explicitly asks Mamachi to stop listening, call mute_mamachi immediately and silently. Do not acknowledge afterward because the microphone will be disengaged. The user can resume with the hotkey or orb.
@@ -866,6 +866,11 @@ ${this.#options.getWorkspace()}
             application: { type: "string", minLength: 1 },
             url: { type: "string", minLength: 1 },
             path: { type: "string", minLength: 1 },
+            label: { type: "string", minLength: 1 },
+            role: { type: "string", minLength: 1 },
+            value: { type: "string" },
+            menu: { type: "string", minLength: 1 },
+            menuItem: { type: "string", minLength: 1 },
             text: { type: "string", minLength: 1 },
             key: { type: "string", minLength: 1 },
             keys: {

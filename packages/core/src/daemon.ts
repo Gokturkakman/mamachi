@@ -2,9 +2,14 @@ import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent";
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { MamachiIpcServer } from "./ipc-server.ts";
-import { OmpRunner } from "./omp-runner.ts";
+import { CodingRunner } from "./coding-runner.ts";
 import { RealtimeBridge } from "./realtime-bridge.ts";
-import { defaultRuntimeSettings, type RuntimeSettings } from "./model-router.ts";
+import {
+  codingBackends,
+  defaultRuntimeSettings,
+  type CodingBackend,
+  type RuntimeSettings,
+} from "./model-router.ts";
 import { MacComputerController } from "./computer-control.ts";
 import { OmpObserverBackend, PassiveObserver } from "./observer.ts";
 import { VoiceBriefStore } from "./voice-brief-store.ts";
@@ -39,12 +44,17 @@ delete process.env["OPENAI_API_KEY"];
 delete process.env["GEMINI_API_KEY"];
 const briefStore = new VoiceBriefStore(databasePath, encryptionKey);
 
-let runner: OmpRunner | null = null;
+let runner: CodingRunner | null = null;
 let realtime: RealtimeBridge | null = null;
 let observer: PassiveObserver | null = null;
 let observerBackend: OmpObserverBackend | null = null;
+const requestedCodingBackend = process.env["MAMACHI_CODING_BACKEND"];
+const initialCodingBackend = codingBackends.includes(requestedCodingBackend as CodingBackend)
+  ? requestedCodingBackend as CodingBackend
+  : defaultRuntimeSettings.codingBackend;
 const initialRuntimeSettings: RuntimeSettings = {
   ...defaultRuntimeSettings,
+  codingBackend: initialCodingBackend,
   primaryModel: process.env["MAMACHI_CODING_MODEL"] ?? defaultRuntimeSettings.primaryModel,
 };
 let runtimeSettings = initialRuntimeSettings;
@@ -150,7 +160,7 @@ observer = new PassiveObserver({
   emit: (type, payload) => daemon.emit(type, payload),
 });
 
-runner = new OmpRunner({
+runner = new CodingRunner({
   authStorage,
   getTask: (taskId) => daemon.snapshot().tasks.find((task) => task.id === taskId),
   getArtifacts: (ids) => daemon.getArtifacts(ids),
@@ -165,8 +175,12 @@ runner = new OmpRunner({
   onComplete: (taskId, summary, evidenceIds) => daemon.completeTask(taskId, summary, evidenceIds),
   onFail: (taskId, error) => daemon.failTask(taskId, error),
   onNeedInput: (taskId, question) => daemon.awaitUserInput(taskId, question),
-  onSessionBound: (taskId, runId, sessionId, sessionFile) =>
-    daemon.recordCoderSession(taskId, runId, sessionId, sessionFile),
+  cliEnvironment: {
+    ANTHROPIC_API_KEY: codingProviderKeys.anthropic,
+    OPENAI_API_KEY: codingProviderKeys.openai,
+  },
+  onSessionBound: (taskId, runId, backend, sessionId, sessionFile) =>
+    daemon.recordCoderSession(taskId, runId, backend, sessionId, sessionFile),
   runtimeSettings: initialRuntimeSettings,
 });
 await daemon.recoverAfterRestart();

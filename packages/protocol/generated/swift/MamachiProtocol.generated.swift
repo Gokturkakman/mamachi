@@ -4,7 +4,7 @@ import Foundation
 
 public enum MamachiProtocol {
     public static let envelopeVersion = 1
-    public static let schemaSHA256 = "449c5fd24a61977fa2e9e3da5e9caf7811b9faa7db85d9292993e6d3da5d81bc"
+    public static let schemaSHA256 = "c133572c8794bfc39d1afa15c1dee49114ad035e444c62ad12f26bb80e496273"
     public static let commandSchemaJSON = #"""
 {
   "oneOf": [
@@ -686,13 +686,28 @@ public enum MamachiProtocol {
   "coder.sessionBound": {
     "additionalProperties": false,
     "properties": {
+      "backend": {
+        "enum": [
+          "omp",
+          "codex",
+          "claude"
+        ],
+        "type": "string"
+      },
       "runId": {
         "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
         "type": "string"
       },
       "sessionFile": {
-        "minLength": 1,
-        "type": "string"
+        "oneOf": [
+          {
+            "minLength": 1,
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
       },
       "sessionId": {
         "minLength": 1,
@@ -700,6 +715,7 @@ public enum MamachiProtocol {
       }
     },
     "required": [
+      "backend",
       "sessionId",
       "sessionFile",
       "runId"

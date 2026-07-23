@@ -292,11 +292,14 @@ export const EventPayloadSchemas = {
     type: "object",
     additionalProperties: false,
     properties: {
+      backend: { type: "string", enum: ["omp", "codex", "claude"] },
       sessionId: { type: "string", minLength: 1 },
-      sessionFile: { type: "string", minLength: 1 },
+      sessionFile: {
+        oneOf: [{ type: "string", minLength: 1 }, { type: "null" }],
+      },
       runId: IdSchema,
     },
-    required: ["sessionId", "sessionFile", "runId"],
+    required: ["backend", "sessionId", "sessionFile", "runId"],
   },
   "coder.recoveryBoundary": {
     type: "object",

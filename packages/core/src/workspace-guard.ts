@@ -28,6 +28,11 @@ export interface WorkspaceMutation {
   paths: string[];
   recordedAt: string;
 }
+export interface ExternalTurnResult {
+  changedFiles: string[];
+  conflict: WorkspaceConflict | null;
+}
+
 
 interface MutationScope {
   targets: string[];
@@ -177,6 +182,51 @@ export class WorkspaceGuard {
     });
     return { status: "allowed" };
   }
+  async beginExternalTurn(turnId: string, backend: string): Promise<WorkspaceGuardDecision> {
+    const pendingConflict = await this.#pendingAttribution;
+    if (pendingConflict) return { status: "conflict", conflict: pendingConflict };
+    if (!this.#repository || !this.#taskId || !this.#runId) return { status: "allowed" };
+
+    const currentFiles = await this.#scanFiles();
+    const changedOutsideAgent = changedPaths(this.#knownFiles, currentFiles);
+    for (const path of changedOutsideAgent) this.#externalChanges.add(path);
+    const dirtyFiles = [...this.#editorStates.entries()]
+      .filter(([, state]) => state.dirty)
+      .map(([path]) => path)
+      .sort();
+    const overlaps = [...new Set([...changedOutsideAgent, ...dirtyFiles])].sort();
+    if (overlaps.length > 0) {
+      return {
+        status: "conflict",
+        conflict: {
+          paths: overlaps,
+          reason: "The external coding agent cannot safely isolate changes while user edits are pending",
+          externalChanges: [...this.#externalChanges].sort(),
+          dirtyFiles,
+        },
+      };
+    }
+
+    this.#toolBaselines.set(turnId, {
+      toolName: backend,
+      scope: {
+        targets: [],
+        mayMutateUnknownFiles: true,
+        replacesWholeFile: false,
+        canMutate: true,
+      },
+      files: currentFiles,
+      editorVersions: new Map([...this.#editorStates].map(([path, editor]) => [path, editor.version])),
+    });
+    return { status: "allowed" };
+  }
+
+  async endExternalTurn(turnId: string): Promise<ExternalTurnResult> {
+    const conflict = await this.afterTool(turnId);
+    const mutation = this.#mutations.find((candidate) => candidate.toolCallId === turnId);
+    return { changedFiles: mutation?.paths ?? [], conflict };
+  }
+
 
   afterTool(toolCallId: string): Promise<WorkspaceConflict | null> {
     const operation = this.#attributeTool(toolCallId);

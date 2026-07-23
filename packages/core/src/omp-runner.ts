@@ -58,6 +58,7 @@ export interface OmpRunnerOptions {
   onSessionBound?: (
     taskId: string,
     runId: string,
+    backend: "omp",
     sessionId: string,
     sessionFile: string,
   ) => Promise<ActionResult>;
@@ -322,18 +323,18 @@ export class OmpRunner {
       if (!task.activeRunId) throw new Error("Running task has no active run for workspace attribution");
       await this.#workspaceGuard.start(task.id, task.activeRunId, task.repositoryId);
       const restoredSession =
-        resumed && task.ompSession?.file
+        resumed && task.codingSession?.backend === "omp" && task.codingSession.file
           ? await (this.#options.openSession ?? ((sessionFile) => SessionManager.open(sessionFile)))(
-              task.ompSession.file,
+              task.codingSession.file,
             )
           : undefined;
-      if (task.ompSession?.recoveryBoundary) {
+      if (task.codingSession?.backend === "omp" && task.codingSession.recoveryBoundary) {
         this.#options.emit("coder.recovery_boundary", {
           taskId,
-          sessionId: task.ompSession.id,
-          previousRunId: task.ompSession.recoveryBoundary.runId,
-          reason: task.ompSession.recoveryBoundary.reason,
-          unknownToolCall: task.ompSession.recoveryBoundary.unknownToolCall,
+          sessionId: task.codingSession.id,
+          previousRunId: task.codingSession.recoveryBoundary.runId,
+          reason: task.codingSession.recoveryBoundary.reason,
+          unknownToolCall: task.codingSession.recoveryBoundary.unknownToolCall,
           replayedToolCall: false,
         });
       }
@@ -367,15 +368,20 @@ export class OmpRunner {
       await created.session.sessionManager.ensureOnDisk();
       const sessionFile = created.session.sessionFile;
       if (!sessionFile) throw new Error("OMP session persistence did not produce a session file");
-      if (restoredSession && task.ompSession && created.session.sessionId !== task.ompSession.id) {
+      if (
+        restoredSession &&
+        task.codingSession?.backend === "omp" &&
+        created.session.sessionId !== task.codingSession.id
+      ) {
         throw new Error(
-          `Recovered OMP session identity mismatch: expected ${task.ompSession.id}, received ${created.session.sessionId}`,
+          `Recovered OMP session identity mismatch: expected ${task.codingSession.id}, received ${created.session.sessionId}`,
         );
       }
       if (this.#options.onSessionBound) {
         const binding = await this.#options.onSessionBound(
           taskId,
           task.activeRunId,
+          "omp",
           created.session.sessionId,
           sessionFile,
         );
@@ -390,6 +396,7 @@ export class OmpRunner {
       this.#options.emit("coder.session_bound", {
         taskId,
         runId: task.activeRunId,
+        backend: "omp",
         sessionId: created.session.sessionId,
         sessionFile,
         recovered: Boolean(restoredSession),
@@ -524,6 +531,7 @@ export class OmpRunner {
       const binding = await this.#options.onSessionBound(
         taskId,
         task.activeRunId,
+        "omp",
         this.#session.sessionId,
         sessionFile,
       );
@@ -542,6 +550,7 @@ export class OmpRunner {
     this.#options.emit("coder.session_bound", {
       taskId,
       runId: task.activeRunId,
+      backend: "omp",
       sessionId: this.#session.sessionId,
       sessionFile,
       recovered: false,
@@ -740,11 +749,11 @@ export class OmpRunner {
           ),
         ]
       : [];
-    const recoveryBoundary = task.ompSession?.recoveryBoundary
+    const recoveryBoundary = task.codingSession?.recoveryBoundary
       ? [
           "",
           "Recovery boundary:",
-          task.ompSession.recoveryBoundary.reason,
+          task.codingSession.recoveryBoundary.reason,
           "The daemon cannot know whether the last in-flight tool took effect. Never replay that unknown tool call. Inspect current repository state first and choose the next safe action from observed state.",
         ]
       : [];

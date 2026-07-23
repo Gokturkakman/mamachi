@@ -10,11 +10,15 @@ import type {
   ComputerConfirmationMode,
 } from "./computer-control.ts";
 
+export const codingBackends = ["omp", "codex", "claude"] as const;
+export type CodingBackend = (typeof codingBackends)[number];
+
 export const thinkingLevels = ["inherit", "auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 export type CodingThinkingLevel = (typeof thinkingLevels)[number];
 
 export interface RuntimeSettings {
+  codingBackend: CodingBackend;
   primaryModel: string;
   fastModel: string;
   thinkingLevel: CodingThinkingLevel;
@@ -24,6 +28,7 @@ export interface RuntimeSettings {
 }
 
 export const defaultRuntimeSettings: RuntimeSettings = {
+  codingBackend: "omp",
   primaryModel: "",
   fastModel: "openai-codex/gpt-5.4-mini",
   thinkingLevel: "inherit",
@@ -86,6 +91,7 @@ export function parseRuntimeSettings(input: unknown): RuntimeSettings {
   const value = input as Record<string, unknown>;
   const keys = Object.keys(value);
   const expected = [
+    "codingBackend",
     "primaryModel",
     "fastModel",
     "thinkingLevel",
@@ -96,12 +102,16 @@ export function parseRuntimeSettings(input: unknown): RuntimeSettings {
   if (keys.length !== expected.length || keys.some((key) => !expected.includes(key))) {
     throw new Error("settings.update payload has unexpected fields");
   }
+  const codingBackend = value["codingBackend"];
   const primaryModel = value["primaryModel"];
   const fastModel = value["fastModel"];
   const thinkingLevel = value["thinkingLevel"];
   const automaticRouting = value["automaticRouting"];
   const configuredComputerCapabilities = value["computerCapabilities"];
   const computerConfirmationMode = value["computerConfirmationMode"];
+  if (typeof codingBackend !== "string" || !codingBackends.includes(codingBackend as CodingBackend)) {
+    throw new Error(`codingBackend must be one of: ${codingBackends.join(", ")}`);
+  }
   if (typeof primaryModel !== "string" || primaryModel.length > 200) {
     throw new Error("primaryModel must be a string of at most 200 characters");
   }
@@ -132,6 +142,7 @@ export function parseRuntimeSettings(input: unknown): RuntimeSettings {
     );
   }
   return {
+    codingBackend: codingBackend as CodingBackend,
     primaryModel: primaryModel.trim(),
     fastModel: fastModel.trim(),
     thinkingLevel: thinkingLevel as CodingThinkingLevel,

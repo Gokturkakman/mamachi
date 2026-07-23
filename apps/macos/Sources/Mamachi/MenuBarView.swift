@@ -8,13 +8,18 @@ struct MenuBarView: View {
 
     var body: some View {
         Group {
+            Label(model.menuBarStatusText, systemImage: model.menuBarSystemImage)
+                .foregroundStyle(.secondary)
+
+            Divider()
+
             Button {
                 showOverlay()
                 model.toggleEngagement()
             } label: {
                 Label(model.isEngaged ? "Sleep microphone" : "Talk to Mamachi", systemImage: model.isEngaged ? "mic.slash" : "mic")
             }
-            .keyboardShortcut(.space, modifiers: [.command, .shift])
+            .keyboardShortcut(.space, modifiers: [.option])
 
             Button {
                 model.setInteractionMode(.text)
@@ -33,8 +38,8 @@ struct MenuBarView: View {
                 }
             }
 
-            Button("Show Overlay", action: showOverlay)
-            Button("Hide Overlay", action: hideOverlay)
+            Button("Open Mamachi", action: showOverlay)
+            Button("Hide Indicator", action: hideOverlay)
 
             Divider()
 

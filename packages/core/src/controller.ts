@@ -156,8 +156,9 @@ export class TaskController {
     signalId: string,
     taskId: string,
     runId: string,
+    backend: "omp" | "codex" | "claude",
     sessionId: string,
-    sessionFile: string,
+    sessionFile: string | null,
   ): ActionResult {
     const execution = this.#store.executeCommand(
       {
@@ -165,7 +166,7 @@ export class TaskController {
         type: "internal.coder.sessionBound",
         actor: "coder",
         expectedRevision: null,
-        payload: { taskId, runId, sessionId, sessionFile },
+        payload: { taskId, runId, backend, sessionId, sessionFile },
         createdAt: this.#now(),
       },
       () => {
@@ -176,7 +177,7 @@ export class TaskController {
         }
         const event = this.#event(
           "coder.sessionBound",
-          { sessionId, sessionFile, runId },
+          { backend, sessionId, sessionFile, runId },
           signalId,
           task,
           runId,
@@ -450,11 +451,11 @@ export class TaskController {
           task,
           runId,
         );
-        const recoveryBoundary = task.ompSession
+        const recoveryBoundary = task.codingSession
           ? this.#event(
               "coder.recoveryBoundary",
               {
-                sessionId: task.ompSession.id,
+                sessionId: task.codingSession.id,
                 runId,
                 reason: "Daemon recovery stopped at an unknown in-flight tool boundary; no tool call was replayed",
                 unknownToolCall: true,

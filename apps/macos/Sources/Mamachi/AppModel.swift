@@ -24,6 +24,9 @@ final class AppModel: ObservableObject {
     @Published var collapsedOverlaySize: OverlaySizePreset
     @Published var expandedOverlaySize: OverlaySizePreset
     @Published var interactionMode: InteractionMode
+    @Published var codingAgentBackend: CodingAgentBackend
+    @Published private(set) var codingAgentStatuses: [CodingAgentStatus]
+    @Published private(set) var codingAgentSetupInProgress = false
     @Published var primaryCodingModel: String
     @Published var fastCodingModel: String
     @Published var codingThinkingLevel: String
@@ -59,6 +62,7 @@ final class AppModel: ObservableObject {
     private var playbackItemId: String?
     private var playbackContentIndex: Int?
     private var errorDismissTask: Task<Void, Never>?
+    private var codingAgentMonitorTask: Task<Void, Never>?
 
     var activeTask: TaskViewState? {
         guard let activeTaskId else { return nil }
@@ -81,6 +85,31 @@ final class AppModel: ObservableObject {
         Array(tasks.filter(\.isTerminal).suffix(6).reversed())
     }
 
+    var selectedCodingAgentStatus: CodingAgentStatus {
+        codingAgentStatuses.first(where: { $0.backend == codingAgentBackend })
+            ?? .unavailable(codingAgentBackend)
+    }
+    var menuBarStatusText: String {
+        if attentionMessage != nil || pendingConfirmation != nil || activeTask?.state == "awaiting_user" {
+            return "Mamachi needs you"
+        }
+        if isEngaged { return voiceState.label }
+        if let activeTask {
+            return activeTask.state == "running" ? "Coding" : activeTask.stateLabel
+        }
+        return daemonConnected ? "Mamachi ready" : "Mamachi starting"
+    }
+
+    var menuBarSystemImage: String {
+        if attentionMessage != nil || pendingConfirmation != nil || activeTask?.state == "awaiting_user" {
+            return "exclamationmark.circle.fill"
+        }
+        if isEngaged { return "waveform" }
+        if activeTask != nil { return "hammer.fill" }
+        return daemonConnected ? "minus" : "ellipsis"
+    }
+
+
     init() {
         let defaults = UserDefaults.standard
         collapsedOverlaySize = OverlaySizePreset(
@@ -91,6 +120,10 @@ final class AppModel: ObservableObject {
         ) ?? .medium
         defaults.removeObject(forKey: "overlayCompactSize")
         interactionMode = InteractionMode(rawValue: defaults.string(forKey: "interactionMode") ?? "") ?? .voice
+        codingAgentBackend = CodingAgentBackend(
+            rawValue: defaults.string(forKey: "codingAgentBackend") ?? ""
+        ) ?? .omp
+        codingAgentStatuses = CodingAgentBackend.allCases.map(CodingAgentStatus.unavailable)
         primaryCodingModel = defaults.string(forKey: "primaryCodingModel") ?? ""
         fastCodingModel = defaults.string(forKey: "fastCodingModel") ?? "openai-codex/gpt-5.4-mini"
         codingThinkingLevel = defaults.string(forKey: "codingThinkingLevel") ?? "inherit"
@@ -154,7 +187,7 @@ final class AppModel: ObservableObject {
         started = true
         Task {
             do {
-                let ready = try await daemon.start(workspace: workspace)
+                let ready = try await daemon.start(workspace: workspace, codingBackend: codingAgentBackend)
                 workspace = ready.workspace
                 ipc.connect(port: ready.port, token: ready.token)
             } catch {
@@ -204,6 +237,59 @@ final class AppModel: ObservableObject {
         defaults.set(codingThinkingLevel, forKey: "codingThinkingLevel")
         defaults.set(automaticModelRouting, forKey: "automaticModelRouting")
         syncRuntimeSettings()
+    }
+
+    func selectCodingBackend(_ backend: CodingAgentBackend) {
+        codingAgentBackend = backend
+        UserDefaults.standard.set(backend.rawValue, forKey: "codingAgentBackend")
+        syncRuntimeSettings()
+    }
+
+    func refreshCodingAgentStatuses() async {
+        codingAgentStatuses = await CodingAgentDiscovery.statuses()
+        if selectedCodingAgentStatus.ready {
+            codingAgentSetupInProgress = false
+            codingAgentMonitorTask?.cancel()
+            codingAgentMonitorTask = nil
+        }
+    }
+
+    func openCodingAgentSetup(_ backend: CodingAgentBackend) {
+        do {
+            try CodingAgentDiscovery.openSetupTerminal(
+                for: backend,
+                executablePath: codingAgentStatuses.first(where: { $0.backend == backend })?.executablePath
+            )
+            codingAgentSetupInProgress = true
+            codingAgentMonitorTask?.cancel()
+            codingAgentMonitorTask = Task { [weak self] in
+                for _ in 0..<90 {
+                    guard let self, !Task.isCancelled else { return }
+                    try? await Task.sleep(for: .seconds(2))
+                    await refreshCodingAgentStatuses()
+                    if codingAgentStatuses.first(where: { $0.backend == backend })?.ready == true {
+                        return
+                    }
+                }
+                self?.codingAgentSetupInProgress = false
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func saveCodingProviderCredential(_ credential: String, for provider: CodingProvider) -> Bool {
+        let value = credential.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return false }
+        do {
+            try keychain.saveCodingCredential(value, for: provider)
+            Task { await refreshCodingAgentStatuses() }
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
     }
 
     func updateComputerControlSettings(
@@ -676,6 +762,7 @@ final class AppModel: ObservableObject {
         ipc.sendRequest(
             type: "settings.update",
             payload: [
+                "codingBackend": codingAgentBackend.rawValue,
                 "primaryModel": primaryCodingModel,
                 "fastModel": fastCodingModel,
                 "thinkingLevel": codingThinkingLevel,

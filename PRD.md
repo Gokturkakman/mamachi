@@ -7,11 +7,11 @@
 
 ## 1. Summary
 
-Mamachi is a local-first, voice-first coding agent harness. A realtime speech-to-speech model maintains a natural conversation with the user while a separate, user-selected coding model performs repository work through an embedded Oh My Pi (OMP) agent session.
+Mamachi is a local-first, voice-first coding agent harness. A realtime speech-to-speech model maintains a natural conversation with the user while a separate, explicitly selected coding agent—embedded Oh My Pi (OMP), Codex CLI, or Claude Code—performs repository work.
 
 The speech model is a bridge, not a coder. It collects intent, starts or queues work, answers grounded status questions, relays questions in both directions, handles safe course corrections, and explains verified results. The coding agent retains full coding responsibility and may continue working while the user talks with Mamachi about the task or unrelated topics.
 
-The product surface is a Wispr Flow-like macOS overlay with an expandable task drawer. The infrastructure runs locally, stores repository and orchestration state on-device, and calls model providers directly with user-supplied credentials.
+The product surface is a Wispr Flow-like macOS overlay with an expandable task drawer. The infrastructure runs locally, stores repository and orchestration state on-device, and reuses the selected coding agent’s existing authenticated account or an optional provider key.
 
 ## 2. Product thesis
 
@@ -41,7 +41,7 @@ This separation should make long coding tasks feel collaborative without allowin
 
 ### 4.1 Initial user
 
-A technical macOS user who already works in VS Code, uses one or more hosted coding models, and is comfortable supplying provider credentials.
+A macOS user who works in VS Code and already uses Codex, Claude Code, or OMP. Setup must not assume familiarity with terminal installation, provider credentials, or Mamachi’s internal stack.
 
 ### 4.2 Alpha audience
 
@@ -68,8 +68,8 @@ The alpha does not require accounts, hosted billing, a cloud control plane, or m
 | Deployment | Local-first desktop application |
 | Platform | macOS native first |
 | Voice provider | OpenAI Realtime 2.1 behind a provider adapter |
-| Coding backend | Embedded OMP SDK agent with user-selected OMP model/provider |
-| OMP integration | Pin and embed the published SDK first; fork only if a required hook is absent |
+| Coding backend | Explicit user choice: embedded OMP SDK, Codex CLI, or Claude Code |
+| Coding-agent integration | Persist and resume the selected backend’s session; never silently fall back to another account |
 | Mid-flight steering | Risk-aware: direct clarifications, confirmed consequential amendments, unrelated work queued |
 | UI | Minimal overlay plus expandable task drawer |
 | Coding permissions | Trust normal in-repository coding; escalate exact/high-impact effects |
@@ -78,7 +78,7 @@ The alpha does not require accounts, hosted billing, a cloud control plane, or m
 | Prototype goal | Request-to-change, concurrent conversation/status, and safe course correction in one demo |
 | Workspace mutation | Edit the current working tree directly; never auto-commit or switch branches |
 | Editor context | Workspace may be inferred; file/selection/diagnostic/terminal content requires explicit capture |
-| Credentials | Bring your own keys, stored in macOS Keychain |
+| Credentials | Reuse existing coding-agent subscription logins; optional provider keys and the required voice key are stored in macOS Keychain |
 | Voice posture | Adaptive companion |
 | Editor integration | VS Code extension first, editor-neutral protocol underneath |
 | Background completion | Visual notification while voice sleeps; spoken brief on resume |
@@ -87,7 +87,7 @@ The alpha does not require accounts, hosted billing, a cloud control plane, or m
 | Crash recovery | Recover paused and ask before resuming |
 | Queue scope | One global queue; every task is pinned to a repository identity |
 | Concurrent user edits | Detect and reconcile; pause only unresolved semantic conflicts |
-| Coder questions | Answer from evidence first; ask OMP at a safe boundary when evidence is insufficient |
+| Coder questions | Answer from evidence first; ask the active coding agent at a safe boundary when supported |
 | Handoff readiness | Adaptive to task size |
 | Intent classifier | Hard rules plus a schema-constrained fast policy model |
 | Confirmation channel | Voice for ordinary confirmation; visual card for exact/high-impact effects |
@@ -102,8 +102,8 @@ The alpha does not require accounts, hosted billing, a cloud control plane, or m
 - Floating overlay and task drawer
 - OpenAI Realtime 2.1 voice adapter
 - Local Bun/TypeScript orchestration daemon
-- Embedded OMP `AgentSession`
-- User-selectable OMP coding provider/model profile
+- Embedded OMP `AgentSession` plus structured Codex CLI and Claude Code adapters
+- Explicit coding-backend selection, authenticated-account detection, and resumable backend sessions
 - One active coding task and a global queue
 - Deterministic command/event controller
 - Persistent SQLite event and task state
@@ -122,7 +122,7 @@ The alpha does not require accounts, hosted billing, a cloud control plane, or m
 - iOS or web clients
 - Cloud workspaces or hosted repository execution
 - Hosted accounts, billing, or provider proxying
-- Compatibility with unrelated coding CLIs such as Claude Code or Codex CLI
+- Compatibility with coding agents beyond OMP, Codex CLI, and Claude Code
 - Multiple simultaneous mutating coding jobs
 - Automatic branches, commits, pull requests, or worktree merging
 - JetBrains, Xcode, Vim, or terminal plugins beyond basic foreground-app fallback
@@ -139,13 +139,13 @@ The first end-to-end demo must complete all of the following in one session:
 1. The user focuses a VS Code workspace and invokes Mamachi with the hotkey.
 2. The user discusses a real coding request.
 3. Mamachi identifies the repository, gathers the minimum required intent, and dispatches or confirms according to policy.
-4. OMP begins work and mutates the current working tree.
+4. The selected coding agent begins work and mutates the current working tree.
 5. The user has an unrelated conversation with Mamachi while coding continues.
 6. The user asks for status and receives an evidence-grounded brief.
 7. The user changes a load-bearing requirement.
 8. Mamachi requests a safe pause at the next tool boundary, summarizes impact, and confirms the revision.
-9. OMP replans and resumes under the new versioned task specification.
-10. OMP verifies the result.
+9. The same coding-agent session replans and resumes under the new versioned task specification.
+10. The coding agent verifies the result.
 11. Mamachi speaks the result, verification, important caveat, and next review action.
 12. The task drawer shows the task history, files changed, verification evidence, and deep links to exact files/ranges.
 
@@ -198,7 +198,7 @@ Expanded content:
 - Run boundaries, including pause/recovery/replan
 - Open-in-VS-Code links to files and ranges
 
-The drawer is not an IDE and does not attempt to reproduce the raw OMP terminal interface.
+The drawer is not an IDE and does not attempt to reproduce a raw coding-agent terminal interface.
 
 ### 8.4 Workspace targeting
 
@@ -234,7 +234,7 @@ flowchart LR
   U[User] <--> M[Mamachi.app\nSwift/AppKit]
   M <--> D[mamachi-core\nBun/TypeScript daemon]
   D <--> V[OpenAI Realtime 2.1]
-  D <--> C[Embedded OMP AgentSession]
+  D <--> C[Selected coding-agent adapter\nOMP, Codex, or Claude]
   C <--> R[Active repository]
   D <--> O[Fast policy/observer model]
   D <--> S[(Local SQLite and artifacts)]
@@ -265,7 +265,7 @@ Responsibilities:
 - Command validation and idempotency
 - Global task scheduler and queue
 - OpenAI Realtime adapter
-- OMP session lifecycle
+- Selected coding-agent lifecycle, routing, event normalization, and session persistence
 - Hard risk policy and fast policy-model invocation
 - Raw-to-fact and fact-to-semantic event projection
 - Observer evidence validation
@@ -273,30 +273,19 @@ Responsibilities:
 - Workspace/change attribution
 - IPC for the native app and editor extension
 
-Runtime: Bun 1.3.14 or newer, matching OMP’s current engine requirement.
+Runtime: Bun 1.3.14 or newer.
 
-### 9.3 OMP integration
+### 9.3 Coding-agent adapters
 
-Use the published `@oh-my-pi/pi-coding-agent` package pinned to an exact version. Required public integration points already exist:
+Every backend implements the same controller contract: start or resume a task in the selected repository, emit normalized lifecycle and evidence events, stop at a safe process boundary, and persist its backend plus session identity. A task never migrates to another backend implicitly.
 
-- `createAgentSession()`
-- Session event subscription
-- `prompt()`
-- `steer()`
-- `followUp()`
-- `abort()`
-- Model selection and persistent sessions
-- Extension `tool_call` event that fires before execution and may block
+#### Embedded OMP
 
-Do not drive or scrape the TUI. Do not hard-fork OMP unless implementation proves a required hook cannot be supplied through the SDK or extension system.
+Use the pinned `@oh-my-pi/pi-coding-agent` package through `createAgentSession()`, session subscriptions, `prompt()`, `steer()`, `followUp()`, `abort()`, persistent sessions, and the pre-execution extension hook. Mamachi supplies the headless question adapter, policy hook, event projection, safe pause behavior, and structured user-query tool. Do not drive or scrape the OMP TUI.
 
-Mamachi supplies:
+#### Codex CLI and Claude Code
 
-- A headless UI/question adapter
-- A policy extension around tool calls
-- Event projection
-- Safe pause behavior
-- A structured `respond_to_user_query` tool for direct user questions
+Launch the user’s installed, authenticated CLI non-interactively in the selected repository and consume its structured JSON event stream. Preserve the native account and sandbox/permission configuration, persist the returned session ID, resume that exact session after an accepted pause, normalize tool and completion evidence, and reconcile repository changes at every external process boundary. Never scrape human-oriented terminal output or fall back to another backend.
 
 ### 9.4 VS Code extension
 
@@ -326,14 +315,14 @@ The canonical protocol package generates or exports JSON Schema. TypeScript cons
 
 Starting coding must not remain an outstanding Realtime tool call.
 
-`submit_task` validates the request, creates a durable task, and immediately returns a task ID and state. OMP runs independently. The Realtime model stays available for arbitrary conversation. Coding progress later enters the voice context through curated, replaceable system-state messages.
+`submit_task` validates the request, creates a durable task, and immediately returns a task ID and state. The selected coding agent runs independently. The Realtime model stays available for arbitrary conversation. Coding progress later enters the voice context through curated, replaceable system-state messages.
 
 The voice model never receives:
 
 - Shell access
 - Filesystem read/write access
 - Git access
-- OMP tools
+- Coding-agent tools
 - Generic MCP access
 - Raw unbounded coding traces
 
@@ -376,7 +365,7 @@ Task state rules:
 - A task owns a versioned `TaskSpec`.
 - Consequential amendment creates a proposed next revision.
 - Accepting an amendment preserves prior revisions and creates a new run boundary.
-- A run is one OMP execution segment under one task-spec revision.
+- A run is one selected coding-agent execution segment under one task-spec revision.
 - Verification is evidence attached to the task/run, not a model claim.
 - Terminal states are immutable.
 
@@ -385,7 +374,7 @@ Task state rules:
 On unexpected restart:
 
 1. Persist `run.interrupted` when recovery begins.
-2. Restore the OMP session and authoritative task/event state.
+2. Restore the selected backend, its exact session identity, and authoritative task/event state.
 3. Inspect repository identity and workspace facts.
 4. Mark the task `paused(reason: recovery)`.
 5. Never replay an unknown in-flight tool call.
@@ -493,7 +482,7 @@ Recovery and concurrency:
 
 ```mermaid
 flowchart LR
-  O[OMP raw events] --> F[Deterministic fact projector]
+  O[Coding-agent raw events] --> F[Deterministic fact projector]
   F --> P[Bounded observation packet]
   O --> P
   P --> X[Passive observer model]
@@ -506,7 +495,7 @@ flowchart LR
 The observer may classify phase, summarize progress, identify a decision or blocker, and assign importance. It may not:
 
 - Change task state
-- Send messages to OMP
+- Send messages to the active coding agent
 - Call tools
 - Read arbitrary repository content
 - Declare tool success without a matching result
@@ -559,7 +548,7 @@ Hard controller rules always override either model.
 - Ambiguous/high-impact task: clarify or confirm before dispatch.
 - Low confidence: use the more conservative path.
 
-Implementation details remain OMP’s responsibility. The voice companion should not interrogate the user about files or architecture that OMP can discover safely.
+Implementation details remain the coding agent’s responsibility. The voice companion should not interrogate the user about files or architecture that the selected agent can discover safely.
 
 ### 14.2 Confirmation tiers
 
@@ -733,24 +722,24 @@ Utterance outcomes:
 Behavior:
 
 - An answer to an outstanding coder question resolves that exact request.
-- A safe clarification may use OMP `steer()`.
-- A non-urgent addition may use `followUp()` or become queued work.
+- A safe clarification uses a live session steering API when the selected backend supports one.
+- A non-urgent addition uses the backend’s follow-up mechanism when available or becomes queued work.
 - A consequential amendment sets `pauseRequested`.
-- The OMP pre-execution `tool_call` hook blocks the next tool boundary.
-- The active turn is stopped cleanly, state is persisted, impact is summarized, and a new task-spec revision is confirmed.
-- Emergency stop uses `AgentSession.abort()`.
+- Embedded OMP blocks at its pre-execution hook; external CLIs stop at the supervised process boundary.
+- State and session identity are persisted, impact is summarized, and a new task-spec revision is confirmed before resume.
+- Emergency stop aborts the embedded session or terminates the selected external process.
 
 ## 18. Concurrent workspace changes
 
 Mamachi never locks files.
 
 - VS Code reports user saves.
-- OMP tool lifecycle identifies coder writes.
+- Normalized coding-agent tool events and external-turn baselines identify coder writes.
 - Filesystem watching catches formatters and unknown processes.
 - The controller tracks content identities for the coder’s read/write set.
-- A stale anchored agent edit fails and forces OMP to reread.
+- A stale anchored agent edit fails and forces the coding agent to reread.
 - An overwrite of an existing file whose identity changed since observation is blocked.
-- OMP attempts reconciliation.
+- The selected coding agent attempts reconciliation.
 - Only an unresolved semantic conflict transitions the task to `awaitingUser`.
 
 Pre-existing user changes are never attributed to the agent and must not be overwritten merely to restore a baseline.
@@ -773,13 +762,14 @@ Persist locally:
 Do not persist:
 
 - Raw microphone audio
-- Unbounded duplicate copies of OMP tool output
+- Unbounded duplicate copies of coding-agent tool output
 - Casual conversation as coding memory without explicit capture
 
 ### 19.2 Credentials
 
-- Store provider credentials in macOS Keychain.
-- Calls go directly from the local daemon to the configured providers.
+- Reuse existing Codex, Claude Code, and OMP account logins without copying their tokens into Mamachi.
+- Store only explicitly supplied provider credentials in macOS Keychain; pass them solely to the selected local adapter.
+- Calls go directly from the local daemon or selected local coding CLI to its configured provider.
 - Never place credentials in protocol events, transcripts, model context, or diagnostics exports.
 - Protect sensitive transcript/artifact fields with an application encryption key stored in Keychain.
 
@@ -817,7 +807,7 @@ The event log is append-only. Current read models may be materialized transactio
 ## 21. Reliability invariants
 
 1. A voice/provider disconnect cannot stop or corrupt an active coding run.
-2. A coding/OMP failure cannot terminate the voice session.
+2. A coding-agent failure cannot terminate the voice session.
 3. A passive observer or policy-model failure cannot mutate task state.
 4. A duplicate command cannot duplicate a task or action.
 5. A stale confirmation cannot approve a revised action.
@@ -855,7 +845,7 @@ These are product targets to validate on real hardware and networks, not guarant
 - Overlay visibly acknowledges the hotkey within 150 ms.
 - Barge-in stops local playback within 150 ms.
 - Read-only status tool results return from local state within 100 ms before any optional observer refresh.
-- Coding dispatch returns a durable task ID without waiting for OMP startup or completion.
+- Coding dispatch returns a durable task ID without waiting for coding-agent startup or completion.
 
 ## 23. Implementation sequence
 
@@ -867,12 +857,12 @@ These are product targets to validate on real hardware and networks, not guarant
 - Snapshot/replay
 - Runnable golden-path state simulation
 
-### Slice 2: Headless OMP run
+### Slice 2: Coding-agent execution
 
-- Exact OMP dependency pin
-- Session creation and persistence
-- Raw event adapter
-- Safe pre-tool pause extension
+- Exact OMP dependency pin and embedded session adapter
+- Structured Codex CLI and Claude Code adapters
+- Backend-qualified session identity and persistence
+- Raw event normalization and safe pause boundaries
 - Headless coder-question handling
 - Current-working-tree change attribution
 

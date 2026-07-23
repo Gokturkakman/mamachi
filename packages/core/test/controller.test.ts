@@ -208,6 +208,7 @@ describe("TaskController", () => {
           Bun.randomUUIDv7(),
           taskId,
           runId,
+          "omp",
           "omp-session-1",
           "/tmp/omp-session-1.jsonl",
         ).status,
@@ -223,7 +224,8 @@ describe("TaskController", () => {
       expect(snapshot.activeTaskId).toBe(taskId);
       expect(snapshot.tasks[0]?.state).toBe("paused");
       expect(snapshot.runs[0]?.state).toBe("interrupted");
-      expect(snapshot.tasks[0]?.ompSession).toMatchObject({
+      expect(snapshot.tasks[0]?.codingSession).toMatchObject({
+        backend: "omp",
         id: "omp-session-1",
         file: "/tmp/omp-session-1.jsonl",
         recoveryBoundary: {
@@ -243,7 +245,7 @@ describe("TaskController", () => {
       snapshot = replayController.snapshot();
       expect(snapshot.tasks[0]?.state).toBe("paused");
       expect(snapshot.runs[0]?.state).toBe("interrupted");
-      expect(snapshot.tasks[0]?.ompSession?.recoveryBoundary?.unknownToolCall).toBe(true);
+      expect(snapshot.tasks[0]?.codingSession?.recoveryBoundary?.unknownToolCall).toBe(true);
       expect(replayController.recoverAfterRestart(Bun.randomUUIDv7()).status).toBe("rejected");
       replayStore.close();
     } finally {

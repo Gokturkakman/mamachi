@@ -335,14 +335,16 @@ export class MamachiIpcServer {
   async recordCoderSession(
     taskId: string,
     runId: string,
+    backend: "omp" | "codex" | "claude",
     sessionId: string,
-    sessionFile: string,
+    sessionFile: string | null,
   ): Promise<ActionResult> {
     const beforeSeq = this.#controller.snapshot().seq;
     const result = this.#controller.recordCoderSession(
       Bun.randomUUIDv7(),
       taskId,
       runId,
+      backend,
       sessionId,
       sessionFile,
     );

@@ -30,7 +30,7 @@ final class GlobalHotKey {
         let identifier = EventHotKeyID(signature: 0x4D_41_4D_41, id: 1)
         let registrationStatus = RegisterEventHotKey(
             UInt32(kVK_Space),
-            UInt32(cmdKey | shiftKey),
+            UInt32(optionKey),
             identifier,
             GetApplicationEventTarget(),
             0,
@@ -54,7 +54,7 @@ enum HotKeyError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .registrationFailed(let status):
-            "The ⌘⇧Space hotkey could not be registered (OSStatus \(status))."
+            "The ⌥Space hotkey could not be registered (OSStatus \(status))."
         }
     }
 }

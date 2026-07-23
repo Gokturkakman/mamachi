@@ -43,6 +43,66 @@ describe("controlMacComputer", () => {
     ]);
   });
 
+  test("falls through canonical aliases when the bundle lookup fails", async () => {
+    const calls: string[][] = [];
+    const run: ProcessRunner = async (argv) => {
+      calls.push([...argv]);
+      return calls.length === 3
+        ? successful()
+        : { exitCode: 1, stdout: "", stderr: "not found", timedOut: false };
+    };
+
+    await expect(
+      controlMacComputer(
+        { action: "open_application", application: "Outlook" },
+        { capabilities: ["applications"], platform: "darwin", run },
+      ),
+    ).resolves.toEqual({
+      status: "ok",
+      action: "open_application",
+      target: "Microsoft Outlook",
+    });
+    expect(calls).toEqual([
+      ["/usr/bin/open", "-b", "com.microsoft.Outlook"],
+      ["/usr/bin/open", "-a", "Outlook"],
+      ["/usr/bin/open", "-a", "Microsoft Outlook"],
+    ]);
+  });
+
+  test("inspects and activates named accessibility elements without coordinates", async () => {
+    const calls: string[][] = [];
+    const run: ProcessRunner = async (argv) => {
+      calls.push([...argv]);
+      return successful(argv[2]?.includes("outputRows") ? "AXButton\tReload\tbutton" : "ok");
+    };
+
+    await expect(
+      controlMacComputer(
+        { action: "inspect_ui", application: "Chrome" },
+        { capabilities: ["screen_observation"], platform: "darwin", run },
+      ),
+    ).resolves.toEqual({
+      status: "ok",
+      action: "inspect_ui",
+      target: "Chrome",
+      output: "AXButton\tReload\tbutton",
+    });
+    await expect(
+      controlMacComputer(
+        { action: "click_ui_element", application: "Chrome", label: "Reload", role: "AXButton" },
+        { capabilities: ["keyboard"], platform: "darwin", run },
+      ),
+    ).resolves.toEqual({
+      status: "ok",
+      action: "click_ui_element",
+      target: "Reload",
+      output: "ok",
+    });
+    expect(calls[0]?.[2]).toContain("entire contents of front window");
+    expect(calls[1]?.[2]).toContain('application process "Google Chrome"');
+    expect(calls[1]?.[2]).toContain('perform action "AXPress" of candidate');
+  });
+
   test("toggles the first running supported media app", async () => {
     const calls: string[][] = [];
     const run: ProcessRunner = async (argv) => {

@@ -159,11 +159,11 @@ enum OverlaySizePreset: String, CaseIterable, Identifiable {
         }
     }
 
-    var collapsedSide: CGFloat {
+    var collapsedSize: CGSize {
         switch self {
-        case .small: 112
-        case .medium: 144
-        case .large: 184
+        case .small: CGSize(width: 116, height: 28)
+        case .medium: CGSize(width: 152, height: 32)
+        case .large: CGSize(width: 192, height: 38)
         }
     }
 
@@ -176,7 +176,7 @@ enum OverlaySizePreset: String, CaseIterable, Identifiable {
     }
 
     var collapsedDimensions: String {
-        "\(Int(collapsedSide)) × \(Int(collapsedSide))"
+        "\(Int(collapsedSize.width)) × \(Int(collapsedSize.height))"
     }
 
     var expandedDimensions: String {

@@ -13,7 +13,7 @@ struct MamachiApp: App {
                 hideOverlay: appDelegate.hideOverlay
             )
         } label: {
-            Label("Mamachi", systemImage: appDelegate.model.isEngaged ? "waveform.circle.fill" : "waveform.circle")
+            Label(appDelegate.model.menuBarStatusText, systemImage: appDelegate.model.menuBarSystemImage)
         }
         .menuBarExtraStyle(.menu)
 

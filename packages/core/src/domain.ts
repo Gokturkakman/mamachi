@@ -18,18 +18,19 @@ export interface WorkspaceConflictRecord {
   detectedAt: string;
 }
 
-export interface OmpRecoveryBoundary {
+export interface CodingRecoveryBoundary {
   runId: string;
   reason: string;
   unknownToolCall: boolean;
   recordedAt: string;
 }
 
-export interface OmpSessionRecord {
+export interface CodingSessionRecord {
+  backend: "omp" | "codex" | "claude";
   id: string;
-  file: string;
+  file: string | null;
   boundRunId: string;
-  recoveryBoundary: OmpRecoveryBoundary | null;
+  recoveryBoundary: CodingRecoveryBoundary | null;
 }
 
 export interface SpecHistoryEntry {
@@ -51,7 +52,7 @@ export interface TaskRecord {
   updatedAt: string;
   terminalSummary: string | null;
   workspaceConflict: WorkspaceConflictRecord | null;
-  ompSession?: OmpSessionRecord | null;
+  codingSession?: CodingSessionRecord | null;
   pendingQuestion: string | null;
   specHistory: SpecHistoryEntry[];
 }
@@ -182,7 +183,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
         updatedAt: event.at,
         workspaceConflict: null,
         terminalSummary: null,
-        ompSession: null,
+        codingSession: null,
         pendingQuestion: null,
         specHistory: [
           {
@@ -294,7 +295,8 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
     }
     case "coder.sessionBound": {
       const task = requiredTask(state, requireTaskId(event));
-      task.ompSession = {
+      task.codingSession = {
+        backend: event.payload.backend,
         id: event.payload.sessionId,
         file: event.payload.sessionFile,
         boundRunId: event.payload.runId,
@@ -305,8 +307,8 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
     }
     case "coder.recoveryBoundary": {
       const task = requiredTask(state, requireTaskId(event));
-      if (task.ompSession && event.payload.sessionId === task.ompSession.id) {
-        task.ompSession.recoveryBoundary = {
+      if (task.codingSession && event.payload.sessionId === task.codingSession.id) {
+        task.codingSession.recoveryBoundary = {
           runId: event.payload.runId,
           reason: event.payload.reason,
           unknownToolCall: event.payload.unknownToolCall,

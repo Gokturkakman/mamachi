@@ -61,6 +61,22 @@ final class AppModelControlTests: XCTestCase {
         }
     }
 
+    func testOMPLoginDetectionAcceptsUsageAndNonUsageAccounts() {
+        XCTAssertTrue(CodingAgentDiscovery.ompLoginAvailable(
+            exitCode: 0,
+            output: #"{"reports":[{"provider":"openai-codex"}],"accountsWithoutUsage":[]}"#
+        ))
+        XCTAssertTrue(CodingAgentDiscovery.ompLoginAvailable(
+            exitCode: 0,
+            output: #"{"reports":[],"accountsWithoutUsage":["provider-without-metering"]}"#
+        ))
+        XCTAssertFalse(CodingAgentDiscovery.ompLoginAvailable(
+            exitCode: 1,
+            output: #"{"reports":[{"provider":"openai-codex"}]}"#
+        ))
+        XCTAssertFalse(CodingAgentDiscovery.ompLoginAvailable(exitCode: 0, output: "not json"))
+    }
+
     private func preservingComputerControlDefaults(_ body: () -> Void) {
         let defaults = UserDefaults.standard
         let priorCapabilities = defaults.object(forKey: "computerCapabilities")

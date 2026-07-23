@@ -43,6 +43,9 @@ export const computerActions = [
   "frontmost_application",
   "list_windows",
   "inspect_ui",
+  "click_ui_element",
+  "set_ui_value",
+  "select_menu_item",
   "media_play_pause",
   "media_next",
   "media_previous",
@@ -82,6 +85,11 @@ export interface ComputerControlRequest {
   application?: string;
   url?: string;
   path?: string;
+  label?: string;
+  role?: string;
+  value?: string;
+  menu?: string;
+  menuItem?: string;
   text?: string;
   key?: string;
   keys?: string[];
@@ -140,6 +148,9 @@ const actionCapabilities: Record<ComputerAction, ComputerCapability> = {
   frontmost_application: "screen_observation",
   list_windows: "screen_observation",
   inspect_ui: "screen_observation",
+  click_ui_element: "keyboard",
+  set_ui_value: "keyboard",
+  select_menu_item: "keyboard",
   media_play_pause: "applications",
   media_next: "applications",
   media_previous: "applications",
@@ -188,6 +199,11 @@ export const sensitiveComputerActions: readonly ComputerAction[] = [
 const stringFields = [
   "application",
   "url",
+  "label",
+  "role",
+  "value",
+  "menu",
+  "menuItem",
   "path",
   "text",
   "key",
@@ -420,9 +436,41 @@ function appleScriptString(value: string): string {
   return value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"");
 }
 
+const applicationBundleIdentifiers: Record<string, string> = {
+  chrome: "com.google.Chrome",
+  "google chrome": "com.google.Chrome",
+  outlook: "com.microsoft.Outlook",
+  "microsoft outlook": "com.microsoft.Outlook",
+  safari: "com.apple.Safari",
+  mail: "com.apple.mail",
+  calendar: "com.apple.iCal",
+  notes: "com.apple.Notes",
+  messages: "com.apple.MobileSMS",
+  finder: "com.apple.finder",
+  slack: "com.tinyspeck.slackmacgap",
+  spotify: "com.spotify.client",
+};
+
+const applicationDisplayNames: Record<string, string> = {
+  chrome: "Google Chrome",
+  "google chrome": "Google Chrome",
+  outlook: "Microsoft Outlook",
+  "microsoft outlook": "Microsoft Outlook",
+};
+
+function normalizedApplicationName(application: string): string {
+  return application.trim().toLowerCase().replace(/\\.app$/i, "");
+}
+
+function canonicalApplicationName(application: string): string {
+  const normalized = normalizedApplicationName(application);
+  return applicationDisplayNames[normalized] ?? application.replace(/\\.app$/i, "").trim();
+}
+
 function applicationProcess(request: ComputerControlRequest): string {
   if (!request.application) return "first application process whose frontmost is true";
-  return `application process "${appleScriptString(requiredString(request, "application", 300))}"`;
+  const application = canonicalApplicationName(requiredString(request, "application", 300));
+  return `application process "${appleScriptString(application)}"`;
 }
 
 function keyboardStatement(key: string, modifiers: readonly string[]): string {
@@ -473,6 +521,102 @@ function pointerJavaScript(request: ComputerControlRequest): string {
     default:
       throw new ComputerControlInputError(`Unsupported pointer action: ${request.action}`);
   }
+}
+
+function inspectUiScript(request: ComputerControlRequest): string {
+  const process = applicationProcess(request);
+  return [
+    'tell application "System Events"',
+    `set targetProcess to ${process}`,
+    "set frontmost of targetProcess to true",
+    "tell targetProcess",
+    "set outputRows to {}",
+    "set candidates to entire contents of front window",
+    "repeat with candidate in candidates",
+    'set candidateName to ""',
+    'set candidateDescription to ""',
+    'set candidateTitle to ""',
+    'set candidateAccessibilityDescription to ""',
+    'set candidateRole to ""',
+    "try",
+    "set candidateName to name of candidate as text",
+    "end try",
+    "try",
+    "set candidateDescription to description of candidate as text",
+    "end try",
+    "try",
+    'set candidateTitle to value of attribute "AXTitle" of candidate as text',
+    "end try",
+    "try",
+    'set candidateAccessibilityDescription to value of attribute "AXDescription" of candidate as text',
+    "end try",
+    "try",
+    "set candidateRole to role of candidate as text",
+    "end try",
+    'if candidateName is "" or candidateName is "missing value" then set candidateName to candidateTitle',
+    'if candidateName is "" or candidateName is "missing value" then set candidateName to candidateAccessibilityDescription',
+    'if candidateName is not "" or candidateDescription is not "" then',
+    'set end of outputRows to candidateRole & tab & candidateName & tab & candidateDescription',
+    "end if",
+    "if (count of outputRows) is greater than or equal to 250 then exit repeat",
+    "end repeat",
+    "end tell",
+    "end tell",
+    "set previousDelimiters to AppleScript's text item delimiters",
+    "set AppleScript's text item delimiters to ASCII character 10",
+    "set outputText to outputRows as text",
+    "set AppleScript's text item delimiters to previousDelimiters",
+    "return outputText",
+  ].join("\n");
+}
+
+function uiElementScript(
+  request: ComputerControlRequest,
+  operation: "click" | "set",
+): string {
+  const label = requiredString(request, "label", 500);
+  const role = request.role?.trim() ?? "";
+  if (role.length > 100) throw new ComputerControlInputError("role must be at most 100 characters");
+  const process = applicationProcess(request);
+  const action = operation === "click"
+    ? 'perform action "AXPress" of candidate'
+    : `set value of candidate to "${appleScriptString(requiredString(request, "value", 20_000, true))}"`;
+  return [
+    'tell application "System Events"',
+    `set targetProcess to ${process}`,
+    "set frontmost of targetProcess to true",
+    "tell targetProcess",
+    "set candidates to entire contents of front window",
+    "repeat with candidate in candidates",
+    'set candidateName to ""',
+    'set candidateDescription to ""',
+    'set candidateTitle to ""',
+    'set candidateAccessibilityDescription to ""',
+    'set candidateRole to ""',
+    "try",
+    "set candidateName to name of candidate as text",
+    "end try",
+    "try",
+    "set candidateDescription to description of candidate as text",
+    "end try",
+    "try",
+    'set candidateTitle to value of attribute "AXTitle" of candidate as text',
+    "end try",
+    "try",
+    'set candidateAccessibilityDescription to value of attribute "AXDescription" of candidate as text',
+    "end try",
+    "try",
+    "set candidateRole to role of candidate as text",
+    "end try",
+    `if (candidateName is "${appleScriptString(label)}" or candidateDescription is "${appleScriptString(label)}" or candidateTitle is "${appleScriptString(label)}" or candidateAccessibilityDescription is "${appleScriptString(label)}") and ("${appleScriptString(role)}" is "" or candidateRole is "${appleScriptString(role)}") then`,
+    action,
+    `return candidateRole & ": ${appleScriptString(label)}"`,
+    "end if",
+    "end repeat",
+    "end tell",
+    "end tell",
+    `error "No visible UI element matched ${appleScriptString(label)}"`,
+  ].join("\n");
 }
 
 async function firstRunningMediaApplication(run: ProcessRunner): Promise<"Spotify" | "Music" | null> {
@@ -543,7 +687,7 @@ export class MacComputerController {
         return this.#process(action, ["/usr/bin/open", "x-apple.systempreferences:"], "System Settings");
       case "open_application": {
         const application = requiredString(request, "application", 300);
-        return this.#process(action, ["/usr/bin/open", "-a", application], application);
+        return this.#openApplication(action, application);
       }
       case "open_url": {
         const url = requiredString(request, "url", 4_096);
@@ -558,7 +702,7 @@ export class MacComputerController {
       }
       case "activate_application":
       case "quit_application": {
-        const application = requiredString(request, "application", 300);
+        const application = canonicalApplicationName(requiredString(request, "application", 300));
         const verb = action === "activate_application" ? "activate" : "quit";
         return this.#appleScript(
           action,
@@ -567,7 +711,7 @@ export class MacComputerController {
         );
       }
       case "hide_application": {
-        const application = requiredString(request, "application", 300);
+        const application = canonicalApplicationName(requiredString(request, "application", 300));
         return this.#appleScript(
           action,
           `tell application "System Events" to set visible of application process "${appleScriptString(application)}" to false`,
@@ -598,11 +742,44 @@ export class MacComputerController {
       case "inspect_ui":
         return this.#appleScript(
           action,
-          `tell application "System Events" to tell ${applicationProcess(request)} to get entire contents of front window`,
+          inspectUiScript(request),
           request.application ?? "frontmost application UI",
           true,
           30_000,
         );
+      case "click_ui_element":
+        return this.#appleScript(
+          action,
+          uiElementScript(request, "click"),
+          request.label ?? "UI element",
+          true,
+          30_000,
+        );
+      case "set_ui_value":
+        return this.#appleScript(
+          action,
+          uiElementScript(request, "set"),
+          request.label ?? "UI element",
+          true,
+          30_000,
+        );
+      case "select_menu_item": {
+        const application = applicationProcess(request);
+        const menu = requiredString(request, "menu", 200);
+        const menuItem = requiredString(request, "menuItem", 300);
+        return this.#appleScript(
+          action,
+          [
+            'tell application "System Events"',
+            `tell ${application}`,
+            "set frontmost to true",
+            `click menu item "${appleScriptString(menuItem)}" of menu "${appleScriptString(menu)}" of menu bar item "${appleScriptString(menu)}" of menu bar 1`,
+            "end tell",
+            "end tell",
+          ].join("\n"),
+          `${menu} → ${menuItem}`,
+        );
+      }
       case "media_play_pause":
       case "media_next":
       case "media_previous": {
@@ -778,6 +955,30 @@ export class MacComputerController {
         );
       }
     }
+  }
+
+  async #openApplication(
+    action: ComputerAction,
+    application: string,
+  ): Promise<ComputerControlResult> {
+    const normalized = normalizedApplicationName(application);
+    const bundleIdentifier = applicationBundleIdentifiers[normalized];
+    const attempts: string[][] = [];
+    if (bundleIdentifier) attempts.push(["/usr/bin/open", "-b", bundleIdentifier]);
+    attempts.push(["/usr/bin/open", "-a", application]);
+    const canonical = canonicalApplicationName(application);
+    if (canonical !== application) attempts.push(["/usr/bin/open", "-a", canonical]);
+    let lastResult: ProcessResult | null = null;
+    for (const argv of attempts) {
+      const result = await this.#run(argv);
+      if (result.exitCode === 0 && !result.timedOut) return ok(action, canonical);
+      lastResult = result;
+    }
+    return failure(
+      action,
+      lastResult ?? { exitCode: 1, stdout: "", stderr: "", timedOut: false },
+      `${application} could not be found in Applications`,
+    );
   }
 
   async #appleScript(
