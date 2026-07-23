@@ -99,8 +99,10 @@ describe("controlMacComputer", () => {
       output: "ok",
     });
     expect(calls[0]?.[2]).toContain("entire contents of front window");
+    expect(calls[0]?.[2]).toContain('attribute "AXLabel"');
     expect(calls[1]?.[2]).toContain('application process "Google Chrome"');
     expect(calls[1]?.[2]).toContain('perform action "AXPress" of candidate');
+    expect(calls[1]?.[2]).toContain('attribute "AXLabel"');
   });
 
   test("toggles the first running supported media app", async () => {

@@ -63,6 +63,7 @@ interface RealtimeBridgeOptions {
   emit: (type: string, payload: unknown) => void;
   emitAudio: (pcm: Uint8Array, playback: { itemId: string; contentIndex: number }) => void;
   initiallyEngaged?: boolean;
+  reconnectDelaysMs?: readonly number[];
 }
 
 interface FunctionCall {
@@ -110,6 +111,7 @@ export class RealtimeBridge {
   readonly #model: string;
   readonly #voice: string;
   readonly #endpoint: string;
+  readonly #reconnectDelaysMs: readonly number[];
   readonly #recentActivity = new Map<string, { type: string; summary: string; at: string }>();
   readonly #pendingContext = new Map<string, CapturedContext>();
   readonly #pendingComputerControls = new Map<string, PendingComputerControl>();
@@ -120,6 +122,8 @@ export class RealtimeBridge {
   #apiKey: string | undefined;
   #socket: WebSocket | null = null;
   #manualClose = false;
+  #reconnectAttempt = 0;
+  #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   #responseActive = false;
   #responsePending = false;
   #inputActive = false;
@@ -135,12 +139,16 @@ export class RealtimeBridge {
     this.#model = options.model ?? "gpt-realtime-2.1";
     this.#voice = options.voice ?? "marin";
     this.#endpoint = options.endpoint ?? "wss://api.openai.com/v1/realtime";
+    this.#reconnectDelaysMs = options.reconnectDelaysMs?.length
+      ? options.reconnectDelaysMs
+      : [250, 1_000, 2_000, 5_000];
     this.#engaged = options.initiallyEngaged ?? true;
     for (const brief of options.initialBriefs ?? []) this.#queuedBriefs.set(brief.taskId, brief);
   }
 
   async connect(apiKey?: string): Promise<void> {
     if (apiKey) this.#apiKey = apiKey;
+    this.#cancelReconnect();
     if (!this.#apiKey) throw new Error("OpenAI Realtime requires an API key");
     if (this.#socket?.readyState === WebSocket.OPEN) return;
     if (this.#socket) await this.disconnect();
@@ -163,7 +171,8 @@ export class RealtimeBridge {
     });
     this.#socket = socket;
     socket.on("close", () => {
-      if (this.#socket === socket) this.#socket = null;
+      if (this.#socket !== socket) return;
+      this.#socket = null;
       this.#responseActive = false;
       this.#responsePending = false;
       this.#inputActive = false;
@@ -174,6 +183,7 @@ export class RealtimeBridge {
       this.#clearPendingComputerControls("provider_connection_closed");
       if (!this.#manualClose) {
         this.#options.emit("voice.state", { state: "disconnected", reason: "provider_connection_closed" });
+        this.#scheduleReconnect();
       }
     });
 
@@ -215,14 +225,16 @@ export class RealtimeBridge {
       reject(error);
     });
     await promise;
+    this.#reconnectAttempt = 0;
     for (const context of this.#pendingContext.values()) this.#injectContext(context);
     this.#flushBriefs();
   }
 
   async disconnect(): Promise<void> {
-    const socket = this.#socket;
-    if (!socket) return;
     this.#manualClose = true;
+    this.#cancelReconnect();
+    const socket = this.#socket;
+    this.#socket = null;
     this.#responseActive = false;
     this.#responsePending = false;
     this.#inputActive = false;
@@ -231,18 +243,49 @@ export class RealtimeBridge {
     this.#toolChainDepth = 0;
     this.#activeAssistantAudio = null;
     this.#lastTruncation = null;
-    this.#socket = null;
     this.#clearPendingComputerControls("voice_disconnected");
-    if (socket.readyState === WebSocket.CLOSED) return;
-    const { promise, resolve } = Promise.withResolvers<void>();
-    const timeout = setTimeout(resolve, 2_000);
-    socket.once("close", () => {
-      clearTimeout(timeout);
-      resolve();
-    });
-    socket.close(1000, "Voice disengaged");
-    await promise;
+    if (socket && socket.readyState !== WebSocket.CLOSED) {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      const timeout = setTimeout(resolve, 2_000);
+      socket.once("close", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      socket.close(1000, "Voice disengaged");
+      await promise;
+    }
     this.#options.emit("voice.state", { state: "disconnected" });
+  }
+
+  #cancelReconnect(): void {
+    if (!this.#reconnectTimer) return;
+    clearTimeout(this.#reconnectTimer);
+    this.#reconnectTimer = null;
+  }
+
+  #scheduleReconnect(): void {
+    if (this.#manualClose || this.#reconnectTimer || !this.#apiKey) return;
+    const delayIndex = Math.min(this.#reconnectAttempt, this.#reconnectDelaysMs.length - 1);
+    const delayMs = Math.max(0, this.#reconnectDelaysMs[delayIndex] ?? 5_000);
+    this.#reconnectAttempt += 1;
+    this.#options.emit("voice.state", {
+      state: "connecting",
+      reason: "provider_reconnecting",
+      attempt: this.#reconnectAttempt,
+      retryInMs: delayMs,
+    });
+    this.#reconnectTimer = setTimeout(() => {
+      this.#reconnectTimer = null;
+      if (this.#manualClose) return;
+      void this.connect().catch((error: unknown) => {
+        if (this.#manualClose) return;
+        this.#options.emit("voice.reconnect_failed", {
+          attempt: this.#reconnectAttempt,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        this.#scheduleReconnect();
+      });
+    }, delayMs);
   }
 
   appendAudio(pcm: Uint8Array): void {

@@ -61,7 +61,7 @@ The alpha does not require accounts, hosted billing, a cloud control plane, or m
 
 | Area | Decision |
 |---|---|
-| Interaction | Hybrid: a hotkey wakes or resumes a voice session; the microphone sleeps when disengaged |
+| Interaction | Hybrid: a wake gesture (double-tap for hands-free, hold for push-to-talk, tap to stop) or fallback hotkey wakes or resumes a voice session; the microphone sleeps when disengaged |
 | Dispatch | Adaptive by risk and task size |
 | Coding context visible to voice | Curated semantic event stream with artifacts fetched on demand |
 | Coding concurrency | One active coding job plus a global queue |
@@ -98,7 +98,7 @@ The alpha does not require accounts, hosted billing, a cloud control plane, or m
 ### 6.1 Included in the first usable product
 
 - Native macOS menu-bar app
-- Global hotkey and resumable duplex voice session
+- Bare-modifier wake gesture (double-tap, hold-to-talk) with `⌥Space` fallback and resumable duplex voice session
 - Floating overlay and task drawer
 - OpenAI Realtime 2.1 voice adapter
 - Local Bun/TypeScript orchestration daemon
@@ -162,7 +162,7 @@ The voice experience is hierarchical rather than one large state enum:
 
 Requirements:
 
-- The global hotkey engages or resumes the session.
+- The wake gesture engages the session: double-tapping the wake key (default Fn) enters hands-free mode, holding it past the hold threshold is push-to-talk, and a single tap while engaged barges in or sleeps the microphone. The fallback `⌥Space` hotkey toggles engagement.
 - Disengaging sleeps the microphone without stopping active coding work.
 - Barge-in stops playback immediately and removes unheard assistant audio from provider conversation history.
 - Background events never trigger speech automatically while disengaged.
@@ -174,18 +174,19 @@ Requirements:
 
 Collapsed overlay content:
 
-- Listening/thinking/speaking/working state
-- Waveform or activity visualization
-- Live transcript
-- Active repository chip
-- Active coding task status
-- Stop/disengage control
+- Slim horizontal state mark rather than a circular orb or waveform
+- Concise live state label such as Ready, Listening, Coding, Needs you, or Offline
+- Click-to-expand affordance
+- Whole-capsule drag target and right-click Open/Settings/Hide/Quit recovery controls
+
+The collapsed frame contains no invisible drawer-sized hit area. Collapsed and expanded modes share one persisted bottom-center anchor, so resizing never teleports the overlay. Expand and collapse are single-click state transitions even when the non-activating panel is not the frontmost application.
 
 The overlay must be non-activating where possible and must not steal focus from the editor for routine use.
 
 ### 8.3 Task drawer
 
 Expanded content:
+- Live conversation transcript and text composer
 
 - Current objective and task-spec revision
 - Active phase and current grounded step
@@ -772,6 +773,7 @@ Do not persist:
 - Calls go directly from the local daemon or selected local coding CLI to its configured provider.
 - Never place credentials in protocol events, transcripts, model context, or diagnostics exports.
 - Protect sensitive transcript/artifact fields with an application encryption key stored in Keychain.
+- Sign Keychain-using app builds with a persistent code-signing identity. Ad-hoc builds must warn that their changing code hash can cause macOS to ask for Keychain authorization after each rebuild.
 
 ### 19.3 Diagnostics
 
@@ -842,7 +844,7 @@ The event log is append-only. Current read models may be materialized transactio
 
 These are product targets to validate on real hardware and networks, not guarantees:
 
-- Overlay visibly acknowledges the hotkey within 150 ms.
+- Overlay visibly acknowledges the wake gesture or hotkey within 150 ms.
 - Barge-in stops local playback within 150 ms.
 - Read-only status tool results return from local state within 100 ms before any optional observer refresh.
 - Coding dispatch returns a durable task ID without waiting for coding-agent startup or completion.
@@ -918,3 +920,4 @@ These do not block the first controller slice:
 - OpenAI Realtime conversation and function-call lifecycle: https://developers.openai.com/api/docs/guides/realtime-conversations
 - OpenAI Realtime prompting guide: https://developers.openai.com/api/docs/guides/realtime-models-prompting
 - OpenAI Realtime API reference: https://developers.openai.com/api/reference/resources/realtime
+- Bun macOS single-file executable code-signing and runtime entitlements: https://bun.com/docs/guides/runtime/codesign-macos-executable

@@ -24,6 +24,8 @@ final class AppModel: ObservableObject {
     @Published var collapsedOverlaySize: OverlaySizePreset
     @Published var expandedOverlaySize: OverlaySizePreset
     @Published var interactionMode: InteractionMode
+    @Published var activationKey: ActivationKey
+    @Published var activationMonitorActive = false
     @Published var codingAgentBackend: CodingAgentBackend
     @Published private(set) var codingAgentStatuses: [CodingAgentStatus]
     @Published private(set) var codingAgentSetupInProgress = false
@@ -46,6 +48,10 @@ final class AppModel: ObservableObject {
     var onOverlaySizeChange: ((_ collapsed: OverlaySizePreset, _ expanded: OverlaySizePreset) -> Void)?
     var onHideOverlay: (() -> Void)?
     var onQuitApplication: (() -> Void)?
+    var onActivationKeyChange: (() -> Void)?
+
+    let inputLevels = AudioLevelHistory()
+    let outputLevels = AudioLevelHistory()
 
     private let daemon = DaemonProcess()
     private let ipc = IpcClient()
@@ -56,9 +62,6 @@ final class AppModel: ObservableObject {
     private var started = false
     private var pendingText: String?
     private var resumeEngagementAfterKey = false
-    private var playbackStartedAt: TimeInterval?
-    private var playbackMicrophoneBaseline = 0.0
-    private var bargeInFrames = 0
     private var playbackItemId: String?
     private var playbackContentIndex: Int?
     private var errorDismissTask: Task<Void, Never>?
@@ -109,6 +112,34 @@ final class AppModel: ObservableObject {
         return daemonConnected ? "minus" : "ellipsis"
     }
 
+    var pillState: VoicePillState {
+        if !daemonConnected {
+            return .dormant(text: errorMessage == nil ? "Starting…" : "Offline")
+        }
+        if attentionMessage != nil || pendingConfirmation != nil || activeTask?.state == "awaiting_user" {
+            return .attention(text: "Needs you")
+        }
+        if voiceState == .error { return .attention(text: voiceState.label) }
+        if isEngaged {
+            switch voiceState {
+            case .listening: return .listening
+            case .thinking: return .thinking
+            case .speaking: return .speaking
+            default: break
+            }
+        }
+        if voiceState == .connecting { return .connecting }
+        return .dormant(text: dormantPillText)
+    }
+
+    private var dormantPillText: String {
+        if activeTask != nil { return "Coding" }
+        if isEngaged { return voiceState.label }
+        if pendingBrief != nil { return "Update ready" }
+        let microphoneSleeping = interactionMode == .voice && !isEngaged && voiceState == .connected
+        return microphoneSleeping ? "Sleeping" : "Ready"
+    }
+
 
     init() {
         let defaults = UserDefaults.standard
@@ -120,6 +151,9 @@ final class AppModel: ObservableObject {
         ) ?? .medium
         defaults.removeObject(forKey: "overlayCompactSize")
         interactionMode = InteractionMode(rawValue: defaults.string(forKey: "interactionMode") ?? "") ?? .voice
+        activationKey = ActivationKey(
+            rawValue: defaults.string(forKey: "activationKey") ?? ""
+        ) ?? .fn
         codingAgentBackend = CodingAgentBackend(
             rawValue: defaults.string(forKey: "codingAgentBackend") ?? ""
         ) ?? .omp
@@ -165,15 +199,11 @@ final class AppModel: ObservableObject {
             if let error { errorMessage = error.localizedDescription }
         }
         audio.onMicrophonePCM = { [weak self] data in
-            guard
-                let self,
-                isEngaged,
-                voiceState != .speaking,
-                !audio.hasPendingPlayback
-            else { return }
+            guard let self, isEngaged else { return }
             ipc.sendAudio(data)
         }
         audio.onLevel = { [weak self] level in self?.handleMicrophoneLevel(level) }
+        audio.onPlaybackLevel = { [weak self] level in self?.outputLevels.append(level) }
         audio.onError = { [weak self] error in self?.errorMessage = "Audio playback failed: \(error.localizedDescription)" }
         audio.onPlaybackDrained = { [weak self] in self?.resumeMicrophoneIfReady() }
         reactions.onOpen = { [weak self] in
@@ -322,6 +352,31 @@ final class AppModel: ObservableObject {
         if attention || completion { reactions.requestAuthorization() }
     }
 
+    func setActivationKey(_ key: ActivationKey) {
+        activationKey = key
+        UserDefaults.standard.set(key.rawValue, forKey: "activationKey")
+        onActivationKeyChange?()
+    }
+
+    /// Maps recognizer verdicts onto engagement transitions. Wake gestures
+    /// also raise the overlay, mirroring the legacy `⌥Space` behavior.
+    func handleActivation(_ verdict: ActivationVerdict) {
+        switch verdict {
+        case .engageHandsFree, .beginPushToTalk:
+            onShowOverlay?()
+            if !isEngaged { toggleEngagement() }
+        case .endPushToTalk:
+            if isEngaged { muteMicrophone() }
+        case .tapWhileEngaged:
+            guard isEngaged else { return }
+            if voiceState == .speaking {
+                bargeIn()
+            } else {
+                muteMicrophone()
+            }
+        }
+    }
+
     func toggleEngagement() {
         if interactionMode == .text { setInteractionMode(.voice) }
         if isEngaged && voiceState == .speaking {
@@ -347,8 +402,8 @@ final class AppModel: ObservableObject {
         isEngaged = false
         audio.stopCapture()
         microphoneLevel = 0
+        inputLevels.clear()
         audio.clearPlayback()
-        resetBargeInDetection()
         if daemonConnected { ipc.reportVoiceEngagement(false, playback: playback) }
         if voiceState != .disconnected && voiceState != .error {
             voiceState = .connected
@@ -574,45 +629,14 @@ final class AppModel: ObservableObject {
 
     private func handleAudioOutput(_ data: Data) {
         guard isEngaged, playbackItemId != nil, playbackContentIndex != nil else { return }
-        if playbackStartedAt == nil {
-            playbackStartedAt = ProcessInfo.processInfo.systemUptime
-            playbackMicrophoneBaseline = 0
-            bargeInFrames = 0
-        }
         audio.play(pcm: data)
     }
 
     private func handleMicrophoneLevel(_ level: Double) {
         microphoneLevel = level
-        guard
-            isEngaged,
-            voiceState == .speaking,
-            let playbackStartedAt
-        else { return }
-
-        let elapsed = ProcessInfo.processInfo.systemUptime - playbackStartedAt
-        if elapsed < 0.55 {
-            playbackMicrophoneBaseline = playbackMicrophoneBaseline == 0
-                ? level
-                : playbackMicrophoneBaseline * 0.82 + level * 0.18
-            return
-        }
-
-        let threshold = min(0.82, max(0.09, playbackMicrophoneBaseline * 1.28 + 0.035))
-        if level > threshold {
-            bargeInFrames += 1
-        } else {
-            bargeInFrames = 0
-            playbackMicrophoneBaseline = playbackMicrophoneBaseline * 0.98 + level * 0.02
-        }
-        if bargeInFrames >= 4 { bargeIn() }
+        inputLevels.append(level)
     }
 
-    private func resetBargeInDetection() {
-        playbackStartedAt = nil
-        playbackMicrophoneBaseline = 0
-        bargeInFrames = 0
-    }
 
     private func currentPlaybackPosition() -> VoicePlaybackPosition? {
         guard
@@ -635,7 +659,6 @@ final class AppModel: ObservableObject {
 
     private func bargeIn() {
         let playback = currentPlaybackPosition()
-        resetBargeInDetection()
         audio.clearPlayback()
         ipc.interruptVoice(playback: playback)
         voiceState = .listening
@@ -832,7 +855,6 @@ final class AppModel: ObservableObject {
         case "connecting": voiceState = .connecting
         case "connected", "idle":
             voiceState = .connected
-            resetBargeInDetection()
             if let pendingText {
                 self.pendingText = nil
                 ipc.sendRequest(type: "voice.text", payload: ["text": pendingText])
@@ -842,7 +864,6 @@ final class AppModel: ObservableObject {
         case "thinking": voiceState = .thinking
         case "speaking": voiceState = .speaking
         case "disconnected":
-            resetBargeInDetection()
             voiceState = .disconnected
         default: break
         }

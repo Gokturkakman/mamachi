@@ -19,14 +19,17 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
 
     private let panel: MamachiPanel
     private let collapseHitTarget = WindowDragHandle.DragHandleView()
+    private let animationDuration: TimeInterval
     private var expanded: Bool
     private var expansionSubscription: AnyCancellable?
     private var collapsedSize: NSSize
     private var expandedSize: NSSize
     private var anchor: NSPoint?
     private var updatingFrame = false
+    private var frameAnimationGeneration = 0
 
-    init(model: AppModel) {
+    init(model: AppModel, animationDuration: TimeInterval = 0.22) {
+        self.animationDuration = animationDuration
         collapsedSize = NSSize(
             width: model.collapsedOverlaySize.collapsedSize.width,
             height: model.collapsedOverlaySize.collapsedSize.height
@@ -70,6 +73,10 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
         )
         collapseHitTarget.autoresizingMask = [.minXMargin, .minYMargin]
         collapseHitTarget.isHidden = !expanded
+        collapseHitTarget.setAccessibilityElement(true)
+        collapseHitTarget.setAccessibilityRole(.button)
+        collapseHitTarget.setAccessibilityLabel("Collapse Mamachi")
+        collapseHitTarget.setAccessibilityTitle("Collapse Mamachi")
         collapseHitTarget.onClick = { [weak model] in
             model?.drawerExpanded = false
         }
@@ -99,8 +106,22 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
     func show() {
         if !panel.isVisible {
             setFrame(for: expanded, anchor: resolvedAnchor(), display: false)
+            if animationDuration > 0,
+                !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                panel.alphaValue = 0
+                panel.orderFrontRegardless()
+                NSAnimationContext.runAnimationGroup { [panel] context in
+                    context.duration = 0.15
+                    context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    panel.animator().alphaValue = 1
+                }
+            } else {
+                panel.alphaValue = 1
+                panel.orderFrontRegardless()
+            }
+        } else {
+            panel.orderFrontRegardless()
         }
-        panel.orderFrontRegardless()
         persistAnchor()
     }
 
@@ -157,15 +178,43 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
 
     private func setFrame(for expanded: Bool, anchor requestedAnchor: NSPoint, display: Bool) {
         let target = clamp(frame(for: expanded, anchor: requestedAnchor))
+        frameAnimationGeneration += 1
+        let generation = frameAnimationGeneration
         updatingFrame = true
+        // Relax the mode pin before moving the frame; a min == max constraint
+        // fights both the instant resize and the animator.
         panel.contentAspectRatio = .zero
         panel.contentMinSize = .zero
         panel.contentMaxSize = NSSize(width: 10_000, height: 10_000)
-        panel.setFrame(target, display: display)
-        applyModeConstraints()
-        updatingFrame = false
-        anchor = frameAnchor(panel.frame)
-        persistAnchor()
+
+        let shouldAnimate = animationDuration > 0
+            && panel.isVisible
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        guard shouldAnimate else {
+            panel.setFrame(target, display: display)
+            applyModeConstraints()
+            updatingFrame = false
+            anchor = frameAnchor(panel.frame)
+            persistAnchor()
+            return
+        }
+
+        NSAnimationContext.runAnimationGroup { [panel, animationDuration] context in
+            context.duration = animationDuration
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().setFrame(target, display: true)
+        } completionHandler: { [weak self] in
+            // NSAnimationContext completions arrive on the main thread.
+            MainActor.assumeIsolated {
+                guard let self, self.frameAnimationGeneration == generation else { return }
+                // Re-pin only after the animator settles so the constraints never
+                // clamp an in-flight frame; persist from the final frame.
+                self.applyModeConstraints()
+                self.updatingFrame = false
+                self.anchor = self.frameAnchor(self.panel.frame)
+                self.persistAnchor()
+            }
+        }
     }
 
     private func applyModeConstraints() {
@@ -259,7 +308,7 @@ final class OverlayPanelController: NSObject, NSWindowDelegate {
     }
 }
 
-struct OrbContextMenuActions {
+struct OverlayContextMenuActions {
     let openTaskDrawer: () -> Void
     let openChat: () -> Void
     let openSettings: () -> Void
@@ -272,23 +321,33 @@ struct OrbContextMenuActions {
 /// press that moves performs a native window drag. Right-click is separate.
 struct WindowDragHandle: NSViewRepresentable {
     var onClick: () -> Void
-    var contextMenuActions: OrbContextMenuActions?
+    var contextMenuActions: OverlayContextMenuActions?
+    var accessibilityLabel: String? = nil
 
     func makeNSView(context: Context) -> DragHandleView {
         let view = DragHandleView()
         view.onClick = onClick
         view.contextMenuActions = contextMenuActions
+        configureAccessibility(view)
         return view
     }
 
     func updateNSView(_ view: DragHandleView, context: Context) {
         view.onClick = onClick
         view.contextMenuActions = contextMenuActions
+        configureAccessibility(view)
     }
+    private func configureAccessibility(_ view: DragHandleView) {
+        view.setAccessibilityElement(accessibilityLabel != nil)
+        view.setAccessibilityRole(.button)
+        view.setAccessibilityLabel(accessibilityLabel)
+        view.setAccessibilityTitle(accessibilityLabel)
+    }
+
 
     final class DragHandleView: NSView {
         var onClick: (() -> Void)?
-        var contextMenuActions: OrbContextMenuActions?
+        var contextMenuActions: OverlayContextMenuActions?
 
         private var pressScreenLocation: NSPoint?
         private var pressWindowOrigin: NSPoint?
@@ -297,6 +356,12 @@ struct WindowDragHandle: NSViewRepresentable {
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
             true
         }
+        override func accessibilityPerformPress() -> Bool {
+            guard let onClick else { return false }
+            onClick()
+            return true
+        }
+
 
         override func resetCursorRects() {
             addCursorRect(bounds, cursor: .pointingHand)

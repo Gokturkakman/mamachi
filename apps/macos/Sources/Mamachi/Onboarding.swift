@@ -97,6 +97,12 @@ final class OnboardingModel: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    /// Fn conflict hint for the accessibility step; nil when the wake key is
+    /// not Fn or the Globe key is already set to Do Nothing.
+    func globeKeyConflictHint() -> String? {
+        appModel.activationKey == .fn ? GlobeKeyUsage.conflictHint() : nil
+    }
+
     func refreshVSCodeStatus() {
         vscodeInstalled = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.microsoft.VSCode") != nil
         let extensions = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".vscode/extensions")
@@ -212,6 +218,7 @@ enum OnboardingError: LocalizedError {
 
 struct OnboardingView: View {
     @ObservedObject var onboarding: OnboardingModel
+    @State private var globeKeyConflict: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -262,15 +269,29 @@ struct OnboardingView: View {
 
     private var accessibilityStep: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Label("Global shortcut access", systemImage: "accessibility")
+            Label("Wake key & shortcut access", systemImage: "accessibility")
                 .font(.title2.bold())
-            Text("Accessibility permission lets Mamachi respond to its global shortcut. macOS controls this permission; Mamachi does not read other applications through it.")
+            Text("Accessibility permission lets Mamachi respond to its wake key — double-tap for hands-free voice, hold for push-to-talk. Mamachi watches only its wake key's press timing; it never reads what you type. Without this permission, only the ⌥Space shortcut works.")
+            if let hint = globeKeyConflict {
+                HStack(alignment: .top, spacing: 8) {
+                    Label(hint, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                    Spacer()
+                    Button("Open Keyboard Settings") { GlobeKeyUsage.openKeyboardSettings() }
+                        .help("Opens the macOS Keyboard settings pane")
+                }
+            }
             HStack {
                 Button("Show macOS Prompt") { onboarding.promptForAccessibility() }
                 Button("Open System Settings") { onboarding.openAccessibilitySettings() }
                 Spacer()
                 Button("Continue") { onboarding.advance() }.buttonStyle(.borderedProminent)
             }
+        }
+        .onAppear { globeKeyConflict = onboarding.globeKeyConflictHint() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            globeKeyConflict = onboarding.globeKeyConflictHint()
         }
     }
 

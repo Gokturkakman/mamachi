@@ -4,8 +4,8 @@ import XCTest
 
 @MainActor
 final class OverlayPanelControllerTests: XCTestCase {
-    func testModelPersistsCollapsedAndExpandedPresetSelections() {
-        preservingOverlayDefaults {
+    func testModelPersistsCollapsedAndExpandedPresetSelections() async {
+        await preservingOverlayDefaults {
             let model = AppModel()
             var received: (OverlaySizePreset, OverlaySizePreset)?
             model.onOverlaySizeChange = { received = ($0, $1) }
@@ -24,13 +24,13 @@ final class OverlayPanelControllerTests: XCTestCase {
         }
     }
 
-    func testSettingsPresetsControlBothModesAndIgnoreSavedFrameDimensions() {
-        preservingOverlayDefaults {
+    func testSettingsPresetsControlBothModesAndPreserveAnchor() async {
+        await preservingOverlayDefaults {
             let model = AppModel()
             model.setCollapsedOverlaySize(.small)
             model.setExpandedOverlaySize(.large)
 
-            let controller = OverlayPanelController(model: model)
+            let controller = OverlayPanelController(model: model, animationDuration: 0)
             controller.resetFrame()
             defer { controller.hide() }
             model.onOverlaySizeChange = { [weak controller] collapsed, expanded in
@@ -39,23 +39,33 @@ final class OverlayPanelControllerTests: XCTestCase {
 
             XCTAssertFalse(panel(from: controller).styleMask.contains(.resizable))
             assertPanel(controller, width: 116, height: 28)
+            let stableAnchor = panelAnchor(from: controller)
 
             model.drawerExpanded = true
+            await nextMainActorTurn()
             assertPanel(controller, width: 640, height: 800)
+            assertAnchor(controller, equals: stableAnchor)
 
             model.drawerExpanded = false
+            await nextMainActorTurn()
             assertPanel(controller, width: 116, height: 28)
+            assertAnchor(controller, equals: stableAnchor)
 
             model.setCollapsedOverlaySize(.large)
             assertPanel(controller, width: 192, height: 38)
+            assertAnchor(controller, equals: stableAnchor)
 
             model.setExpandedOverlaySize(.small)
             assertPanel(controller, width: 192, height: 38)
 
             model.drawerExpanded = true
+            await nextMainActorTurn()
             assertPanel(controller, width: 440, height: 540)
+            assertAnchor(controller, equals: stableAnchor)
             model.drawerExpanded = false
+            await nextMainActorTurn()
             assertPanel(controller, width: 192, height: 38)
+            assertAnchor(controller, equals: stableAnchor)
 
             controller.hide()
             UserDefaults.standard.set(
@@ -68,22 +78,51 @@ final class OverlayPanelControllerTests: XCTestCase {
             )
 
             let replacementModel = AppModel()
-            let replacement = OverlayPanelController(model: replacementModel)
+            let replacement = OverlayPanelController(model: replacementModel, animationDuration: 0)
             replacement.show()
             defer { replacement.hide() }
 
             assertPanel(replacement, width: 192, height: 38)
+            let replacementAnchor = panelAnchor(from: replacement)
             replacementModel.drawerExpanded = true
+            await nextMainActorTurn()
             assertPanel(replacement, width: 440, height: 540)
+            assertAnchor(replacement, equals: replacementAnchor)
         }
     }
 
-    func testOrbContextMenuProvidesRecoveryAndQuitActions() {
+    func testRapidExpansionRequestsSettleAtFinalMode() async {
+        await preservingOverlayDefaults {
+            let model = AppModel()
+            model.setCollapsedOverlaySize(.small)
+            model.setExpandedOverlaySize(.small)
+            let controller = OverlayPanelController(model: model, animationDuration: 0)
+            controller.resetFrame()
+            defer { controller.hide() }
+            let stableAnchor = panelAnchor(from: controller)
+
+            model.drawerExpanded = true
+            model.drawerExpanded = false
+            model.drawerExpanded = true
+            await nextMainActorTurn()
+            assertPanel(controller, width: 440, height: 540)
+            assertAnchor(controller, equals: stableAnchor)
+
+            model.drawerExpanded = false
+            model.drawerExpanded = true
+            model.drawerExpanded = false
+            await nextMainActorTurn()
+            assertPanel(controller, width: 116, height: 28)
+            assertAnchor(controller, equals: stableAnchor)
+        }
+    }
+
+    func testOverlayContextMenuProvidesRecoveryAndQuitActions() {
         var openedSettings = false
         var hidOverlay = false
         var quitApplication = false
         let view = WindowDragHandle.DragHandleView()
-        view.contextMenuActions = OrbContextMenuActions(
+        view.contextMenuActions = OverlayContextMenuActions(
             openTaskDrawer: {},
             openChat: {},
             openSettings: { openedSettings = true },
@@ -111,6 +150,22 @@ final class OverlayPanelControllerTests: XCTestCase {
         XCTAssertTrue(quitApplication)
     }
 
+    private func assertAnchor(
+        _ controller: OverlayPanelController,
+        equals expected: NSPoint,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let actual = panelAnchor(from: controller)
+        XCTAssertEqual(actual.x, expected.x, accuracy: 0.001, file: file, line: line)
+        XCTAssertEqual(actual.y, expected.y, accuracy: 0.001, file: file, line: line)
+    }
+
+    private func panelAnchor(from controller: OverlayPanelController) -> NSPoint {
+        let frame = panel(from: controller).frame
+        return NSPoint(x: frame.midX, y: frame.minY)
+    }
+
     private func assertPanel(
         _ controller: OverlayPanelController,
         width: CGFloat,
@@ -123,13 +178,14 @@ final class OverlayPanelControllerTests: XCTestCase {
         XCTAssertEqual(frame.height, height, accuracy: 0.001, file: file, line: line)
     }
 
-    private func preservingOverlayDefaults(_ body: () -> Void) {
+    private func preservingOverlayDefaults(_ body: () async -> Void) async {
         let defaults = UserDefaults.standard
         let keys = [
             "collapsedOverlaySizePreset",
             "expandedOverlaySizePreset",
             "overlayCompactFrame",
             "overlayExpandedFrame",
+            "overlayAnchorV2",
         ]
         let previous = Dictionary(uniqueKeysWithValues: keys.map { ($0, defaults.object(forKey: $0)) })
         keys.forEach(defaults.removeObject(forKey:))
@@ -142,7 +198,15 @@ final class OverlayPanelControllerTests: XCTestCase {
                 }
             }
         }
-        body()
+        await body()
+    }
+
+    private func nextMainActorTurn() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                continuation.resume()
+            }
+        }
     }
 
     private func panel(from controller: OverlayPanelController) -> NSPanel {

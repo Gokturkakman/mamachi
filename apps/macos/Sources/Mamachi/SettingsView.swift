@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct SettingsView: View {
@@ -10,6 +11,7 @@ struct SettingsView: View {
     @State private var fastModel: String
     @State private var thinkingLevel: String
     @State private var automaticRouting: Bool
+    @State private var globeKeyConflict: String?
 
     private let thinkingLevels = [
         ("inherit", "OMP default"),
@@ -218,8 +220,55 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Activation") {
+                Picker("Wake key", selection: activationKey) {
+                    ForEach(ActivationKey.allCases) { key in
+                        Text(key.label).tag(key)
+                    }
+                }
+                .help("Bare modifier key that wakes voice mode")
+                Text("Double-tap the wake key for hands-free voice, hold it for push-to-talk, and tap again to stop. ⌥Space always works as a fallback.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if model.activationKey != .off {
+                    if model.activationMonitorActive {
+                        HStack(spacing: 6) {
+                            Circle().fill(.green).frame(width: 8, height: 8)
+                            Text("Wake key active")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("Wake key active")
+                    } else {
+                        HStack {
+                            Label(
+                                "Needs Accessibility access — grant it in System Settings, then reopen Settings",
+                                systemImage: "exclamationmark.triangle"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            Spacer()
+                            Button("Open Accessibility Settings") { model.openAccessibilitySettings() }
+                        }
+                    }
+                }
+
+                if model.activationKey == .fn, let hint = globeKeyConflict {
+                    HStack(alignment: .top) {
+                        Label(hint, systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        Spacer()
+                        Button("Open Keyboard Settings") { GlobeKeyUsage.openKeyboardSettings() }
+                            .help("Opens the macOS Keyboard settings pane")
+                    }
+                }
+            }
+
             Section("Overlay") {
-                Picker("Collapsed orb", selection: collapsedOverlaySize) {
+                Picker("Collapsed indicator", selection: collapsedOverlaySize) {
                     ForEach(OverlaySizePreset.allCases) { preset in
                         Text(preset.label).tag(preset)
                     }
@@ -314,6 +363,10 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .scrollIndicators(.visible)
         .task { await model.refreshCodingAgentStatuses() }
+        .onAppear { globeKeyConflict = GlobeKeyUsage.conflictHint() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            globeKeyConflict = GlobeKeyUsage.conflictHint()
+        }
         .frame(width: 600, height: 760)
         .padding(8)
     }
@@ -324,6 +377,10 @@ struct SettingsView: View {
 
     private var interactionMode: Binding<InteractionMode> {
         Binding(get: { model.interactionMode }, set: model.setInteractionMode)
+    }
+
+    private var activationKey: Binding<ActivationKey> {
+        Binding(get: { model.activationKey }, set: model.setActivationKey)
     }
 
     private var collapsedOverlaySize: Binding<OverlaySizePreset> {
@@ -408,5 +465,40 @@ struct SettingsView: View {
                 sounds: $0
             ) }
         )
+    }
+}
+
+/// Reads macOS's "Press Globe key to" assignment (com.apple.HIToolbox,
+/// AppleFnUsageType: 0 = Do Nothing, 1 = Change Input Source, 2 = Show Emoji
+/// & Symbols, 3 = Start Dictation) so Fn wake-key users can be warned about
+/// gestures racing the system. Read fresh on every call — it is a cheap
+/// preference lookup and the user may change it in System Settings while
+/// Mamachi is open.
+enum GlobeKeyUsage {
+    /// Full warning text when the Globe key is bound to a system action, or
+    /// nil when it is set to Do Nothing. A missing or unrecognized preference
+    /// value yields a generic hint.
+    static func conflictHint() -> String? {
+        let remedy = "Set 'Press Globe key to' to 'Do Nothing' and disable the "
+            + "double-Fn Dictation shortcut so it doesn't race Mamachi."
+        let action: String
+        switch CFPreferencesCopyAppValue("AppleFnUsageType" as CFString, "com.apple.HIToolbox" as CFString) as? Int {
+        case 0:
+            return nil
+        case 1:
+            action = "Change Input Source"
+        case 2:
+            action = "Show Emoji & Symbols"
+        case 3:
+            action = "Start Dictation"
+        default:
+            return "macOS may bind the Globe key to a system action. \(remedy)"
+        }
+        return "macOS currently uses the Globe key for \(action). \(remedy)"
+    }
+
+    static func openKeyboardSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.Keyboard-Settings.extension") else { return }
+        NSWorkspace.shared.open(url)
     }
 }

@@ -58,13 +58,16 @@ The implementation is local-first and keeps one mutating coding job active at a 
 
 ### macOS product surface
 
-- Menu-bar lifecycle, non-conflicting global `⌥Space` hotkey, explicit Open/Hide/Quit controls, and live idle/working/attention status.
-- Non-activating, draggable Wispr-style collapsed capsule with a thin state indicator, repository/status text, and expandable Task/Chat surface.
+- Menu-bar lifecycle, Wispr-style wake gestures on a configurable bare modifier (double-tap Fn for hands-free, hold for push-to-talk, tap again to barge in or sleep) that survive terminal Secure Keyboard Entry, the global `⌥Space` hotkey as a fallback needing no Accessibility trust, explicit Open/Hide/Quit controls, and live idle/working/attention status.
+- Exact-size 116×28 non-activating collapsed pill with a live microphone waveform while listening, a playout-timed speech waveform while the assistant talks, shimmer/pulse thinking and connecting states, concise status text while dormant, whole-surface drag/open behavior, right-click recovery controls, and expandable Task/Chat surface.
 - Expanded Task/Chat drawer with live transcript, composer, current objective/step, queue, confirmations, coder questions, revision history, changed files, evidence, verification, and controls.
+- Animated collapse/expand morph from the shared bottom-center anchor (easeOut frame animation with synchronized content crossfade), sub-150 ms wake acknowledgment pop, and reduce-motion fallbacks throughout.
+- Accessibility-gated wake-key monitoring with live status in Settings, plus Globe-key conflict detection (emoji, input-source, and dictation bindings) with keyboard-settings deep links in Settings and onboarding.
 - Native notifications and optional reaction sounds for attention/completion.
 - Repository picker plus focused VS Code workspace handoff.
 - First-run onboarding requires a working coding agent, detects existing OMP/Codex/Claude logins, and offers one-click terminal installation/login. An OMP API key is an optional fallback, not a duplicate requirement.
 - OpenAI Realtime and optional coding credentials plus the application encryption key are stored in macOS Keychain; coding subscription tokens remain owned by their CLIs.
+- Local builds automatically use an available persistent Developer ID or Apple Development identity, preventing rebuilt binaries from repeatedly invalidating Keychain authorization. Explicit ad-hoc builds remain available with a warning.
 - Preview-before-export diagnostics with an allowlisted, bounded schema that excludes source, transcripts, prompts, tool arguments, credentials, and audio.
 - Privacy controls for transcript retention, credential replacement/removal, diagnostics preview/export, and overlay reset.
 - Computer control can launch arbitrary applications with common aliases and perform structured accessibility inspection, named clicks, value entry, and menu selection; the voice prompt requires minimal multi-step action chains and visible-result verification.
@@ -77,32 +80,36 @@ The implementation is local-first and keeps one mutating coding job active at a 
 - Generated protocol types/constants are consumed by both clients.
 - The standalone macOS bundle embeds the compiled daemon and the compiled VS Code extension.
 - Onboarding can install the bundled extension into the user’s VS Code extension directory.
-- Packaging supports ad-hoc or Developer ID signing plus optional notarization preflight, submission, and stapling.
+- Packaging automatically selects a persistent local signing identity when available, supports explicit ad-hoc or Developer ID modes, applies the required Bun daemon entitlements under hardened runtime, and provides optional notarization preflight, submission, and stapling.
 
 ## Verification
 
 - `bun run typecheck`: passed.
-- `bun test`: 91 passed, 0 failed across protocol, core, backend-runner, computer-control, and VS Code tests.
+- `bun test`: 92 passed, 0 failed across protocol, core, backend-runner, computer-control, and VS Code tests.
 - `apps/vscode`: typecheck and production bundle passed as part of the workspace checks/build.
-- `cd apps/macos && swift test`: 18 passed, 0 failed, including OMP-login parsing, slim-overlay sizing, context-menu recovery, snapshots, audio, privacy, and encryption.
+- `cd apps/macos && swift test`: 39 passed, 0 failed, including the wake-gesture recognizer (double-tap, hold, combo poisoning, engagement mapping), audio-level history, rapid overlay transitions, anchor invariants, OMP-login parsing, snapshots, audio, privacy, and encryption.
 - `apps/macos/build-app.sh`: produced `apps/macos/dist/Mamachi.app` with the embedded daemon and VS Code extension.
 - `codesign --verify --deep --strict --verbose=2 apps/macos/dist/Mamachi.app`: valid on disk and satisfies its designated requirement.
 - Live backend smokes: Codex completed a supervised repository task and OMP completed an authenticated provider turn. Claude’s authenticated CLI emitted the expected structured session protocol, then the local account rejected model work for insufficient credit; deterministic Claude stream/resume coverage passes.
-- Native UI smoke: onboarding detected the existing Codex login, completed without a coding API key, and transitioned to the 116×32 idle indicator. Chrome, Calendar, and Discord launched; named Chrome UI inspection and Reload activation succeeded. Outlook was not installed and returned that exact macOS error.
+- Native UI smoke: onboarding detected the existing Codex login and completed without a coding API key; the final overlay held an identical bottom-center anchor across drag, 440×540 expansion, and 116×28 collapse. Fifty immediate expand/collapse cycles completed with zero frame or input failures. Repeated launches, including after a rebuild, reached Ready with no SecurityAgent prompt. Chrome, Calendar, and Discord launched; named Chrome UI inspection and Reload activation succeeded. Outlook was not installed and returned that exact macOS error.
 
 ## External release validation still required
 
 These are environment/release gates, not missing implementation:
 
 1. Run the full voice-to-verified-change golden path with production OpenAI Realtime and each supported coding backend on clean accounts.
-2. Exercise microphone permission, `⌥Space`, VoiceOver, real speaker playback/truncation, and focused VS Code handoff on clean physical Macs.
+2. Exercise microphone permission, the Fn/Globe wake gestures (including macOS double-Fn Dictation and Globe-key conflicts plus terminal Secure Keyboard Entry), `⌥Space`, VoiceOver, real speaker playback/truncation, and focused VS Code handoff on clean physical Macs.
 3. Run the documented 10-minute conversation/reconnect and concurrent-save acceptance matrix with production providers.
 4. Sign with the team’s Developer ID certificate, submit with its notary profile, staple, and install the resulting invited-alpha artifact on a clean machine.
 
 ## Final implementation pass
 
 - Added explicit OMP, Codex, and Claude backend routing, backend-qualified session recovery, structured event normalization, and existing-login reuse.
+- Repaired legacy encrypted `coder.sessionBound` events that predate backend-qualified sessions, allowing existing local databases to start under the current protocol.
 - Reworked onboarding so setup cannot finish without a working coder, coding API keys are optional fallbacks, and setup/install/login controls are visible without scrolling.
 - Replaced the conflicting shortcut and circular collapsed orb with `⌥Space`, menu-bar activity state, explicit Open/Hide/Quit controls, and a slim state capsule.
+- Rebuilt overlay sizing around one persisted anchor and exact fixed frames; deferred `@Published` transitions avoid stale SwiftUI state, and a persistent native collapse target accepts the first click even during immediate mode changes.
 - Added arbitrary application launch aliases, accessibility UI inspection, named in-app actions, and multi-step voice-control guidance with visible-result verification.
 - Added backend/control regression coverage, protocol generation/consumer checks, reconnect replay, focused editor capture, release packaging, and end-to-end smoke coverage.
+- Defaulted local packaging to a stable signing identity so Keychain trusts the same designated requirement across rebuilds; ad-hoc fallback remains explicit and warns about repeated authorization. Hardened Developer ID builds apply the Bun runtime entitlements and launch the embedded daemon successfully.
+- Adopted the Wispr Flow interaction model: bare-modifier wake gestures (double-tap hands-free, hold-to-talk, tap-to-stop) recognized by a clock-injected state machine, a live waveform pill fed by real playout-time audio levels, an animated overlay morph, and wake-key conflict guidance in Settings and onboarding.

@@ -7,6 +7,7 @@ final class AudioService {
     var onLevel: ((Double) -> Void)?
     var onError: ((Error) -> Void)?
     var onPlaybackDrained: (() -> Void)?
+    var onPlaybackLevel: ((Double) -> Void)?
 
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
@@ -18,6 +19,7 @@ final class AudioService {
     )!
     private var converter: AVAudioConverter?
     private var capturing = false
+    private var voiceProcessingConfigured = false
     private var playbackGeneration = 0
     private var pendingPlaybackBuffers = 0
     private var scheduledPlaybackFrames: AVAudioFramePosition = 0
@@ -39,6 +41,16 @@ final class AudioService {
         player.volume = 0.62
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: wireFormat)
+        // Real-time playout loudness for the collapsed pill's waveform: tap
+        // the mixer output (what actually reaches the speaker right now, not
+        // audio as it arrives from the network) and mirror the microphone
+        // level normalization.
+        let playerNode = player
+        engine.mainMixerNode.installTap(onBus: 0, bufferSize: 1_024, format: nil) { [weak self, playerNode] buffer, _ in
+            guard playerNode.isPlaying else { return }
+            let level = Self.normalizedLevel(buffer)
+            Task { @MainActor in self?.onPlaybackLevel?(level) }
+        }
     }
 
     func startCapture() async throws {
@@ -46,6 +58,10 @@ final class AudioService {
         guard await microphoneAccess() else { throw AudioError.microphoneDenied }
 
         let input = engine.inputNode
+        if !voiceProcessingConfigured {
+            try input.setVoiceProcessingEnabled(true)
+            voiceProcessingConfigured = true
+        }
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
             throw AudioError.noInputDevice
@@ -164,14 +180,14 @@ final class AudioService {
         guard let bytes = audioBuffer.mData else { return }
         let byteCount = Int(output.frameLength) * Int(outputFormat.streamDescription.pointee.mBytesPerFrame)
         let data = Data(bytes: bytes, count: byteCount)
-        let level = Self.inputLevel(input)
+        let level = Self.normalizedLevel(input)
         Task { @MainActor [weak self] in
             self?.onMicrophonePCM?(data)
             self?.onLevel?(level)
         }
     }
 
-    nonisolated private static func inputLevel(_ buffer: AVAudioPCMBuffer) -> Double {
+    nonisolated private static func normalizedLevel(_ buffer: AVAudioPCMBuffer) -> Double {
         guard let channels = buffer.floatChannelData, buffer.frameLength > 0 else { return 0 }
         let samples = channels[0]
         let count = Int(buffer.frameLength)

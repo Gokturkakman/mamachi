@@ -18,15 +18,26 @@ struct OverlayView: View {
     @State private var composerFocusTask: Task<Void, Never>?
     @State private var surface: OverlaySurface = .conversation
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var wakeScale: CGFloat = 1.0
 
     var body: some View {
         Group {
             if model.drawerExpanded {
                 expandedPanel
+                    .transition(reduceMotion ? .opacity : .opacity.combined(
+                        with: .scale(scale: 0.96, anchor: .bottom)
+                    ))
             } else {
                 compactIndicator
+                    .transition(reduceMotion ? .opacity : .opacity.combined(
+                        with: .scale(scale: 0.90, anchor: .bottom)
+                    ))
             }
         }
+        // Content crossfade tracks the panel's 0.22 s frame morph so the
+        // pill appears to grow into the drawer instead of jump-cutting.
+        .animation(.easeOut(duration: 0.22), value: model.drawerExpanded)
         .onChange(of: model.drawerExpanded) { _, expanded in
             composerFocusTask?.cancel()
             if expanded, surface == .conversation {
@@ -43,26 +54,11 @@ struct OverlayView: View {
 
     private var compactIndicator: some View {
         ZStack {
-            HStack(spacing: 8) {
-                Capsule()
-                    .fill(compactIndicatorColor)
-                    .frame(width: 18, height: 3)
-                    .shadow(
-                        color: compactIndicatorColor.opacity(model.isEngaged ? 0.8 : 0),
-                        radius: 3
-                    )
-
-                Text(compactIndicatorText)
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-
-                Spacer(minLength: 4)
-
-                Image(systemName: "chevron.up")
-                    .font(.system(size: 8, weight: .bold))
-                    .foregroundStyle(.tertiary)
-            }
+            VoicePillView(
+                state: model.pillState,
+                inputLevels: model.inputLevels,
+                outputLevels: model.outputLevels
+            )
             .padding(.horizontal, 11)
             .allowsHitTesting(false)
 
@@ -70,7 +66,7 @@ struct OverlayView: View {
                 onClick: {
                     model.drawerExpanded = true
                 },
-                contextMenuActions: OrbContextMenuActions(
+                contextMenuActions: OverlayContextMenuActions(
                     openTaskDrawer: {
                         surface = .task
                         model.drawerExpanded = true
@@ -82,7 +78,8 @@ struct OverlayView: View {
                     openSettings: model.openSettings,
                     hideOverlay: model.hideOverlay,
                     quitApplication: model.quitApplication
-                )
+                ),
+                accessibilityLabel: "\(model.pillState.accessibilityText), \(codingStatusLabel). Open Mamachi"
             )
             .clipShape(Capsule())
         }
@@ -101,12 +98,22 @@ struct OverlayView: View {
             radius: 6,
             y: 2
         )
+        .scaleEffect(wakeScale)
+        .onChange(of: model.isEngaged) { _, engaged in
+            // PRD: visible wake acknowledgment within 150 ms of engagement.
+            guard engaged, !reduceMotion else { return }
+            wakeScale = 0.92
+            Task { @MainActor in
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.6)) {
+                    wakeScale = 1.0
+                }
+            }
+        }
         .help("Open Mamachi. Drag to move; right-click for app controls.")
-        .accessibilityLabel("\(compactIndicatorText), \(codingStatusLabel)")
-    }
-
-    private var microphoneSleeping: Bool {
-        model.interactionMode == .voice && !model.isEngaged && model.voiceState == .connected
+        .accessibilityLabel(
+            Text(verbatim: "\(model.pillState.accessibilityText), \(codingStatusLabel)")
+        )
+        .accessibilityAddTraits(.isButton)
     }
 
     private var expandedPanel: some View {
@@ -152,6 +159,8 @@ struct OverlayView: View {
         .animation(.smooth(duration: 0.3), value: model.voiceState)
         .animation(.smooth(duration: 0.3), value: model.interactionMode)
         .animation(.smooth(duration: 0.25), value: surface)
+        .animation(.smooth(duration: 0.3), value: model.errorMessage)
+        .animation(.smooth(duration: 0.3), value: model.pendingBrief == nil)
         .onExitCommand { model.drawerExpanded = false }
     }
 
@@ -241,7 +250,7 @@ struct OverlayView: View {
                 .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .help(compactOrbHelp)
+            .help(expandedOrbHelp)
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(currentHeadline)
@@ -293,7 +302,11 @@ struct OverlayView: View {
                 .fill(.secondary.opacity(0.28))
                 .frame(width: 34, height: 4)
 
-            WindowDragHandle(onClick: {}, contextMenuActions: nil)
+            WindowDragHandle(
+                onClick: {},
+                contextMenuActions: nil,
+                accessibilityLabel: "Drag Mamachi"
+            )
         }
         .frame(maxWidth: .infinity)
         .frame(height: 10)
@@ -390,8 +403,6 @@ struct OverlayView: View {
             Text(text)
                 .font(.system(size: 12))
                 .lineSpacing(3)
-                .contentTransition(.interpolate)
-                .animation(.easeOut(duration: 0.12), value: text)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -528,7 +539,7 @@ struct OverlayView: View {
         return model.interactionMode == .text ? "Type below; responses stay silent." : "Press ⌥Space to talk."
     }
 
-    private var compactOrbHelp: String {
+    private var expandedOrbHelp: String {
         if model.interactionMode == .text { return "Open silent chat" }
         return model.isEngaged ? "Sleep microphone (⌥Space)" : "Talk to Mamachi (⌥Space)"
     }
@@ -543,36 +554,12 @@ struct OverlayView: View {
         return "coder \(task.state.replacingOccurrences(of: "_", with: " "))"
     }
 
-    private var compactIndicatorText: String {
-        if !model.daemonConnected {
-            return model.errorMessage == nil ? "Starting…" : "Offline"
-        }
-        if taskNeedsAttention { return "Needs you" }
-        if model.activeTask != nil { return "Coding" }
-        if model.isEngaged { return model.voiceState.label }
-        if model.pendingBrief != nil { return "Update ready" }
-        return microphoneSleeping ? "Sleeping" : "Ready"
-    }
-
-    private var compactIndicatorColor: Color {
-        if !model.daemonConnected {
-            return model.errorMessage == nil ? .secondary : .red
-        }
-        if taskNeedsAttention { return .orange }
-        if let task = model.activeTask { return Theme.statusColor(task.state) }
-        if model.voiceState == .error { return .red }
-        return model.isEngaged ? Theme.accentA : .secondary
-    }
-
     private var taskNeedsAttention: Bool {
         model.attentionMessage != nil
             || model.pendingConfirmation != nil
             || model.activeTask?.state == "awaiting_user"
     }
 
-    private func compactOrbAction() {
-        model.drawerExpanded = true
-    }
 
     private func expandedOrbAction() {
         if model.interactionMode == .voice {

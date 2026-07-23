@@ -9,6 +9,7 @@ RUNTIME_DIR="$CONTENTS/Resources/runtime"
 SIGN_MODE="${MAMACHI_SIGN_MODE:-auto}"
 NOTARIZE="${MAMACHI_NOTARIZE:-0}"
 APP_VERSION="${MAMACHI_VERSION:-0.1.0}"
+DAEMON_ENTITLEMENTS="${MAMACHI_DAEMON_ENTITLEMENTS:-$SCRIPT_DIR/Resources/Daemon.entitlements}"
 
 fail() {
     printf 'build-app.sh: %s\n' "$*" >&2
@@ -83,6 +84,9 @@ fi
 if [[ -n "${MAMACHI_ENTITLEMENTS:-}" && ! -f "$MAMACHI_ENTITLEMENTS" ]]; then
     fail "MAMACHI_ENTITLEMENTS does not name a readable file: $MAMACHI_ENTITLEMENTS"
 fi
+if [[ ! -f "$DAEMON_ENTITLEMENTS" ]]; then
+    fail "MAMACHI_DAEMON_ENTITLEMENTS does not name a readable file: $DAEMON_ENTITLEMENTS"
+fi
 
 swift build -c release --package-path "$SCRIPT_DIR"
 BIN_DIR="$(swift build -c release --package-path "$SCRIPT_DIR" --show-bin-path)"
@@ -137,15 +141,19 @@ chmod 755 "$RUNTIME_DIR/mamachi-daemon"
 printf '{"daemonVersion":"%s"}\n' "$APP_VERSION" > "$RUNTIME_DIR/daemon-version.json"
 
 if [[ -n "$SIGN_IDENTITY" ]]; then
-    SIGN_ARGS=(--force --sign "$SIGN_IDENTITY")
+    APP_SIGN_ARGS=(--force --sign "$SIGN_IDENTITY")
+    DAEMON_SIGN_ARGS=(--force --sign "$SIGN_IDENTITY")
     if [[ "$SIGN_MODE" == "developer-id" || "$NOTARIZE" == "1" ]]; then
-        SIGN_ARGS+=(--options runtime --timestamp)
+        APP_SIGN_ARGS+=(--options runtime --timestamp)
+        DAEMON_SIGN_ARGS+=(--options runtime --timestamp --entitlements "$DAEMON_ENTITLEMENTS")
+    elif [[ -n "${MAMACHI_DAEMON_ENTITLEMENTS:-}" ]]; then
+        DAEMON_SIGN_ARGS+=(--entitlements "$DAEMON_ENTITLEMENTS")
     fi
     if [[ -n "${MAMACHI_ENTITLEMENTS:-}" ]]; then
-        SIGN_ARGS+=(--entitlements "$MAMACHI_ENTITLEMENTS")
+        APP_SIGN_ARGS+=(--entitlements "$MAMACHI_ENTITLEMENTS")
     fi
-    codesign "${SIGN_ARGS[@]}" "$RUNTIME_DIR/mamachi-daemon"
-    codesign "${SIGN_ARGS[@]}" "$APP_DIR"
+    codesign "${DAEMON_SIGN_ARGS[@]}" "$RUNTIME_DIR/mamachi-daemon"
+    codesign "${APP_SIGN_ARGS[@]}" "$APP_DIR"
     codesign --verify --deep --strict "$APP_DIR"
 fi
 

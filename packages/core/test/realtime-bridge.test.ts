@@ -248,6 +248,91 @@ describe("RealtimeBridge", () => {
     expect(emitted.at(-1)).toEqual({ type: "voice.state", payload: { state: "disconnected" } });
   });
 
+  test("reconnects after the provider closes and accepts the next turn", async () => {
+    const emitted: Array<{ type: string; payload: unknown }> = [];
+    const connectionIds = new Map<ServerWebSocket<MockClientData>, number>();
+    const reconnected = Promise.withResolvers<void>();
+    const turnAfterReconnect = Promise.withResolvers<void>();
+    let firstClient: ServerWebSocket<MockClientData> | undefined;
+    let connectionCount = 0;
+
+    server = Bun.serve<MockClientData>({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request, bunServer) {
+        const upgraded = bunServer.upgrade(request, { data: { authenticated: true } });
+        return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
+      },
+      websocket: {
+        open(socket) {
+          connectionCount += 1;
+          connectionIds.set(socket, connectionCount);
+          if (connectionCount === 1) firstClient = socket;
+        },
+        message(socket, message) {
+          if (typeof message !== "string") return;
+          const event = JSON.parse(message) as Record<string, unknown>;
+          const connectionId = connectionIds.get(socket);
+          if (event["type"] === "session.update") {
+            socket.send(JSON.stringify({
+              type: "session.updated",
+              session: { id: `session_reconnect_${connectionId}` },
+            }));
+            if (connectionId === 2) reconnected.resolve();
+          } else if (
+            connectionId === 2 &&
+            event["type"] === "conversation.item.create" &&
+            JSON.stringify(event).includes("Still listening after reconnect")
+          ) {
+            turnAfterReconnect.resolve();
+          }
+        },
+        close(socket) {
+          connectionIds.delete(socket);
+        },
+      },
+    });
+
+    const bridge = new RealtimeBridge({
+      apiKey: "test-realtime-key",
+      endpoint: `ws://127.0.0.1:${server.port}/realtime`,
+      reconnectDelaysMs: [5],
+      getWorkspace: () => "/tmp/mamachi-workspace",
+      getSnapshot: () => ({
+        seq: 0,
+        activeTaskId: null,
+        queue: [],
+        tasks: [],
+        runs: [],
+        confirmations: [],
+      }),
+      executeCommand: async () => ({ status: "accepted", eventId: Bun.randomUUIDv7() }),
+      emit: (type, payload) => emitted.push({ type, payload }),
+      emitAudio: () => {},
+    });
+
+    await bridge.connect();
+    firstClient?.close(1012, "Provider session rotated");
+    await reconnected.promise;
+    bridge.sendText("Still listening after reconnect");
+    await turnAfterReconnect.promise;
+
+    expect(connectionCount).toBe(2);
+    expect(emitted).toContainEqual({
+      type: "voice.state",
+      payload: { state: "disconnected", reason: "provider_connection_closed" },
+    });
+    expect(
+      emitted.filter(
+        (event) => event.type === "voice.state" && isRecord(event.payload) && event.payload["state"] === "connected",
+      ),
+    ).toHaveLength(2);
+
+    await bridge.disconnect();
+    await Bun.sleep(20);
+    expect(connectionCount).toBe(2);
+  });
+
   test("wait_for_user ends the response chain", async () => {
     let client: ServerWebSocket<MockClientData> | undefined;
     const idle = Promise.withResolvers<void>();

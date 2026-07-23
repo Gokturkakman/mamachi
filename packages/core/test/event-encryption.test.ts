@@ -119,4 +119,70 @@ describe("encrypted event persistence", () => {
     }
   });
 
+  test("repairs encrypted OMP session events written before backend selection", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mamachi-session-backend-migration-"));
+    const path = join(directory, "state.sqlite");
+    const eventId = Bun.randomUUIDv7();
+    const taskId = Bun.randomUUIDv7();
+    const runId = Bun.randomUUIDv7();
+    try {
+      const initialized = new EventStore(path, { encryptionKey });
+      initialized.close();
+
+      const legacy = new Database(path, { strict: true });
+      legacy
+        .query(`
+          INSERT INTO events(
+            id, at, type, actor, project_id, task_id, run_id,
+            correlation_id, caused_by, payload_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          eventId,
+          new Date(0).toISOString(),
+          "coder.sessionBound",
+          "coder",
+          null,
+          taskId,
+          runId,
+          eventId,
+          null,
+          JSON.stringify({
+            sessionId: "legacy-omp-session",
+            sessionFile: "/tmp/legacy-omp-session.jsonl",
+            runId,
+          }),
+        );
+      legacy.close();
+
+      const migrated = new EventStore(path, { encryptionKey });
+      const [event] = migrated.readAfter();
+      expect(event?.type).toBe("coder.sessionBound");
+      if (!event || event.type !== "coder.sessionBound") {
+        throw new Error("Expected migrated coder.sessionBound event");
+      }
+      expect(event.payload.backend).toBe("omp");
+      migrated.close();
+
+      const stored = new Database(path, { strict: true });
+      const payload = stored
+        .query<{ payload_json: string }, [string]>(
+          "SELECT payload_json FROM events WHERE id = ?",
+        )
+        .get(eventId)?.payload_json;
+      expect(payload?.startsWith("mamachi:aes256gcm:v1:")).toBe(true);
+      stored.close();
+
+      const reopened = new EventStore(path, { encryptionKey });
+      const replayed = reopened.readAfter()[0];
+      expect(replayed?.type).toBe("coder.sessionBound");
+      if (replayed?.type === "coder.sessionBound") {
+        expect(replayed.payload.backend).toBe("omp");
+      }
+      reopened.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
 });
