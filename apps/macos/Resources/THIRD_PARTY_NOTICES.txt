@@ -1,9 +1,86 @@
+Mamachi is licensed under the MIT License. This file lists third-party
+components redistributed inside the Mamachi.app bundle.
+
+================================================================================
+
 thinking-orbs
 https://github.com/Jakubantalik/thinking-orbs
 
 MIT License
 
 Copyright (c) 2026 Jakub Antalik
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+
+Bun
+https://github.com/oven-sh/bun
+
+Bun itself is MIT-licensed. Contents/Resources/runtime/mamachi-daemon is a Bun
+single-file executable and therefore embeds the Bun runtime.
+
+Bun statically links JavaScriptCore and WebCore files from WebKit, which are
+LGPL-2 licensed. Per LGPL-2, a user must be able to modify that library and
+relink the application. The patched WebKit used by Bun is published at
+https://github.com/oven-sh/webkit, and the relinking procedure, together with
+the complete list of libraries Bun statically links and their licenses, is
+documented in https://github.com/oven-sh/bun/blob/main/LICENSE.md.
+
+================================================================================
+
+@oh-my-pi/pi-coding-agent, @oh-my-pi/pi-agent-core and their @oh-my-pi/*
+dependencies
+https://github.com/can1357/oh-my-pi
+
+MIT License
+
+Copyright (c) Can Boluk
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+
+ws
+https://github.com/websockets/ws
+
+MIT License
+
+Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
+Copyright (c) 2013 Arnout Kazemier and contributors
+Copyright (c) 2016 Luigi Pinca and contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

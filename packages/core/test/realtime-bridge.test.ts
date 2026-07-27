@@ -149,6 +149,7 @@ describe("RealtimeBridge", () => {
       "inspect_workspace",
       "research_web",
       "set_overlay",
+      "look_at_screen",
       "control_computer",
       "resolve_computer_control",
       "mute_mamachi",

@@ -1,9 +1,13 @@
-# Mamachi Product Requirements Document
+# Mamachi Product Requirements
 
-**Status:** Initial product and architecture baseline  
-**Date:** 2026-07-22  
-**Audience:** Product, design, and engineering  
-**Initial release:** Small invited macOS alpha
+**Status:** Product and architecture baseline
+**Audience:** Anyone building on, contributing to, or evaluating Mamachi
+**Scope:** macOS desktop, local-first
+
+> This is the design document the implementation is measured against. It states
+> intent and invariants, not shipped status. For what actually exists today, see
+> [status.md](./status.md); for how the code is laid out, see
+> [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## 1. Summary
 
@@ -34,20 +38,20 @@ This separation should make long coding tasks feel collaborative without allowin
 6. **Act naturally, gate by consequence.** Low-risk actions may proceed; ambiguous or consequential actions require confirmation.
 7. **Keep the source local.** Only provider-bound context leaves the machine.
 8. **Do not commandeer the workspace.** No automatic commits, branch switches, file locks, or overwriting pre-existing user work.
-9. **Prefer one clear execution path.** The alpha supports one active mutating coding job globally.
+9. **Prefer one clear execution path.** Mamachi runs one active mutating coding job globally.
 10. **Preserve user intent.** Task revisions are explicit, versioned, and attributable.
 
-## 4. Target user and release
+## 4. Target user and release baseline
 
 ### 4.1 Initial user
 
 A macOS user who works in VS Code and already uses Codex, Claude Code, or OMP. Setup must not assume familiarity with terminal installation, provider credentials, or Mamachi’s internal stack.
 
-### 4.2 Alpha audience
+### 4.2 Release baseline
 
-A small invited group. The alpha must include:
+A build is considered usable by someone other than its author only when it has:
 
-- Signed and notarized macOS builds
+- Signed macOS builds, so Keychain authorization survives rebuilds
 - First-run microphone, notification, Accessibility, and editor integration setup
 - macOS Keychain credential storage
 - Local diagnostics export
@@ -55,7 +59,9 @@ A small invited group. The alpha must include:
 - Crash recovery
 - Safe defaults and an inspectable local audit trail
 
-The alpha does not require accounts, hosted billing, a cloud control plane, or multi-device synchronization.
+Mamachi requires no account, no hosted billing, no cloud control plane, and no
+multi-device synchronization. It is a local application that talks directly to
+the providers you configure.
 
 ## 5. Decisions made
 
@@ -116,7 +122,7 @@ The alpha does not require accounts, hosted billing, a cloud control plane, or m
 - Visual high-impact approval cards
 - Recovery after app or daemon restart
 
-### 6.2 Explicit non-goals for the invited alpha
+### 6.2 Explicit non-goals
 
 - Windows or Linux clients
 - iOS or web clients
@@ -223,7 +229,7 @@ Rules:
 
 ### 8.5 Explicit editor context
 
-The workspace identity may be inferred automatically. Source content may cross into a request only through an explicit gesture or phrase such as “use what I’m looking at.” Supported alpha attachments:
+The workspace identity may be inferred automatically. Source content may cross into a request only through an explicit gesture or phrase such as “use what I’m looking at.” Supported attachments:
 
 - Active file
 - Current selection
@@ -837,7 +843,7 @@ The event log is append-only. Current read models may be materialized transactio
 
 ### 22.2 Quality
 
-- No false completion or verification claims in the alpha evaluation set.
+- No false completion or verification claims in the evaluation set.
 - No task dispatch from explicitly hypothetical or side-conversation examples.
 - No stale or reused confirmation accepted.
 - No raw audio retained.
@@ -895,7 +901,7 @@ These are product targets to validate on real hardware and networks, not guarant
 - VS Code workspace/context extension
 - Notifications, approvals, and deep links
 
-### Slice 6: Invited-alpha hardening
+### Slice 6: Release hardening
 
 - Signed/notarized packaging
 - Migrations and recovery testing
@@ -910,7 +916,7 @@ These do not block the first controller slice:
 - Final product name and visual identity
 - Default OpenAI voice and user voice selection UI
 - Default coding and fast-model profiles
-- Exact updater/distribution mechanism for invited builds
+- Exact updater and distribution mechanism for signed builds
 - Retention/clear UI granularity for transcripts versus task history
 - Whether later releases add per-project scheduler limits or isolated worktrees
 
