@@ -150,10 +150,10 @@ neither bridge.
 5. Wire `daemon.ts`: `activeVoice()` and the engine-switch branch of the
    settings-update hook.
 
-> **Copy `CascadeBridge`, not `RealtimeBridge`.** `RealtimeBridge` predates the
-> shared toolkit and carries a private near-duplicate of all 22 tools. It is
-> legacy and is being migrated. Until then, any change to the tool surface must
-> land in **both** `voice-toolkit.ts` and `realtime-bridge.ts`.
+Both bridges build the same canonical 23-tool surface from
+`createVoiceToolkit`. Choose the existing bridge whose transport most resembles
+yours, and include the shared parity assertion from the bridge tests so an
+engine cannot silently omit a tool.
 
 Non-obvious requirements your engine must get right:
 
@@ -203,13 +203,12 @@ the backoff sequence.
 
 - **Close a gap in [ARCHITECTURE §11](docs/ARCHITECTURE.md#11-design-vs-implementation).**
   Each entry is a real, scoped, verifiable piece of work.
-- **`MAMACHI_VERSION` does not version the app bundle.** `Info.plist` hardcodes
-  `0.1.0`; `build-app.sh` should rewrite it.
-- **No app icon** is produced or copied.
+- **External-backend live steering.** Codex and Claude persist and resume
+  sessions, but `askCoder` / `steer` / `followUp` are still OMP-only.
+- **Login-item integration or an automatic updater.** Releases currently use an
+  explicit, documented manual update path.
 - **Policy ladder coverage.** New destructive patterns are easy to add and easy
   to test; mind the first-match ordering.
-- **`Info.plist` has no `NSAppleEventsUsageDescription`** although an
-  `apple_script` computer-control capability is exposed in Settings.
 
 ## Protocol changes
 

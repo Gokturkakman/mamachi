@@ -79,8 +79,9 @@ Mamachi is what we reach for when we *don't* want to sit there:
   fast tasks so "what does this module do" doesn't consume the mutating slot.
 
 What we deliberately do *not* use it for: unattended work. Mamachi never
-commits, never switches branches, never opens a PR, and never overwrites a file
-you were already editing. It edits the working tree and stops.
+switches branches, publishes, deploys, or opens a PR unless the accepted task
+explicitly authorizes that exact effect. Commits likewise require an explicit
+task constraint; ordinary work edits the working tree and stops.
 
 ---
 
@@ -88,19 +89,14 @@ you were already editing. It edits the working tree and stops.
 
 Near-term direction, roughly in order:
 
-1. **One voice tool surface.** `packages/core/src/voice-toolkit.ts` is canonical
-   (23 tools). `RealtimeBridge` still carries a near-duplicate 22-tool copy;
-   collapsing the two is the largest outstanding cleanup and blocks clean
-   third-engine support.
-2. **Signed, distributable builds.** Packaging, hardened-runtime entitlements,
-   and notarization already work; what is missing is a versioned bundle, an
-   icon, and an update path.
-3. **Editor-neutral clients.** The protocol is already editor-agnostic and
+1. **Published, clean-machine releases.** Versioned Developer ID packaging,
+   notarization, icons, checksums, and a manual update policy are implemented;
+   production-provider and fresh-machine acceptance remain release gates.
+2. **Editor-neutral clients.** The protocol is already editor-agnostic and
    codegen'd; the VS Code extension is just the first consumer.
-4. **Daemon supervision from the app.** The daemon recovers its own state after
-   a restart, but the app does not currently restart or re-attach to a crashed
-   daemon.
-5. **More backends and more engines.** Both are documented extension points —
+3. **External-backend live steering.** Codex and Claude sessions persist and
+   resume, but in-turn `askCoder` / `steer` / `followUp` remain OMP-only.
+4. **More backends and more engines.** Both are documented extension points —
    see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 Explicit non-goals: Windows/Linux clients, cloud workspaces, hosted accounts or
@@ -249,13 +245,16 @@ say so. An unknown in-flight tool call is never replayed.
 ## Privacy
 
 - Raw microphone audio is never persisted.
-- Text transcripts stay local until you clear them.
-- With an encryption key configured, event payloads, commands, artifacts,
-  evidence, observer notes, memories, and queued briefs are AES-256-GCM
-  encrypted at rest, bound per row and column. The macOS app always supplies a
-  Keychain-backed key. **A bare `bun run daemon` with no key stores plaintext.**
-- Credentials live in the macOS Keychain and are stripped from the daemon's
-  environment before any coding CLI is spawned.
+- Text transcripts stay local and are bounded to 30 days, 1,000 entries, and
+  1 MB of text; you can clear them immediately at any time.
+- Event payloads, commands, artifacts, evidence, observer notes, memories,
+  queued briefs, and native transcripts are AES-256-GCM encrypted at rest,
+  bound per row and column. The app uses a Keychain-backed key; a headless
+  daemon creates a private persistent key beside its SQLite file unless
+  `MAMACHI_ALLOW_PLAINTEXT=1` is explicitly set.
+- Credentials live in the macOS Keychain or their coding CLI's own login store.
+  Known secrets are removed before children spawn; external backends receive no
+  unrelated provider keys.
 - Diagnostics export is preview-first and allowlisted: no source, no
   transcripts, no prompts, no tool arguments, no credentials, no audio.
 - The daemon accepts editor *metadata* by default. File contents, selections,

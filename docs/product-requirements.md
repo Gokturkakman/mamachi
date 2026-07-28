@@ -79,7 +79,7 @@ the providers you configure.
 | Mid-flight steering | Risk-aware: direct clarifications, confirmed consequential amendments, unrelated work queued |
 | UI | Minimal overlay plus expandable task drawer |
 | Coding permissions | Trust normal in-repository coding; escalate exact/high-impact effects |
-| Memory | Persist confirmed task facts and explicit memories; full local transcript remains until manually cleared |
+| Memory | Persist confirmed task facts and explicit memories; bound local transcripts by age, count, and size with immediate manual clearing |
 | Workspace targeting | Focused VS Code workspace, pinned repository fallback, visible repository chip |
 | Prototype goal | Request-to-change, concurrent conversation/status, and safe course correction in one demo |
 | Workspace mutation | Edit the current working tree directly; never commit or switch branches unless the accepted task explicitly asks for that exact effect |
@@ -762,7 +762,7 @@ Pre-existing user changes are never attributed to the agent and must not be over
 Persist locally:
 
 - Repositories and workspace identities
-- Voice transcript history until manually cleared
+- Voice transcript history within the local retention policy, with manual clear
 - Intent drafts and task-spec revisions
 - Commands, domain events, and approvals
 - Run state and recovery metadata
@@ -917,7 +917,7 @@ These do not block the first controller slice:
 - Default OpenAI voice and user voice selection UI
 - Default coding and fast-model profiles
 - Exact updater and distribution mechanism for signed builds
-- Retention/clear UI granularity for transcripts versus task history
+- Whether task history needs a separate retention policy from transcripts
 - Whether later releases add per-project scheduler limits or isolated worktrees
 
 ## 25. Source references

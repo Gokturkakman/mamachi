@@ -516,17 +516,15 @@ Executable resolution: `MAMACHI_CODEX_PATH`/`MAMACHI_CLAUDE_PATH` → `Bun.which
 `/opt/homebrew/bin`, `/usr/local/bin`, `~/.nvm/versions/node/*/bin`.
 
 ```
-codex   exec --json --sandbox workspace-write [--add-dir <repo>/.git]
-        --skip-git-repo-check [--model M] -
-codex   exec resume --json --skip-git-repo-check [--model M] <sessionId> -
-claude  -p --output-format stream-json --verbose --permission-mode auto
-        --append-system-prompt <str> [--model M] [--resume <sessionId>]
+codex   exec --json + workspace-write sandbox + PreToolUse hook
+claude  -p --output-format stream-json + PreToolUse hook
 ```
 
 Prompt on stdin, NDJSON on stdout, `NO_COLOR=1`/`TERM=dumb`. Session ids are
-persisted and resumed in the original repository. These backends keep their own
-native sandbox and permission enforcement; Mamachi stops them at supervised
-process boundaries rather than per tool call.
+persisted and resumed in the original repository. Each turn starts an
+authenticated loopback policy service; native `PreToolUse` hooks synchronously
+submit every proposed tool call to `assessToolCall` and deny on service failure.
+The CLIs retain their native workspace sandbox as a second boundary.
 
 `--add-dir <repo>/.git` appears only for an explicit commit task — a
 deliberate, narrow escalation.
@@ -578,23 +576,20 @@ Realtime API also accepts — one definition serves both engines.
 
 **`CascadeBridge implements VoiceBridge`** — ElevenLabs Scribe v2 Realtime STT →
 OpenAI Responses (`gpt-5.5`, reasoning effort `none`) → ElevenLabs Flash v2.5
-TTS. It builds its toolkit from `createVoiceToolkit` in the constructor. **This
-is the reference adapter to copy.**
+TTS.
 
-**`RealtimeBridge`** — OpenAI Realtime WebSocket, 24 kHz duplex PCM, server VAD,
-`create_response: false` so the bridge drives generation itself. It does *not*
-declare `implements` (its `connect` takes an `apiKey` string rather than
-`VoiceConnectKeys`) and it carries a near-verbatim **private copy** of the tool
-surface instead of using `voice-toolkit.ts`.
+**`RealtimeBridge implements VoiceBridge`** — OpenAI Realtime WebSocket, 24 kHz
+duplex PCM, server VAD, `create_response: false` so the bridge drives generation
+itself.
 
-> **The toolkit is canonical; the realtime copy is legacy.** Until the migration
-> lands, a change to the tool surface must be made in *both* files. This is the
-> largest outstanding cleanup in the codebase.
+Both construct the canonical toolkit once with `createVoiceToolkit`; provider
+transport, audio/history behavior, and conversion between provider function
+calls and `VoiceToolkit.execute` stay inside each bridge.
 
 ### 6.3 The tool surface (`voice-toolkit.ts`)
 
-23 tools. `RealtimeBridge` exposes 22 — the same list minus
-`capture_screen_context`.
+23 tools, exposed identically by both engines and pinned by cross-engine parity
+tests.
 
 | Tool | Mutates controller state |
 |---|---|
@@ -674,6 +669,10 @@ SwiftPM, Swift tools 6.0, `.macOS(.v14)`, no external package dependencies.
 the bundle (or `MAMACHI_DAEMON_PATH`), injects the token, port `0`, encryption
 key, provider keys, and CLI paths, then parses the `mamachi.ready` stdout line
 for the ephemeral port and token.
+After readiness it drains both pipes, watches termination, and relaunches with
+bounded backoff. Each successful restart publishes a fresh port/token to
+`AppModel`, which reconnects IPC and requests a state replay. Repeated early
+crashes exhaust the restart budget and become a visible terminal failure.
 
 **Wake gestures.** `ActivationKey` defaults to `.fn`. `ActivationGestureMachine`
 uses `doubleTapWindow = 0.35 s` and `holdThreshold = 0.25 s`. Double-tap engages
@@ -688,10 +687,9 @@ the design. `KeyActivationMonitor` requires `AXIsProcessTrusted()`; without it,
 ⌥Space still works.
 
 **Permissions.** Microphone (degrades to text mode), Notifications (degrades to
-in-app state only), Accessibility (degrades to ⌥Space only). Screen Recording,
-Apple Events, and Full Disk Access are *not* requested — note that
-`Info.plist` has no `NSAppleEventsUsageDescription` even though an
-`apple_script` computer-control capability is exposed in Settings.
+in-app state only), Accessibility (degrades to ⌥Space only). The bundle declares
+its Apple Events purpose for explicitly enabled `apple_script` control. Screen
+Recording and Full Disk Access are not requested.
 
 ### 7.1 Packaging (`build-app.sh`)
 
@@ -703,6 +701,7 @@ Mamachi.app/Contents/
   Info.plist
   MacOS/Mamachi
   Resources/THIRD_PARTY_NOTICES.txt
+  Resources/AppIcon.icns
   Resources/runtime/mamachi-daemon        (Bun single-file, entitled)
   Resources/runtime/daemon-version.json
   Resources/vscode-extension/package.json
@@ -719,8 +718,11 @@ ad-hoc signs. The daemon binary alone receives `Daemon.entitlements`
 `disable-executable-page-protection`, `allow-dyld-environment-variables`,
 `disable-library-validation`) because Bun JITs.
 
-Known gap: `MAMACHI_VERSION` writes `daemon-version.json` only. The bundle
-version stays `0.1.0`, hardcoded in `Info.plist`.
+`VERSION` is canonical. `scripts/check-version.ts` keeps package manifests and
+the source plist aligned; `build-app.sh` writes the selected version and build
+number into the assembled plist and daemon diagnostics. `release-app.sh`
+requires Developer ID and notary credentials, staples the bundle, and emits a
+versioned archive plus SHA-256 checksum.
 
 ---
 
@@ -756,10 +758,7 @@ through an explicit capture command.
 ## 9. Testing
 
 ```bash
-bun run typecheck                   # tsc --noEmit across the workspace
-bun test                            # protocol + core + vscode
-swift test --package-path apps/macos
-cd packages/protocol && bun run bindings:check
+bun run check                       # typecheck + versions + TS/Swift tests + protocol drift
 ```
 
 The suites are behavioral: they pin the completion gate rejecting cross-run
@@ -806,18 +805,11 @@ implemented as written:
    `FactProjector`.
 3. **Eight relational tables are created and never used** — see [§4.6](#46-persistence).
    Intent drafts have no implementation anywhere.
-4. **Encryption is opt-in at the daemon level.** With no key, everything is
-   plaintext. Only the macOS app guarantees a key.
-5. **The app does not supervise a crashed daemon.** The daemon recovers its own
-   state on restart, but nothing relaunches or re-attaches to it; the
-   post-ready termination handler is inert.
-6. **`steerCoder` / `followUpCoder` are wired in `daemon.ts` but no voice tool
+4. **`steerCoder` / `followUpCoder` are wired in `daemon.ts` but no voice tool
    calls them.** Dead capability today.
-7. **External backends return `false` from `askCoder`/`steer`/`followUp`.**
+5. **External backends return `false` from `askCoder`/`steer`/`followUp`.**
    Live steering is an OMP-only capability; external CLIs stop at process
    boundaries instead.
-8. **Transcript retention is manual only** — a Clear button, no age, size, or
-   count policy.
 
 Keep this list honest. If you close one of these, delete the entry in the same
 pull request.

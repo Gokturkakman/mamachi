@@ -24,11 +24,8 @@ while coding runs.
 Reproduce with:
 
 ```bash
-bun run typecheck                                  # clean
-bun test                                           # 128 pass, 0 fail, 21 files
-swift test --package-path apps/macos               # 43 pass, 0 fail
-cd packages/protocol && bun run bindings:check     # no drift
-bun run macos:build                                # produces a signed .app
+bun run check                                      # 134 Bun + 48 Swift pass; no drift
+MAMACHI_SIGN_MODE=adhoc bun run macos:build        # signed .app
 ```
 
 Those are deterministic suites — in-memory SQLite, mock provider servers,
@@ -59,8 +56,11 @@ is exercised manually and is **not** covered by automated tests.
   stale clients.
 - AES-256-GCM field encryption with per-row/column AAD binding, covering event
   and command payloads, context artifacts, evidence, observer notes, memories,
-  queued briefs, and native transcripts. Legacy plaintext rows upgrade when a
-  key first becomes available.
+  queued briefs, and native transcripts. The app uses Keychain; headless mode
+  creates and reuses a `0600` key beside SQLite. Legacy plaintext rows upgrade
+  when a key first becomes available.
+- Native transcript history is pruned on read and write to 30 days, 1,000
+  entries, and 1 MB of text.
 - Repair pass for `coder.sessionBound` events written before multi-backend
   support, so pre-existing databases still replay.
 
@@ -70,7 +70,9 @@ is exercised manually and is **not** covered by automated tests.
   coder questions, and final-summary integration; tool calls intercepted
   **before** execution.
 - Codex CLI and Claude Code driven non-interactively over their structured JSON
-  streams, using the user's existing login and native configuration.
+  streams, using the user's existing login and native configuration. Their
+  native `PreToolUse` hooks synchronously consult Mamachi's authenticated local
+  policy service and fail closed if it is unavailable.
 - Backend choice is explicit and persisted. Backend-qualified session ids resume
   in the original repository after an accepted pause or a restart. Mamachi never
   silently falls back to another agent or account.
@@ -83,8 +85,8 @@ is exercised manually and is **not** covered by automated tests.
   coder answer not grounded verbatim in the current user turn.
 - Equivalent in-flight research is deduplicated; substantive coding work is
   ordered ahead of queued fast/research tasks.
-- Provider keys, the encryption key, and the IPC token are stripped from the
-  environment before any CLI is spawned.
+- Provider keys, the encryption key, and the IPC token are consumed and removed
+  before child spawn; the external runner strips the known secret set again.
 
 ### Policy, attribution, observation
 
@@ -156,12 +158,15 @@ is exercised manually and is **not** covered by automated tests.
   optional fallback, not a duplicate requirement.
 - Keychain-stored credentials and application encryption key; coding
   subscription tokens stay owned by their CLIs.
+- The app monitors the daemon after readiness, relaunches with bounded backoff,
+  reconnects IPC with the fresh port/token, and surfaces crash-loop exhaustion.
 - Builds automatically select an available persistent Developer ID or Apple
   Development identity so rebuilds do not invalidate Keychain authorization.
 - Preview-before-export diagnostics on an allowlisted, bounded schema excluding
   source, transcripts, prompts, tool arguments, credentials, and audio.
 - Privacy controls for transcript clearing, credential replacement and removal,
   diagnostics export, and overlay reset.
+- Transcript retention is automatic; manual clearing remains available.
 
 ### VS Code and packaging
 
@@ -177,6 +182,10 @@ is exercised manually and is **not** covered by automated tests.
 - Packaging supports ad-hoc, automatic, and Developer ID signing, applies the
   required Bun daemon entitlements under hardened runtime, and provides
   notarization preflight, submission, and stapling.
+- `VERSION` drives package, bundle, and daemon metadata. The app includes a
+  branded icon and Apple Events purpose string.
+- `release-app.sh` requires Developer ID and notary credentials, validates and
+  staples the bundle, then emits a versioned ZIP and SHA-256 checksum.
 
 ---
 
@@ -187,17 +196,11 @@ Each of these is a real, scoped piece of work. Contributions welcome — see
 
 | Gap | Detail |
 |---|---|
-| One voice tool surface | `voice-toolkit.ts` is canonical (23 tools); `RealtimeBridge` carries a near-duplicate 22-tool private copy. Changes must land in both until the migration completes. |
 | Unix-domain socket IPC | The design specifies a Unix socket with length-prefixed frames. Reality is a loopback TCP WebSocket with Bearer auth. Everything else in that section is implemented. |
 | ~20 catalogued events | `intent.updated`, `task.phaseChanged`, `plan.updated`, `step.*`, `decision.recorded`, `blocker.*`, `verification.*`, and the `voice.*` lifecycle events have no schema and no emitter. Phase is derived, not evented. |
 | Relational read models | Eight tables exist as DDL with zero readers and zero writers. Intent drafts have no implementation at all. |
-| Daemon supervision | The daemon recovers its own state on restart, but the app never relaunches or re-attaches to a crashed daemon. |
 | External-backend steering | `askCoder`/`steer`/`followUp` return `false` for Codex and Claude; live steering is OMP-only. `steerCoder`/`followUpCoder` are wired in the daemon but no voice tool calls them. |
-| Transcript retention policy | Manual clearing only — no age, size, or count policy. |
-| App bundle versioning | `MAMACHI_VERSION` writes `daemon-version.json` only; `Info.plist` hardcodes `0.1.0`. |
-| App icon, login item, updater | None exist. |
-| `NSAppleEventsUsageDescription` | Absent, although an `apple_script` computer-control capability is exposed in Settings. |
-| Encryption by default | Sensitive fields are plaintext unless `MAMACHI_ENCRYPTION_KEY` is set. Only the macOS app guarantees a key. |
+| Login item and automatic updater | Neither exists. Updates are explicitly manual; the release path is versioned, signed, notarized, and checksummed. |
 
 ## Release gates
 

@@ -53,11 +53,11 @@ pre-existing user changes is blocked while anchored edits are allowed. Mamachi
 never commits, never switches branches, and never opens a pull request unless a
 task explicitly asks for that exact effect.
 
-**Credential leakage into a child process.** The daemon deletes
-`MAMACHI_ENCRYPTION_KEY`, `MAMACHI_TOKEN`, `ANTHROPIC_API_KEY`,
-`OPENAI_API_KEY`, `GEMINI_API_KEY`, and `MAMACHI_ELEVENLABS_API_KEY` from
-`process.env` immediately after reading them, because the external CLI runner
-copies the whole environment into every spawned child.
+**Credential leakage into a child process.** The daemon consumes and deletes
+provider keys, `MAMACHI_ENCRYPTION_KEY`, and the IPC token from `process.env`.
+`ExternalCliRunner` reconstructs a sanitized child environment and removes the
+known secret set again at the spawn boundary. Codex and Claude use their own
+login stores; they do not receive another backend's provider key.
 
 **Credential leakage into stored data.** Non-routine tool arguments are redacted
 before persistence; `credential_access` results are dropped entirely.
@@ -69,11 +69,12 @@ containing a home-directory path or a secret marker.
 the daemon's stdout handshake and a `0600` descriptor inside a `0700`
 directory.
 
-**Data at rest.** With a key configured, event payloads, command payloads and
-results, context artifacts, evidence, observer notes, memories, and queued
-briefs are AES-256-GCM encrypted. The AAD binds each ciphertext to its exact
-`<table>.<column>:<row-id>`, so a blob cannot be relocated to another row. Any
-authentication failure throws.
+**Data at rest.** Event payloads, command payloads and results, context
+artifacts, evidence, observer notes, memories, queued briefs, and native
+transcripts are AES-256-GCM encrypted. The AAD binds each ciphertext to its exact
+`<table>.<column>:<row-id>`, so a blob cannot be relocated to another row. The
+app keeps its key in Keychain; a headless daemon creates a `0600` key beside the
+database. Any authentication failure throws.
 
 **Raw audio.** Never persisted.
 
@@ -91,9 +92,9 @@ Be honest with yourself about these before you run it.
   `127.0.0.1` and authenticates, but the token file, the SQLite database, and
   the Keychain are all reachable by anything running as you. There is no
   privilege boundary between Mamachi and other processes you own.
-- **Plaintext storage without a key.** `bun run daemon` with no
-  `MAMACHI_ENCRYPTION_KEY` stores everything unencrypted. Only the macOS app
-  guarantees a Keychain-backed key.
+- **Lost encryption keys.** Mamachi cannot recover encrypted state if its
+  Keychain item or headless `*.sqlite.key` file is lost. Explicitly setting
+  `MAMACHI_ALLOW_PLAINTEXT=1` disables the at-rest guarantee.
 - **An unsandboxed app.** The macOS app has no App Sandbox entitlement. The
   daemon binary carries JIT and library-validation exemptions because Bun
   requires them.
@@ -113,8 +114,9 @@ If you are running Mamachi on a machine that matters:
 
 1. Build and sign with a persistent Developer ID identity. Ad-hoc rebuilds
    change the code hash and retrain you to click through Keychain prompts.
-2. Set `MAMACHI_ENCRYPTION_KEY` (base64 of exactly 32 bytes) for any headless
-   daemon. `openssl rand -base64 32`.
+2. Back up the `*.sqlite.key` file with any headless state you need to preserve,
+   or inject `MAMACHI_ENCRYPTION_KEY` from your secret manager. Never set
+   `MAMACHI_ALLOW_PLAINTEXT=1` on durable state.
 3. Leave `computerCapabilities` at the default `assistive` set. Do not enable
    `shell` or `apple_script` unless you need them.
 4. Leave `computerConfirmationMode` at `sensitive`.
