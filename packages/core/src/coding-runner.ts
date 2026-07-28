@@ -31,7 +31,6 @@ export interface CodingRunnerOptions
     sessionFile: string | null,
   ) => Promise<ActionResult>;
   runtimeSettings?: RuntimeSettings;
-  cliEnvironment?: Record<string, string | undefined>;
   codexExecutable?: string;
   claudeExecutable?: string;
 }
@@ -60,7 +59,6 @@ export class CodingRunner {
       onFail: options.onFail,
       onNeedInput: options.onNeedInput,
       ...(options.onSessionBound ? { onSessionBound: options.onSessionBound } : {}),
-      ...(options.cliEnvironment ? { environment: options.cliEnvironment } : {}),
       runtimeSettings: this.#runtimeSettings,
     };
     this.#runners = {

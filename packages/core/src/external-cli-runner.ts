@@ -15,6 +15,7 @@ import {
   type EditorDocumentState,
   type WorkspaceConflict,
 } from "./workspace-guard.ts";
+import { fingerprintToolEffect } from "./policy.ts";
 
 export type ExternalCodingBackend = Exclude<CodingBackend, "omp">;
 
@@ -61,6 +62,12 @@ interface CliProcess {
   kill(signal?: number | NodeJS.Signals): void;
 }
 
+interface PolicyHookServer {
+  url: string;
+  token: string;
+  stop(): void;
+}
+
 interface ToolObservation {
   id: string;
   name: string;
@@ -79,6 +86,16 @@ const verificationCommandPattern =
 const mutatingCommandPattern =
   /(?:^|[;&|]\s*)(?:rm|mv|cp|mkdir|rmdir|touch|truncate|tee|install|patch|git\s+(?:checkout|switch|reset|restore|clean|apply))\b|(?:^|[^>])>(?!>)/i;
 const mutatingTools = new Set(["edit", "write", "notebook", "lsp"]);
+const sensitiveChildEnvironmentKeys = [
+  "MAMACHI_ENCRYPTION_KEY",
+  "MAMACHI_TOKEN",
+  "MAMACHI_POLICY_TOKEN",
+  "MAMACHI_POLICY_URL",
+  "ANTHROPIC_API_KEY",
+  "OPENAI_API_KEY",
+  "GEMINI_API_KEY",
+  "MAMACHI_ELEVENLABS_API_KEY",
+] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -196,6 +213,7 @@ function normalizeToolName(name: string): string {
   const names: Record<string, string> = {
     bash: "bash",
     command_execution: "bash",
+    apply_patch: "edit",
     edit: "edit",
     file_change: "edit",
     glob: "glob",
@@ -309,6 +327,9 @@ export class ExternalCliRunner {
   readonly #tools = new Map<string, ToolObservation>();
   readonly #evidenceIds: string[] = [];
   readonly #pendingQuestionAnswers = new Map<string, string>();
+  #policyServer: PolicyHookServer | null = null;
+  readonly #authorizedToolIds = new Set<string>();
+  readonly #authorizedEffects = new Map<string, number>();
 
   constructor(options: ExternalCliRunnerOptions) {
     this.#options = options;
@@ -373,6 +394,7 @@ export class ExternalCliRunner {
     this.#generation += 1;
     this.#process?.kill("SIGTERM");
     this.#process = null;
+    this.#stopPolicyHookServer();
     this.#workspaceGuard.finish();
     this.#taskId = null;
   }
@@ -451,8 +473,11 @@ export class ExternalCliRunner {
     }
     const route = resolveTaskRoute(task, this.#runtimeSettings);
     const model = modelForExternalBackend(this.#backend, route.modelPattern);
-    const argv = this.#arguments(executable, model, task);
+    const policyHook = this.#startPolicyHookServer(task);
+    const argv = this.#arguments(executable, model, task, this.#policyHookCommand());
     const environment = this.#processEnvironment();
+    environment["MAMACHI_POLICY_URL"] = policyHook.url;
+    environment["MAMACHI_POLICY_TOKEN"] = policyHook.token;
     this.#options.emit("coder.routed", {
       taskId: task.id,
       backend: this.#backend,
@@ -467,7 +492,14 @@ export class ExternalCliRunner {
       repository: task.repositoryId,
     });
 
-    const child = spawnCli(argv, task.repositoryId, environment);
+    let child: CliProcess;
+    try {
+      child = spawnCli(argv, task.repositoryId, environment);
+    } catch (error) {
+      this.#stopPolicyHookServer();
+      await this.#fail(task, error instanceof Error ? error.message : String(error));
+      return;
+    }
     this.#process = child;
     child.stdin.write(prompt);
     await child.stdin.end();
@@ -493,6 +525,7 @@ export class ExternalCliRunner {
         if (this.#policyPauseReason) child.kill("SIGTERM");
       }
       const [exitCode, stderr] = await Promise.all([child.exited, stderrPromise]);
+      this.#stopPolicyHookServer();
       if (this.#process === child) this.#process = null;
       if (generation !== this.#generation || task.id !== this.#taskId) return;
 
@@ -578,21 +611,160 @@ export class ExternalCliRunner {
       this.#workspaceGuard.finish();
       this.#taskId = null;
     } catch (error) {
+      this.#stopPolicyHookServer();
       if (this.#process === child) this.#process = null;
       if (generation !== this.#generation || task.id !== this.#taskId) return;
       await this.#fail(task, error instanceof Error ? error.message : String(error));
     }
   }
 
-  #arguments(executable: string, model: string | undefined, task: TaskRecord): string[] {
+  #policyHookCommand(): string {
+    const fallback = JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: "Mamachi policy service was unavailable; the tool was blocked",
+      },
+    });
+    return [
+      'response="$(/usr/bin/curl --fail --silent --show-error --max-time 35',
+      '--request POST --header "Authorization: Bearer $MAMACHI_POLICY_TOKEN"',
+      '--header "Content-Type: application/json" --data-binary @- "$MAMACHI_POLICY_URL")"',
+      `|| { printf '%s\\n' '${fallback}'; exit 0; };`,
+      "printf '%s' \"$response\"",
+    ].join(" ");
+  }
+
+  #startPolicyHookServer(task: TaskRecord): PolicyHookServer {
+    this.#stopPolicyHookServer();
+    const token = `${Bun.randomUUIDv7()}${Bun.randomUUIDv7()}`;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: (request) => this.#handlePolicyHookRequest(task, token, request),
+    });
+    const policyServer: PolicyHookServer = {
+      url: `http://127.0.0.1:${server.port}/authorize`,
+      token,
+      stop: () => server.stop(true),
+    };
+    this.#policyServer = policyServer;
+    return policyServer;
+  }
+
+  #stopPolicyHookServer(): void {
+    this.#policyServer?.stop();
+    this.#policyServer = null;
+  }
+
+  async #handlePolicyHookRequest(task: TaskRecord, token: string, request: Request): Promise<Response> {
+    const json = (value: unknown, status = 200) =>
+      Response.json(value, { status, headers: { "Cache-Control": "no-store" } });
+    if (
+      request.method !== "POST"
+      || request.headers.get("authorization") !== `Bearer ${token}`
+    ) {
+      return json({ error: "forbidden" }, 403);
+    }
+    try {
+      const text = await request.text();
+      if (text.length > 1_048_576) return json({ error: "request_too_large" }, 413);
+      const payload: unknown = JSON.parse(text);
+      if (!isRecord(payload)) return json({ error: "invalid_hook_payload" }, 400);
+      const rawName = nonEmptyString(payload["tool_name"]);
+      const input = isRecord(payload["tool_input"]) ? payload["tool_input"] : {};
+      if (!rawName) return json({ error: "missing_tool_name" }, 400);
+      const name = normalizeToolName(rawName);
+      const toolUseId = nonEmptyString(payload["tool_use_id"]);
+      const authorization = await this.#options.onAuthorizeTool(task.id, name, input);
+      if (authorization.status === "accepted") {
+        if (toolUseId) this.#authorizedToolIds.add(toolUseId);
+        const effect = fingerprintToolEffect(name, input);
+        this.#authorizedEffects.set(effect, (this.#authorizedEffects.get(effect) ?? 0) + 1);
+        return json({});
+      }
+      let reason: string;
+      if (authorization.status === "confirmation_required") {
+        reason = `Mamachi requires approval before ${name}: ${authorization.summary}`;
+        this.#options.emit("coder.needs_attention", {
+          taskId: task.id,
+          confirmationId: authorization.confirmationId,
+          question: authorization.summary,
+        });
+      } else {
+        reason = `Mamachi blocked ${name}: ${authorization.explanation}`;
+        this.#options.emit("coder.policy_blocked", {
+          taskId: task.id,
+          toolName: name,
+          explanation: authorization.explanation,
+        });
+      }
+      this.#policyPauseReason = reason;
+      setTimeout(() => this.#process?.kill("SIGTERM"), 25);
+      return json({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: reason,
+        },
+      });
+    } catch {
+      const reason = "Mamachi blocked a tool because its policy request was invalid";
+      this.#policyPauseReason = reason;
+      setTimeout(() => this.#process?.kill("SIGTERM"), 25);
+      return json({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: reason,
+        },
+      });
+    }
+  }
+
+  #consumePolicyAuthorization(id: string, name: string, input: Record<string, unknown>): boolean {
+    const idAllowed = this.#authorizedToolIds.delete(id);
+    const effect = fingerprintToolEffect(name, input);
+    const effectCount = this.#authorizedEffects.get(effect) ?? 0;
+    if (effectCount <= 1) this.#authorizedEffects.delete(effect);
+    else this.#authorizedEffects.set(effect, effectCount - 1);
+    return idAllowed || effectCount > 0;
+  }
+
+  #arguments(
+    executable: string,
+    model: string | undefined,
+    task: TaskRecord,
+    policyHookCommand: string,
+  ): string[] {
     const gitMetadataWriteAllowed = taskAllowsGitMetadataWrite(task);
     if (this.#backend === "codex") {
+      const hookConfig = [
+        "{ matcher = \".*\", hooks = [",
+        `{ type = "command", command = ${JSON.stringify(policyHookCommand)}, timeout = 40 }`,
+        "] }",
+      ].join(" ");
+      const policyArguments = [
+        "--dangerously-bypass-hook-trust",
+        "-c",
+        "features.hooks=true",
+        "-c",
+        `hooks.PreToolUse=[${hookConfig}]`,
+        "-c",
+        'sandbox_mode="workspace-write"',
+        "-c",
+        'approval_policy="never"',
+        ...(gitMetadataWriteAllowed
+          ? ["-c", `sandbox_workspace_write.writable_roots=[${JSON.stringify(join(task.repositoryId, ".git"))}]`]
+          : []),
+      ];
       if (this.#sessionId) {
         return [
           executable,
           "exec",
           "resume",
           "--json",
+          ...policyArguments,
           "--skip-git-repo-check",
           ...(model ? ["--model", model] : []),
           this.#sessionId,
@@ -603,22 +775,34 @@ export class ExternalCliRunner {
         executable,
         "exec",
         "--json",
-        "--sandbox",
-        "workspace-write",
+        ...policyArguments,
         ...(gitMetadataWriteAllowed ? ["--add-dir", join(task.repositoryId, ".git")] : []),
         "--skip-git-repo-check",
         ...(model ? ["--model", model] : []),
         "-",
       ];
     }
+    const settings = JSON.stringify({
+      hooks: {
+        PreToolUse: [{
+          matcher: ".*",
+          hooks: [{ type: "command", command: policyHookCommand, timeout: 40 }],
+        }],
+      },
+    });
     return [
       executable,
       "-p",
       "--output-format",
       "stream-json",
+      "--include-hook-events",
       "--verbose",
       "--permission-mode",
       "auto",
+      "--setting-sources",
+      "user",
+      "--settings",
+      settings,
       "--append-system-prompt",
       gitMetadataWriteAllowed
         ? "Mamachi is supervising this coding run. The accepted task authorizes staging and committing inside the selected repository. Preserve user changes, avoid other external side effects, and verify before finishing."
@@ -636,6 +820,7 @@ export class ExternalCliRunner {
     for (const [key, value] of Object.entries(this.#options.environment ?? {})) {
       if (value !== undefined) result[key] = value;
     }
+    for (const key of sensitiveChildEnvironmentKeys) delete result[key];
     result["NO_COLOR"] = "1";
     result["TERM"] = "dumb";
     return result;
@@ -769,6 +954,17 @@ export class ExternalCliRunner {
     input: Record<string, unknown>,
   ): Promise<void> {
     if (this.#tools.has(id)) return;
+    if (!this.#consumePolicyAuthorization(id, name, input)) {
+      const explanation = "The external backend did not obtain pre-execution authorization";
+      this.#policyPauseReason ??= `Mamachi blocked ${name}: ${explanation}`;
+      this.#options.emit("coder.policy_blocked", {
+        taskId: task.id,
+        toolName: name,
+        explanation,
+      });
+      this.#process?.kill("SIGTERM");
+      return;
+    }
     const observation = { id, name, input, sequence: ++this.#sequence };
     this.#tools.set(id, observation);
     const command = commandFromInput(input);
@@ -782,23 +978,6 @@ export class ExternalCliRunner {
       intent: null,
       backend: this.#backend,
     });
-    const authorization = await this.#options.onAuthorizeTool(task.id, name, input);
-    if (authorization.status === "accepted") return;
-    if (authorization.status === "confirmation_required") {
-      this.#options.emit("coder.needs_attention", {
-        taskId: task.id,
-        confirmationId: authorization.confirmationId,
-        question: authorization.summary,
-      });
-      this.#policyPauseReason = `Mamachi requires approval before ${name}: ${authorization.summary}`;
-    } else {
-      this.#policyPauseReason = `Mamachi blocked ${name}: ${authorization.explanation}`;
-      this.#options.emit("coder.policy_blocked", {
-        taskId: task.id,
-        toolName: name,
-        explanation: authorization.explanation,
-      });
-    }
   }
 
   async #finishTool(task: TaskRecord, id: string, result: unknown, isError: boolean): Promise<void> {
@@ -879,6 +1058,8 @@ export class ExternalCliRunner {
     this.#resultError = null;
     this.#tools.clear();
     this.#policyPauseReason = null;
+    this.#authorizedToolIds.clear();
+    this.#authorizedEffects.clear();
   }
 
   #questionFromSummary(summary: string): string | null {

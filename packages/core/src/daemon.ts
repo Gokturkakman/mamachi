@@ -269,10 +269,6 @@ runner = new CodingRunner({
   onComplete: (taskId, summary, evidenceIds) => daemon.completeTask(taskId, summary, evidenceIds),
   onFail: (taskId, error) => daemon.failTask(taskId, error),
   onNeedInput: (taskId, question) => daemon.awaitUserInput(taskId, question),
-  cliEnvironment: {
-    ANTHROPIC_API_KEY: codingProviderKeys.anthropic,
-    OPENAI_API_KEY: codingProviderKeys.openai,
-  },
   onSessionBound: (taskId, runId, backend, sessionId, sessionFile) =>
     daemon.recordCoderSession(taskId, runId, backend, sessionId, sessionFile),
   runtimeSettings: initialRuntimeSettings,

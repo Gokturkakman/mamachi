@@ -68,19 +68,44 @@ function shellQuote(value: string): string {
 function fakeExecutable(
   repository: string,
   events: readonly Record<string, unknown>[],
-  capture?: { argumentsPath: string; promptPath: string },
+  capture?: { argumentsPath?: string; promptPath?: string; environmentPath?: string },
 ): string {
   const path = join(repository, "fake-coding-agent");
   const output = events
-    .map((event) => `printf '%s\\n' ${shellQuote(JSON.stringify(event))}`)
+    .flatMap((event) => {
+      const item = typeof event["item"] === "object" && event["item"] !== null
+        ? event["item"] as Record<string, unknown>
+        : null;
+      const hookInput = event["type"] === "item.started" && item
+        ? {
+            hook_event_name: "PreToolUse",
+            tool_name: item["type"] === "command_execution" ? "Bash" : item["type"],
+            tool_input: item["type"] === "command_execution" ? { command: item["command"] } : item,
+            tool_use_id: item["id"],
+          }
+        : null;
+      return [
+        ...(hookInput
+          ? [
+              `printf '%s' ${shellQuote(JSON.stringify(hookInput))} | /usr/bin/curl --fail --silent --show-error --request POST --header "Authorization: Bearer $MAMACHI_POLICY_TOKEN" --header "Content-Type: application/json" --data-binary @- "$MAMACHI_POLICY_URL" >/dev/null`,
+            ]
+          : []),
+        `printf '%s\\n' ${shellQuote(JSON.stringify(event))}`,
+      ];
+    })
     .join("\n");
-  const consumeInput = capture
-    ? [
-        `printf '%s\\n' "$@" > ${shellQuote(capture.argumentsPath)}`,
-        `cat > ${shellQuote(capture.promptPath)}`,
-      ].join("\n")
-    : "cat >/dev/null";
-  writeFileSync(path, `#!/bin/sh\n${consumeInput}\n${output}\n`);
+  const setup = [
+    ...(capture?.argumentsPath
+      ? [`printf '%s\\n' "$@" > ${shellQuote(capture.argumentsPath)}`]
+      : []),
+    ...(capture?.environmentPath
+      ? [`env | sort > ${shellQuote(capture.environmentPath)}`]
+      : []),
+    capture?.promptPath
+      ? `cat > ${shellQuote(capture.promptPath)}`
+      : "cat >/dev/null",
+  ].join("\n");
+  writeFileSync(path, `#!/bin/sh\n${setup}\n${output}\n`);
   chmodSync(path, 0o755);
   return path;
 }
@@ -105,11 +130,18 @@ async function exerciseBackend(
   backend: ExternalCodingBackend,
   events: readonly Record<string, unknown>[],
   resumed = false,
-): Promise<{ summary: string; sessionIds: string[]; emittedTypes: string[]; evidenceIds: string[] }> {
+): Promise<{
+  summary: string;
+  sessionIds: string[];
+  emittedTypes: string[];
+  evidenceIds: string[];
+  childEnvironment: string;
+}> {
   const repository = mkdtempSync(join(tmpdir(), `mamachi-${backend}-runner-`));
   temporaryDirectories.push(repository);
   const task = createTask(repository, resumed ? backend : undefined);
-  const executable = fakeExecutable(repository, events);
+  const environmentPath = join(repository, "captured-environment");
+  const executable = fakeExecutable(repository, events, { environmentPath });
   const completion = Promise.withResolvers<{ summary: string; evidenceIds: string[] }>();
   const sessionIds: string[] = [];
   const emittedTypes: string[] = [];
@@ -118,6 +150,12 @@ async function exerciseBackend(
     backend,
     executable,
     getTask: (taskId) => taskId === task.id ? task : undefined,
+    environment: {
+      OPENAI_API_KEY: "test-openai-secret",
+      ANTHROPIC_API_KEY: "test-anthropic-secret",
+      MAMACHI_ENCRYPTION_KEY: "test-encryption-secret",
+      MAMACHI_TOKEN: "test-ipc-secret",
+    },
     emit: (type) => emittedTypes.push(type),
     onSafePause: async () => accepted(),
     onAuthorizeTool: async () => accepted(),
@@ -152,7 +190,12 @@ async function exerciseBackend(
   ]);
   const result = await completion.promise;
   await runner.dispose();
-  return { ...result, sessionIds, emittedTypes };
+  return {
+    ...result,
+    sessionIds,
+    emittedTypes,
+    childEnvironment: readFileSync(environmentPath, "utf8"),
+  };
 }
 
 describe("ExternalCliRunner", () => {
@@ -190,6 +233,12 @@ describe("ExternalCliRunner", () => {
     expect(result.evidenceIds).toEqual(["evidence-1"]);
     expect(result.emittedTypes).toContain("coder.tool_started");
     expect(result.emittedTypes).toContain("coder.tool_finished");
+    expect(result.childEnvironment).not.toContain("test-openai-secret");
+    expect(result.childEnvironment).not.toContain("test-anthropic-secret");
+    expect(result.childEnvironment).not.toContain("test-encryption-secret");
+    expect(result.childEnvironment).not.toContain("test-ipc-secret");
+    expect(result.childEnvironment).toContain("MAMACHI_POLICY_URL=http://127.0.0.1:");
+    expect(result.childEnvironment).toContain("MAMACHI_POLICY_TOKEN=");
   });
 
   test("streams Claude events and reuses a persisted subscription session", async () => {
@@ -218,6 +267,7 @@ describe("ExternalCliRunner", () => {
     task.spec.constraints = ["Do not modify files beyond what is needed to commit existing changes"];
     const argumentsPath = join(repository, "captured-arguments");
     const promptPath = join(repository, "captured-prompt");
+    const environmentPath = join(repository, "captured-environment");
     const executable = fakeExecutable(repository, [
       { type: "thread.started", thread_id: "new-commit-session" },
       {
@@ -225,12 +275,16 @@ describe("ExternalCliRunner", () => {
         item: { id: "message-commit", type: "agent_message", text: "Commit completed" },
       },
       { type: "turn.completed" },
-    ], { argumentsPath, promptPath });
+    ], { argumentsPath, promptPath, environmentPath });
     const completed = Promise.withResolvers<void>();
     let ordinal = 0;
     const runner = new ExternalCliRunner({
       backend: "codex",
       executable,
+      environment: {
+        OPENAI_API_KEY: "test-openai-secret",
+        ANTHROPIC_API_KEY: "test-anthropic-secret",
+      },
       getTask: (taskId) => taskId === task.id ? task : undefined,
       emit: () => {},
       onSafePause: async () => accepted(),
@@ -277,8 +331,9 @@ describe("ExternalCliRunner", () => {
     try {
       await completed.promise;
       const argumentsList = readFileSync(argumentsPath, "utf8").trim().split("\n");
-      expect(argumentsList).toContain("--sandbox");
-      expect(argumentsList).toContain("workspace-write");
+      expect(argumentsList).toContain('sandbox_mode="workspace-write"');
+      expect(argumentsList).toContain('approval_policy="never"');
+      expect(argumentsList.some((argument) => argument.startsWith("hooks.PreToolUse="))).toBeTrue();
       expect(argumentsList).toContain("--add-dir");
       expect(argumentsList[argumentsList.indexOf("--add-dir") + 1]).toBe(join(repository, ".git"));
       expect(argumentsList).not.toContain("resume");
@@ -287,6 +342,76 @@ describe("ExternalCliRunner", () => {
       expect(prompt).toContain("explicitly authorizes staging and committing");
       expect(prompt).toContain("The exact answer to your pending question is: Yes, grant write access to .git");
       expect(prompt).not.toContain("Do not commit");
+      const childEnvironment = readFileSync(environmentPath, "utf8");
+      expect(childEnvironment).not.toContain("test-openai-secret");
+      expect(childEnvironment).not.toContain("test-anthropic-secret");
+    } finally {
+      await runner.dispose();
+    }
+  });
+
+  test("blocks a denied external tool before its side effect", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "mamachi-codex-policy-"));
+    temporaryDirectories.push(repository);
+    const task = createTask(repository);
+    const executable = join(repository, "fake-coding-agent");
+    const sideEffectPath = join(repository, "forbidden-side-effect");
+    const hookInput = JSON.stringify({
+      hook_event_name: "PreToolUse",
+      tool_name: "Bash",
+      tool_input: { command: `touch ${sideEffectPath}` },
+      tool_use_id: "denied-command",
+    });
+    writeFileSync(
+      executable,
+      [
+        "#!/bin/sh",
+        "cat >/dev/null",
+        `response="$(printf '%s' ${shellQuote(hookInput)} | /usr/bin/curl --fail --silent --show-error --request POST --header "Authorization: Bearer $MAMACHI_POLICY_TOKEN" --header "Content-Type: application/json" --data-binary @- "$MAMACHI_POLICY_URL")"`,
+        `case "$response" in *'"permissionDecision":"deny"'*) ;; *) touch ${shellQuote(sideEffectPath)} ;; esac`,
+        "sleep 1",
+      ].join("\n"),
+    );
+    chmodSync(executable, 0o755);
+    const paused = Promise.withResolvers<void>();
+    const runner = new ExternalCliRunner({
+      backend: "codex",
+      executable,
+      getTask: (taskId) => taskId === task.id ? task : undefined,
+      emit: () => {},
+      onSafePause: async () => {
+        paused.resolve();
+        return accepted();
+      },
+      onAuthorizeTool: async () => ({
+        status: "rejected",
+        code: "credential_access",
+        explanation: "fixture policy denial",
+      }),
+      onWorkspaceConflict: async () => accepted(),
+      onRecordEvidence: async (input) => evidence(input, 1),
+      onComplete: async () => {
+        throw new Error("A denied tool must pause rather than complete");
+      },
+      onFail: async (_taskId, error) => {
+        paused.reject(new Error(error));
+        return accepted();
+      },
+      onNeedInput: async () => accepted(),
+      runtimeSettings: {
+        ...defaultRuntimeSettings,
+        codingBackend: "codex",
+        automaticRouting: false,
+      },
+    });
+    runner.handleEvents([{
+      type: "task.started",
+      taskId: task.id,
+      payload: { runId: task.activeRunId!, revision: task.revision },
+    } as DomainEvent]);
+    try {
+      await paused.promise;
+      expect(Bun.file(sideEffectPath).size).toBe(0);
     } finally {
       await runner.dispose();
     }
