@@ -1163,7 +1163,7 @@ final class AppModel: ObservableObject {
         if let last = transcripts.last, last.speaker == speaker, last.text == normalized { return }
         transcripts.append(TranscriptEntry(id: UUID(), speaker: speaker, text: normalized, at: Date()))
         do {
-            try transcriptStore?.save(transcripts)
+            if let retained = try transcriptStore?.save(transcripts) { transcripts = retained }
         } catch {
             errorMessage = error.localizedDescription
         }

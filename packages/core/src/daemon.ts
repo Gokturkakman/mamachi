@@ -18,6 +18,7 @@ import {
 import { MacComputerController } from "./computer-control.ts";
 import { OmpObserverBackend, PassiveObserver } from "./observer.ts";
 import { VoiceBriefStore } from "./voice-brief-store.ts";
+import { resolveEncryptionKey } from "./encryption-key.ts";
 
 const token = process.env["MAMACHI_TOKEN"] ?? Bun.randomUUIDv7();
 const port = Number.parseInt(process.env["MAMACHI_PORT"] ?? "47821", 10);
@@ -26,12 +27,17 @@ if (!Number.isInteger(port) || port < 0 || port > 65_535) {
 }
 
 const databasePath = resolve(process.env["MAMACHI_STATE_PATH"] ?? ".mamachi/demo.sqlite");
-mkdirSync(dirname(databasePath), { recursive: true });
+mkdirSync(dirname(databasePath), { recursive: true, mode: 0o700 });
 const connectionPath = process.env["MAMACHI_CONNECTION_PATH"]
   ? resolve(process.env["MAMACHI_CONNECTION_PATH"])
   : null;
 
-const encryptionKey = process.env["MAMACHI_ENCRYPTION_KEY"] ?? null;
+const encryptionKey = resolveEncryptionKey({
+  configuredKey: process.env["MAMACHI_ENCRYPTION_KEY"],
+  databasePath,
+  keyPath: process.env["MAMACHI_ENCRYPTION_KEY_PATH"],
+  allowPlaintext: process.env["MAMACHI_ALLOW_PLAINTEXT"] === "1",
+});
 const codingProviderKeys = {
   anthropic: process.env["ANTHROPIC_API_KEY"],
   openai: process.env["OPENAI_API_KEY"],
@@ -44,6 +50,8 @@ for (const [provider, apiKey] of Object.entries(codingProviderKeys)) {
   if (apiKey) authStorage.setRuntimeApiKey(provider, apiKey);
 }
 delete process.env["MAMACHI_ENCRYPTION_KEY"];
+delete process.env["MAMACHI_ENCRYPTION_KEY_PATH"];
+delete process.env["MAMACHI_ALLOW_PLAINTEXT"];
 delete process.env["MAMACHI_TOKEN"];
 delete process.env["ANTHROPIC_API_KEY"];
 delete process.env["OPENAI_API_KEY"];

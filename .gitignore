@@ -10,6 +10,7 @@ node_modules/
 *.sqlite-journal
 *.sqlite-shm
 *.sqlite-wal
+*.sqlite.key
 
 # Generated builds and test output
 .build/
