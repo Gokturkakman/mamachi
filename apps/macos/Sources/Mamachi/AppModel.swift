@@ -195,6 +195,20 @@ final class AppModel: ObservableObject {
             ?? (try? DaemonProcess.projectRoot().path)
             ?? FileManager.default.homeDirectoryForCurrentUser.path
 
+        daemon.onRestart = { [weak self] ready in
+            guard let self else { return }
+            daemonConnected = false
+            voiceState = .disconnected
+            workspace = ready.workspace
+            ipc.connect(port: ready.port, token: ready.token)
+        }
+        daemon.onTerminalFailure = { [weak self] error in
+            guard let self else { return }
+            daemonConnected = false
+            voiceState = .error
+            isEngaged = false
+            errorMessage = "Mamachi daemon could not be restarted: \(error.localizedDescription)"
+        }
         ipc.onEvent = { [weak self] event in self?.handle(event) }
         ipc.onAudio = { [weak self] data in self?.handleAudioOutput(data) }
         ipc.onDisconnect = { [weak self] error in
@@ -747,6 +761,7 @@ final class AppModel: ObservableObject {
         switch type {
         case "server.ready":
             daemonConnected = true
+            errorMessage = nil
             syncRuntimeSettings()
             ipc.reportVoiceEngagement(isEngaged, playback: nil)
             applySnapshot(payload["snapshot"] as? [String: Any])
