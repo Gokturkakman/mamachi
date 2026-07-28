@@ -104,6 +104,7 @@ function makeHost(overrides: Partial<VoiceToolHost> = {}): HostHarness {
     },
     isEngaged: () => true,
     getResponseMode: () => "voice",
+    getCurrentUserInput: () => null,
     sleepMicrophone: () => {
       sleepCalls.count += 1;
     },
@@ -163,6 +164,48 @@ describe("createVoiceToolkit", () => {
     expect(instructions).toContain("# Current workspace\n/repo");
     expect(instructions).toContain("Enabled capability categories: applications, shell.");
     expect(instructions).toContain("Confirmation policy: always.");
+    toolkit.dispose();
+  });
+
+  test("forwards coder answers only from exact current-turn user text", async () => {
+    let currentUserInput: string | null = null;
+    const snapshot: ControllerSnapshot = {
+      ...makeSnapshot(),
+      questions: [{
+        id: "question-1",
+        taskId: "task-1",
+        taskRevision: 3,
+        runId: "run-1",
+        question: "Which API version should I use?",
+        state: "open",
+        resolution: null,
+        answer: null,
+        askedAt: new Date(0).toISOString(),
+        resolvedAt: null,
+      }],
+    };
+    const { host, commands } = makeHost({
+      getSnapshot: () => snapshot,
+      getCurrentUserInput: () => currentUserInput,
+    });
+    const toolkit = createVoiceToolkit(host);
+    expect(await toolkit.execute("answer_task_question", {
+      requestId: "question-1",
+      answer: "Use v2",
+    })).toMatchObject({ status: "rejected", code: "user_answer_required" });
+    currentUserInput = "Use v2";
+    expect(await toolkit.execute("answer_task_question", {
+      requestId: "question-1",
+      answer: "Use version 2",
+    })).toMatchObject({ status: "rejected", code: "answer_not_verbatim" });
+    expect(await toolkit.execute("answer_task_question", {
+      requestId: "question-1",
+      answer: "Use v2",
+    })).toMatchObject({ status: "accepted" });
+    expect(commands.at(-1)).toMatchObject({
+      type: "task.answerQuestion",
+      payload: { taskId: "task-1", questionId: "question-1", answer: "Use v2" },
+    });
     toolkit.dispose();
   });
 

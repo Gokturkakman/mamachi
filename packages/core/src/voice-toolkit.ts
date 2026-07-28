@@ -603,12 +603,27 @@ ${this.#host.getWorkspace()}
             explanation: "The question belongs to an older task revision",
           };
         }
+        const explicitUserAnswer = this.#host.getCurrentUserInput()?.trim() ?? "";
+        if (!explicitUserAnswer) {
+          return {
+            status: "rejected",
+            code: "user_answer_required",
+            explanation: "Ask the open coder question aloud. Only the user's current-turn answer may be forwarded.",
+          };
+        }
+        if (answer !== explicitUserAnswer) {
+          return {
+            status: "rejected",
+            code: "answer_not_verbatim",
+            explanation: "The answer must exactly match the user's current utterance; do not infer or paraphrase it.",
+          };
+        }
         return this.#host.executeCommand({
           id: Bun.randomUUIDv7(),
           type: "task.answerQuestion",
           actor: "voice",
           expectedRevision: task.revision,
-          payload: { taskId: task.id, questionId: question.id, answer },
+          payload: { taskId: task.id, questionId: question.id, answer: explicitUserAnswer },
         });
       }
       case "ask_coder": {

@@ -95,7 +95,7 @@ async function activeVoiceConnect(keys: { apiKey?: string; elevenLabsApiKey?: st
       });
       return;
     }
-    await realtime?.connect(keys.apiKey);
+    await realtime?.connect(keys.apiKey ? { openaiApiKey: keys.apiKey } : {});
   } catch (error) {
     voiceLog("connect.failed", { error: error instanceof Error ? error.message : String(error) });
     throw error;

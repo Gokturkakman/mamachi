@@ -110,6 +110,7 @@ interface ActiveTurn {
   itemId: string;
   contentIndex: number;
   controller: AbortController;
+  userInput: string | null;
   /// Full assistant text streamed so far across every tool round of the turn.
   text: string;
   /// Absolute char → start-ms timeline. Flash alignment times are relative to
@@ -346,7 +347,7 @@ export class CascadeBridge implements VoiceBridge {
       role: "user",
       content: [{ type: "input_text", text: normalized }],
     });
-    this.#startTurn();
+    this.#startTurn(normalized);
   }
 
   captureContext(context: CapturedContext): void {
@@ -388,6 +389,7 @@ export class CascadeBridge implements VoiceBridge {
       emit: options.emit,
       isEngaged: () => this.#engaged,
       getResponseMode: () => this.#responseMode,
+      getCurrentUserInput: () => this.#turn?.userInput ?? null,
       sleepMicrophone: () => {
         this.setEngaged(false);
         this.#options.emit("ui.mute", {});
@@ -419,6 +421,7 @@ export class CascadeBridge implements VoiceBridge {
     if (options.rememberFact) host.rememberFact = options.rememberFact;
     if (options.forgetFact) host.forgetFact = options.forgetFact;
     if (options.controlComputer) host.controlComputer = options.controlComputer;
+    if (options.captureScreenContext) host.captureScreenContext = options.captureScreenContext;
     return host;
   }
 
@@ -523,7 +526,7 @@ export class CascadeBridge implements VoiceBridge {
           role: "user",
           content: [{ type: "input_text", text }],
         });
-        this.#startTurn();
+        this.#startTurn(text.trim());
       }
       return undefined;
     }
@@ -618,7 +621,7 @@ export class CascadeBridge implements VoiceBridge {
 
   // ==== Turn engine: Responses API + Flash v2.5 ====
 
-  #startTurn(): void {
+  #startTurn(userInput: string | null = null): void {
     this.#abortActiveTurn();
     this.#detachStaleImages();
     this.#log("turn.start", { history: this.#history.length, mode: this.#responseMode });
@@ -627,6 +630,7 @@ export class CascadeBridge implements VoiceBridge {
       contentIndex: 0,
       controller: new AbortController(),
       text: "",
+      userInput,
       timeline: [],
       audioMsOffset: 0,
       tts: null,

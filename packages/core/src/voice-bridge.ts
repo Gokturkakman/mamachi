@@ -38,9 +38,7 @@ export interface VoiceConnectKeys {
   elevenLabsApiKey?: string;
 }
 
-/// The surface the daemon drives. `RealtimeBridge` satisfies this modulo its
-/// `connect(apiKey)` signature; migrating it onto `VoiceConnectKeys` is the
-/// tracked follow-up once its in-flight work lands.
+/// Common surface driven by the daemon for either voice pipeline.
 export interface VoiceBridge {
   connect(keys?: VoiceConnectKeys): Promise<void>;
   disconnect(): Promise<void>;
@@ -102,6 +100,9 @@ export interface VoiceToolHost extends VoiceHostCallbacks {
   /// retention: the cascade detaches images after their turn because it
   /// re-sends full history per request.
   attachUserImage(note: string, dataUrl: string): void;
+  /// Exact accepted user text for the active turn, or null for autonomous
+  /// task updates. Used to prevent models from inventing coder answers.
+  getCurrentUserInput(): string | null;
 }
 
 /// Function-tool definition in OpenAI Responses API shape. The Realtime API
