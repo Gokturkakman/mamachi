@@ -183,6 +183,25 @@ MAMACHI_SIGN_IDENTITY="Developer ID Application: …" \
   bun run macos:build
 ```
 
+### Updates
+
+Mamachi has no background updater and makes no update-check requests. Until
+signed binaries are published, update manually: fetch the desired tagged
+revision, rebuild with `bun run macos:build`, quit Mamachi, and replace the old
+application bundle. State and credentials remain in Application Support and the
+Keychain, outside the bundle.
+
+Published archives will include a sibling `.sha256` file. Verify one before
+installing with `shasum -a 256 -c Mamachi-<version>-macos.zip.sha256`.
+
+Maintainers create the signed, notarized archive and checksum in one command:
+
+```bash
+MAMACHI_SIGN_IDENTITY="Developer ID Application: …" \
+MAMACHI_NOTARY_PROFILE="mamachi-notary" \
+  bun run macos:release
+```
+
 ### First run
 
 Onboarding walks through microphone, notifications, Accessibility, VS Code,

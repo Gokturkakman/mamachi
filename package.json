@@ -1,5 +1,6 @@
 {
   "name": "mamachi",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "packageManager": "bun@1.3.14",
@@ -12,11 +13,13 @@
     "daemon": "bun packages/core/src/daemon.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "protocol:check": "bun run --cwd packages/protocol bindings:check",
+    "version:check": "bun scripts/check-version.ts",
     "macos:test": "swift test --package-path apps/macos",
-    "check": "bun run typecheck && bun test && bun run protocol:check && bun run macos:test",
+    "check": "bun run typecheck && bun run version:check && bun test && bun run protocol:check && bun run macos:test",
     "test": "bun test",
     "macos:build": "apps/macos/build-app.sh",
-    "macos:run": "apps/macos/build-app.sh --open"
+    "macos:run": "apps/macos/build-app.sh --open",
+    "macos:release": "apps/macos/release-app.sh"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",

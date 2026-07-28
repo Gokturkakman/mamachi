@@ -8,13 +8,18 @@ CONTENTS="$APP_DIR/Contents"
 RUNTIME_DIR="$CONTENTS/Resources/runtime"
 SIGN_MODE="${MAMACHI_SIGN_MODE:-auto}"
 NOTARIZE="${MAMACHI_NOTARIZE:-0}"
-APP_VERSION="${MAMACHI_VERSION:-0.1.0}"
+APP_VERSION="${MAMACHI_VERSION:-$(< "$PROJECT_DIR/VERSION")}"
+BUILD_NUMBER="${MAMACHI_BUILD_NUMBER:-1}"
 DAEMON_ENTITLEMENTS="${MAMACHI_DAEMON_ENTITLEMENTS:-$SCRIPT_DIR/Resources/Daemon.entitlements}"
 
 fail() {
     printf 'build-app.sh: %s\n' "$*" >&2
     exit 1
 }
+[[ "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
+    || fail "MAMACHI_VERSION must be a semantic version."
+[[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] \
+    || fail "MAMACHI_BUILD_NUMBER must be a positive integer."
 
 if [[ -n "${MAMACHI_BUILD_BUN:-}" ]]; then
     BUILD_BUN="$MAMACHI_BUILD_BUN"
@@ -97,6 +102,9 @@ mkdir -p "$CONTENTS/MacOS" "$RUNTIME_DIR"
 cp "$BIN_DIR/Mamachi" "$CONTENTS/MacOS/Mamachi"
 cp "$SCRIPT_DIR/Resources/Info.plist" "$CONTENTS/Info.plist"
 cp "$SCRIPT_DIR/Resources/THIRD_PARTY_NOTICES.txt" "$CONTENTS/Resources/THIRD_PARTY_NOTICES.txt"
+cp "$SCRIPT_DIR/Resources/AppIcon.icns" "$CONTENTS/Resources/AppIcon.icns"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$CONTENTS/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$CONTENTS/Info.plist"
 mkdir -p "$CONTENTS/Resources/vscode-extension/dist"
 cp "$PROJECT_DIR/apps/vscode/package.json" "$CONTENTS/Resources/vscode-extension/package.json"
 cp "$PROJECT_DIR/apps/vscode/dist/extension.js" "$CONTENTS/Resources/vscode-extension/dist/extension.js"

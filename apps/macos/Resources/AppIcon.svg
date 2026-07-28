@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="background" x1="128" y1="96" x2="896" y2="928" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#17233F"/>
+      <stop offset="1" stop-color="#090B17"/>
+    </linearGradient>
+    <linearGradient id="brand" x1="266" y1="256" x2="758" y2="768" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#66C2FF"/>
+      <stop offset="1" stop-color="#997AFF"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(512 500) rotate(90) scale(390)" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#76B8FF" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#8A71FF" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="180" y="180" width="664" height="664" filterUnits="userSpaceOnUse">
+      <feGaussianBlur stdDeviation="22"/>
+    </filter>
+  </defs>
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#background)"/>
+  <circle cx="512" cy="500" r="390" fill="url(#glow)"/>
+  <circle cx="512" cy="512" r="244" fill="none" stroke="#6EBBFF" stroke-opacity="0.18" stroke-width="54" filter="url(#shadow)"/>
+  <circle cx="512" cy="512" r="244" fill="#0E1427" stroke="url(#brand)" stroke-width="34"/>
+  <path d="M336 618V414C336 388 367 375 386 393L512 512L638 393C657 375 688 388 688 414V618" fill="none" stroke="url(#brand)" stroke-width="62" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="512" cy="512" r="22" fill="#EEF8FF"/>
+  <path d="M270 512H218M806 512H754M512 270V218M512 806V754" stroke="#B9E5FF" stroke-opacity="0.7" stroke-width="20" stroke-linecap="round"/>
+</svg>
