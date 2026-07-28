@@ -60,11 +60,11 @@ export class MemoryStore {
     const rows = projectId === null
       ? this.#db.query<MemoryRow, []>(
           `SELECT id, project_id, content_ciphertext, created_at, updated_at
-           FROM memories WHERE kind = 'explicit_memory' AND project_id IS NULL ORDER BY updated_at DESC`,
+           FROM memories WHERE kind = 'explicit_memory' AND project_id IS NULL ORDER BY updated_at DESC, id DESC`,
         ).all()
       : this.#db.query<MemoryRow, [string]>(
           `SELECT id, project_id, content_ciphertext, created_at, updated_at
-           FROM memories WHERE kind = 'explicit_memory' AND (project_id IS NULL OR project_id = ?) ORDER BY updated_at DESC`,
+           FROM memories WHERE kind = 'explicit_memory' AND (project_id IS NULL OR project_id = ?) ORDER BY updated_at DESC, id DESC`,
         ).all(projectId);
     return rows.map((row) => this.#fromRow(row));
   }

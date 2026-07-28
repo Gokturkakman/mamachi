@@ -27,6 +27,9 @@ describe("voice tool support stores", () => {
     const global = first.remember("global", null, "Use concise commit messages");
     const project = first.remember("project", "/workspace/one", "Tests use Bun");
     first.close();
+    const timestampCollision = new Database(path);
+    timestampCollision.query("UPDATE memories SET updated_at = ?").run(new Date(0).toISOString());
+    timestampCollision.close();
 
     const reopened = new MemoryStore(path, key);
     expect(reopened.list("/workspace/one").map((memory) => memory.id)).toEqual([project.id, global.id]);

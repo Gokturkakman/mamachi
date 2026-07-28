@@ -11,6 +11,9 @@
     "demo": "bun packages/core/src/demo.ts",
     "daemon": "bun packages/core/src/daemon.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "protocol:check": "bun run --cwd packages/protocol bindings:check",
+    "macos:test": "swift test --package-path apps/macos",
+    "check": "bun run typecheck && bun test && bun run protocol:check && bun run macos:test",
     "test": "bun test",
     "macos:build": "apps/macos/build-app.sh",
     "macos:run": "apps/macos/build-app.sh --open"
