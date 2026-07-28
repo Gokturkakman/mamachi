@@ -3,8 +3,15 @@ import XCTest
 @testable import Mamachi
 
 final class AudioServiceTests: XCTestCase {
+    private func requireAudioHardware() throws {
+        try XCTSkipIf(
+            ProcessInfo.processInfo.environment["CI"] != nil,
+            "AVAudioEngine hardware tests require a physical audio device"
+        )
+    }
     @MainActor
     func testSchedulesRealtimePCMOnPlayerNode() throws {
+        try requireAudioHardware()
         let service = AudioService()
         try XCTSkipUnless(service.isPlaybackAvailable, "No audio output device is available")
         var playbackError: Error?
@@ -27,6 +34,7 @@ final class AudioServiceTests: XCTestCase {
 
     @MainActor
     func testReportsWhenAllRealtimePCMHasPlayed() async throws {
+        try requireAudioHardware()
         let service = AudioService()
         try XCTSkipUnless(service.isPlaybackAvailable, "No audio output device is available")
         let drained = expectation(description: "scheduled PCM drained")
@@ -41,6 +49,7 @@ final class AudioServiceTests: XCTestCase {
     }
     @MainActor
     func testStoppedEngineRecoveryUnwedgesPlaybackGate() async throws {
+        try requireAudioHardware()
         let service = AudioService()
         try XCTSkipUnless(service.isPlaybackAvailable, "No audio output device is available")
         var drains = 0
@@ -66,6 +75,7 @@ final class AudioServiceTests: XCTestCase {
 
     @MainActor
     func testBenignConfigurationChangeLeavesRunningPlaybackAlone() throws {
+        try requireAudioHardware()
         let service = AudioService()
         try XCTSkipUnless(service.isPlaybackAvailable, "No audio output device is available")
         var drains = 0
