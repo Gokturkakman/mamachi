@@ -4,8 +4,9 @@ import XCTest
 
 final class AudioServiceTests: XCTestCase {
     @MainActor
-    func testSchedulesRealtimePCMOnPlayerNode() {
+    func testSchedulesRealtimePCMOnPlayerNode() throws {
         let service = AudioService()
+        try XCTSkipUnless(service.isPlaybackAvailable, "No audio output device is available")
         var playbackError: Error?
         service.onError = { playbackError = $0 }
 
@@ -25,8 +26,9 @@ final class AudioServiceTests: XCTestCase {
     }
 
     @MainActor
-    func testReportsWhenAllRealtimePCMHasPlayed() async {
+    func testReportsWhenAllRealtimePCMHasPlayed() async throws {
         let service = AudioService()
+        try XCTSkipUnless(service.isPlaybackAvailable, "No audio output device is available")
         let drained = expectation(description: "scheduled PCM drained")
         service.onPlaybackDrained = { drained.fulfill() }
 
@@ -38,8 +40,9 @@ final class AudioServiceTests: XCTestCase {
         service.stop()
     }
     @MainActor
-    func testStoppedEngineRecoveryUnwedgesPlaybackGate() async {
+    func testStoppedEngineRecoveryUnwedgesPlaybackGate() async throws {
         let service = AudioService()
+        try XCTSkipUnless(service.isPlaybackAvailable, "No audio output device is available")
         var drains = 0
         service.onPlaybackDrained = { drains += 1 }
 
@@ -62,8 +65,9 @@ final class AudioServiceTests: XCTestCase {
     }
 
     @MainActor
-    func testBenignConfigurationChangeLeavesRunningPlaybackAlone() {
+    func testBenignConfigurationChangeLeavesRunningPlaybackAlone() throws {
         let service = AudioService()
+        try XCTSkipUnless(service.isPlaybackAvailable, "No audio output device is available")
         var drains = 0
         service.onPlaybackDrained = { drains += 1 }
 

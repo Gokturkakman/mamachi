@@ -18,6 +18,7 @@ final class AudioService {
         interleaved: true
     )!
     private var converter: AVAudioConverter?
+    private var playbackConfigured = false
     private var capturing = false
     private var voiceProcessingConfigured = false
     private var playbackGeneration = 0
@@ -32,6 +33,10 @@ final class AudioService {
     private var recoveryErrorReported = false
     var isPlaying: Bool { player.isPlaying }
     var hasPendingPlayback: Bool { pendingPlaybackBuffers > 0 }
+    var isPlaybackAvailable: Bool {
+        let format = engine.outputNode.outputFormat(forBus: 0)
+        return format.channelCount > 0 && format.sampleRate > 0
+    }
     var playbackPositionMilliseconds: Int {
         guard
             let renderTime = player.lastRenderTime,
@@ -46,20 +51,10 @@ final class AudioService {
     init() {
         player.volume = 0.62
         engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: wireFormat)
-        // Real-time playout loudness for the collapsed pill's waveform: tap
-        // the mixer output (what actually reaches the speaker right now, not
-        // audio as it arrives from the network) and mirror the microphone
-        // level normalization.
-        let playerNode = player
-        engine.mainMixerNode.installTap(onBus: 0, bufferSize: 1_024, format: nil) { [weak self, playerNode] buffer, _ in
-            guard playerNode.isPlaying else { return }
-            let level = Self.normalizedLevel(buffer)
-            Task { @MainActor in self?.onPlaybackLevel?(level) }
-        }
         // Device/route changes (AirPods, headphones, sleep/wake) stop the
         // engine silently; without recovery the session goes deaf until the
-        // next disengage/engage cycle.
+        // next disengage/engage cycle. Playback wiring stays lazy: constructing
+        // AppModel must not require an output device, including in headless CI.
         configurationObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
             object: engine,
@@ -181,6 +176,23 @@ final class AudioService {
         }
     }
 
+    private func configurePlaybackIfNeeded() throws {
+        guard !playbackConfigured else { return }
+        guard isPlaybackAvailable else { throw AudioError.noOutputDevice }
+        engine.connect(player, to: engine.mainMixerNode, format: wireFormat)
+        // Real-time playout loudness for the collapsed pill's waveform: tap
+        // the mixer output (what actually reaches the speaker right now, not
+        // audio as it arrives from the network) and mirror microphone level
+        // normalization.
+        let playerNode = player
+        engine.mainMixerNode.installTap(onBus: 0, bufferSize: 1_024, format: nil) { [weak self, playerNode] buffer, _ in
+            guard playerNode.isPlaying else { return }
+            let level = Self.normalizedLevel(buffer)
+            Task { @MainActor in self?.onPlaybackLevel?(level) }
+        }
+        playbackConfigured = true
+    }
+
     func beginPlaybackItem() {
         playbackOriginFrame = scheduledPlaybackFrames
     }
@@ -188,6 +200,7 @@ final class AudioService {
     func play(pcm data: Data) {
         guard !data.isEmpty, data.count.isMultiple(of: 2) else { return }
         do {
+            try configurePlaybackIfNeeded()
             if !engine.isRunning {
                 engine.prepare()
                 try engine.start()
@@ -326,6 +339,7 @@ enum AudioError: LocalizedError {
     case converterUnavailable
     case microphoneDenied
     case noInputDevice
+    case noOutputDevice
 
     var errorDescription: String? {
         switch self {
@@ -335,6 +349,8 @@ enum AudioError: LocalizedError {
             "Microphone access is required. Enable Mamachi in System Settings > Privacy & Security > Microphone."
         case .noInputDevice:
             "No microphone input device is available."
+        case .noOutputDevice:
+            "No audio output device is available."
         }
     }
 }
