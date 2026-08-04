@@ -114,6 +114,9 @@ MAMACHI_DAEMON_OUTPUT="$RUNTIME_DIR/mamachi-daemon" \
 MAMACHI_BUILD_ROOT="$PROJECT_DIR" \
 BUN_NO_CODESIGN_MACHO_BINARY=1 \
 "$BUILD_BUN" -e '
+import { copyFileSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+
 const legacyPlugin = {
     name: "mamachi:omp-legacy-module",
     setup(build) {
@@ -144,6 +147,29 @@ if (!output.success) {
     for (const log of output.logs) console.error(log);
     process.exit(1);
 }
+const codingAgent = Bun.resolveSync(
+    "@oh-my-pi/pi-coding-agent",
+    join(Bun.env.MAMACHI_BUILD_ROOT, "packages/core"),
+);
+const nativeCore = Bun.resolveSync("@oh-my-pi/pi-natives", dirname(codingAgent));
+const nativeAddon = Bun.resolveSync(
+    `@oh-my-pi/pi-natives-darwin-${process.arch}`,
+    dirname(nativeCore),
+);
+const nativeDirectory = dirname(nativeAddon);
+const nativePattern = new RegExp(
+    `^pi_natives\\.darwin-${process.arch}(?:-(?:baseline|modern))?\\.node$`,
+);
+const nativeFiles = readdirSync(nativeDirectory).filter((filename) => nativePattern.test(filename));
+if (nativeFiles.length === 0) {
+    throw new Error(`No native addon found in ${nativeDirectory}`);
+}
+for (const filename of nativeFiles) {
+    copyFileSync(
+        join(nativeDirectory, filename),
+        join(dirname(Bun.env.MAMACHI_DAEMON_OUTPUT), filename),
+    );
+}
 '
 chmod 755 "$RUNTIME_DIR/mamachi-daemon"
 printf '{"daemonVersion":"%s"}\n' "$APP_VERSION" > "$RUNTIME_DIR/daemon-version.json"
@@ -151,15 +177,20 @@ printf '{"daemonVersion":"%s"}\n' "$APP_VERSION" > "$RUNTIME_DIR/daemon-version.
 if [[ -n "$SIGN_IDENTITY" ]]; then
     APP_SIGN_ARGS=(--force --sign "$SIGN_IDENTITY")
     DAEMON_SIGN_ARGS=(--force --sign "$SIGN_IDENTITY")
+    NATIVE_SIGN_ARGS=(--force --sign "$SIGN_IDENTITY")
     if [[ "$SIGN_MODE" == "developer-id" || "$NOTARIZE" == "1" ]]; then
         APP_SIGN_ARGS+=(--options runtime --timestamp)
         DAEMON_SIGN_ARGS+=(--options runtime --timestamp --entitlements "$DAEMON_ENTITLEMENTS")
+        NATIVE_SIGN_ARGS+=(--options runtime --timestamp)
     elif [[ -n "${MAMACHI_DAEMON_ENTITLEMENTS:-}" ]]; then
         DAEMON_SIGN_ARGS+=(--entitlements "$DAEMON_ENTITLEMENTS")
     fi
     if [[ -n "${MAMACHI_ENTITLEMENTS:-}" ]]; then
         APP_SIGN_ARGS+=(--entitlements "$MAMACHI_ENTITLEMENTS")
     fi
+    for NATIVE_ADDON in "$RUNTIME_DIR"/pi_natives.darwin-*.node; do
+        codesign "${NATIVE_SIGN_ARGS[@]}" "$NATIVE_ADDON"
+    done
     codesign "${DAEMON_SIGN_ARGS[@]}" "$RUNTIME_DIR/mamachi-daemon"
     codesign "${APP_SIGN_ARGS[@]}" "$APP_DIR"
     codesign --verify --deep --strict "$APP_DIR"
