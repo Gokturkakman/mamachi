@@ -314,11 +314,11 @@ unconditionally, backfilling `backend: "omp"` into pre-multi-backend
   `timingSafeEqual`
 - anything else → 404
 
-Text frames are `{version:1, id, type, payload}` against a **15-type allowlist**:
-`state.get`, `workspace.select`, `workspace.focus`, `editor.state`,
-`context.capture`, `context.remove`, `command.execute`, `settings.update`,
-`voice.connect`, `voice.disconnect`, `voice.engagement`, `voice.interrupt`,
-`voice.text`, `voice.mode`, `editor.context.response`.
+Text frames are `{version:1, id, type, payload}` against a **16-type allowlist**:
+`state.get`, `workspace.select`, `workspace.deselect`, `workspace.focus`,
+`editor.state`, `context.capture`, `context.remove`, `command.execute`,
+`settings.update`, `voice.connect`, `voice.disconnect`, `voice.engagement`,
+`voice.interrupt`, `voice.text`, `voice.mode`, `editor.context.response`.
 
 Binary frames are raw PCM audio, both directions.
 
@@ -332,9 +332,24 @@ consistent. `state.get {afterSeq}` is the reconnect path; `reset: true` tells a
 stale client (one whose sequence is *ahead* of the store) to rebuild from the
 snapshot. Replay is clamped to `seq <= snapshot.seq`.
 
+**Multiple repositories.** `#selectedWorkspaces` is a set, not a single path.
+`workspace.select {path}` adds `path` and also moves the single `#workspace`
+focus pointer to it (both, for backward compatibility with clients that only
+ever select one workspace); `workspace.deselect {path}` removes it and
+refuses to drop the last remaining entry. `workspace.focus` — the VS Code
+extension's signal that its active folder changed — only moves the focus
+pointer; it never changes the selected set. `getAvailableWorkspaces()`
+(`daemon.ts`) already fed the voice toolkit's `get_workspace {view:"available"}`
+tool before this existed; it now returns the real selected set instead of a
+single-element stub, so `submit_task {repositoryId}` can target any selected
+repository — see [§6.3](#63-the-tool-surface-voice-toolkitts). Combined with
+per-repository lanes ([§4.5](#45-task-lifecycle)), multiple selected
+repositories run concurrently.
+
 **Boundary checks worth knowing.** `task.submit` requires
-`payload.repositoryId` to equal the selected workspace and every attachment id
-to resolve inside it, both *before* the controller sees the command.
+`payload.repositoryId` to be one of the selected workspaces and every
+attachment id to resolve inside *that* repository, both *before* the
+controller sees the command.
 `editor.state` accepts metadata only — `{workspace, path, version, dirty, open}`
 — never document content. Captured context is capped at 128 KiB. Screenshots
 must be an absolute `.png`/`.jpg`/`.jpeg` path and are copied into
@@ -352,7 +367,7 @@ returning `tier ∈ {automatic, visual_approval, reject}`:
 | 1 | `rm -rf /`, `mkfs`/`diskutil eraseDisk`, fork bomb | **reject** / `unsupported` |
 | 2 | credential access: `*_API_KEY`, `MAMACHI_TOKEN`, `AWS_*`, `GITHUB_TOKEN`, `.env`, `.ssh/`, `id_rsa`, `security find-*-password`, bare `env`/`printenv`/`export` | **reject** / `credential_access` |
 | 3 | purchase / checkout / `stripe payment` | approval / `purchase` |
-| 4 | `npm\|bun\|cargo\|gem\|pypi\|twine publish`, `gh release`, `git push` | approval / `external_publication` |
+| 4 | `npm\|bun\|cargo\|gem\|pypi\|twine publish`, `gh release create\|upload`, `gh pr create`, `git push` | approval / `external_publication` |
 | 5 | `vercel\|netlify\|fly\|railway\|firebase deploy`, `kubectl apply`, `terraform apply` | approval / `deployment` |
 | 6 | `git reset --hard`, `clean`, `restore`, `checkout --`, `switch`, `branch -D`, `rebase`, `commit`, `push`, `tag -d` | approval / `destructive_git` |
 | 7 | `rm`, `shred`, `dd`, `chmod -R`, output redirection | approval / `destructive_filesystem` |

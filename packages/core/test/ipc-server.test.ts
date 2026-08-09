@@ -304,3 +304,112 @@ test("IPC artifact getters enforce task ownership", async () => {
     rmSync(workspace, { recursive: true, force: true });
   }
 });
+
+function submitPayload(repositoryId: string, objective: string) {
+  return {
+    repositoryId,
+    objective,
+    acceptanceCriteria: ["The change is verified"],
+    constraints: [],
+    attachmentIds: [],
+    codingProfileId: null,
+  };
+}
+
+test("IPC selects workspaces additively and accepts task.submit for any selected repository", async () => {
+  const repoA = mkdtempSync(join(tmpdir(), "mamachi-ipc-repo-a-"));
+  const repoB = mkdtempSync(join(tmpdir(), "mamachi-ipc-repo-b-"));
+  const server = new MamachiIpcServer({ token: "multi-repo-token", port: 0, initialWorkspace: repoA });
+  const socket = new WebSocket(`ws://127.0.0.1:${server.port}/ws`, {
+    headers: { Authorization: "Bearer multi-repo-token" },
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", () => resolve());
+      socket.once("error", reject);
+    });
+
+    expect(server.selectedWorkspaces).toEqual([realpathSync(repoA)]);
+
+    const beforeSelect = await server.executeCommand({
+      id: Bun.randomUUIDv7(),
+      type: "task.submit",
+      actor: "voice",
+      expectedRevision: null,
+      payload: submitPayload(realpathSync(repoB), "Work only possible once repo B is selected"),
+    });
+    expect(beforeSelect).toMatchObject({ status: "rejected", code: "workspace_mismatch" });
+
+    const selected = await request(socket, "workspace.select", { path: repoB });
+    expect(selected.ok).toBe(true);
+    expect([...server.selectedWorkspaces].sort()).toEqual([realpathSync(repoA), realpathSync(repoB)].sort());
+
+    const inRepoA = await server.executeCommand({
+      id: Bun.randomUUIDv7(),
+      type: "task.submit",
+      actor: "voice",
+      expectedRevision: null,
+      payload: submitPayload(realpathSync(repoA), "Change repo A"),
+    });
+    const inRepoB = await server.executeCommand({
+      id: Bun.randomUUIDv7(),
+      type: "task.submit",
+      actor: "voice",
+      expectedRevision: null,
+      payload: submitPayload(realpathSync(repoB), "Change repo B"),
+    });
+    expect(inRepoA.status).toBe("accepted");
+    expect(inRepoB.status).toBe("accepted");
+    expect(server.snapshot().tasks.map((task) => task.repositoryId).sort()).toEqual(
+      [realpathSync(repoA), realpathSync(repoB)].sort(),
+    );
+  } finally {
+    socket.close();
+    server.close();
+    rmSync(repoA, { recursive: true, force: true });
+    rmSync(repoB, { recursive: true, force: true });
+  }
+});
+
+test("IPC deselects a workspace, refuses further submissions to it, and keeps at least one selected", async () => {
+  const repoA = mkdtempSync(join(tmpdir(), "mamachi-ipc-deselect-a-"));
+  const repoB = mkdtempSync(join(tmpdir(), "mamachi-ipc-deselect-b-"));
+  const server = new MamachiIpcServer({ token: "deselect-token", port: 0, initialWorkspace: repoA });
+  const socket = new WebSocket(`ws://127.0.0.1:${server.port}/ws`, {
+    headers: { Authorization: "Bearer deselect-token" },
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", () => resolve());
+      socket.once("error", reject);
+    });
+
+    await request(socket, "workspace.select", { path: repoB });
+    expect(server.selectedWorkspaces).toHaveLength(2);
+
+    const rejectedLastOne = await request(socket, "workspace.deselect", { path: repoA });
+    expect(rejectedLastOne.ok).toBe(true);
+    expect(server.selectedWorkspaces).toEqual([realpathSync(repoB)]);
+
+    const afterDeselect = await server.executeCommand({
+      id: Bun.randomUUIDv7(),
+      type: "task.submit",
+      actor: "voice",
+      expectedRevision: null,
+      payload: submitPayload(realpathSync(repoA), "No longer selected"),
+    });
+    expect(afterDeselect).toMatchObject({ status: "rejected", code: "workspace_mismatch" });
+
+    const refusesLastWorkspace = await request(socket, "workspace.deselect", { path: repoB });
+    expect(refusesLastWorkspace).toMatchObject({
+      ok: false,
+      error: "At least one workspace must remain selected",
+    });
+    expect(server.selectedWorkspaces).toEqual([realpathSync(repoB)]);
+  } finally {
+    socket.close();
+    server.close();
+    rmSync(repoA, { recursive: true, force: true });
+    rmSync(repoB, { recursive: true, force: true });
+  }
+});

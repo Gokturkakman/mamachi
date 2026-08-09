@@ -39,6 +39,7 @@ interface RequestEnvelope {
   type:
     | "state.get"
     | "workspace.select"
+    | "workspace.deselect"
     | "workspace.focus"
     | "editor.state"
     | "context.capture"
@@ -121,6 +122,7 @@ function parseRequest(input: unknown): RequestEnvelope {
   const supported = new Set([
     "state.get",
     "workspace.select",
+    "workspace.deselect",
     "workspace.focus",
     "editor.state",
     "context.capture",
@@ -159,12 +161,20 @@ export class MamachiIpcServer {
   readonly #clients = new Set<ClientSocket>();
   readonly #server: Server<ClientData>;
   #workspace: string;
+  /**
+   * Repositories a task.submit may target, alongside the single #workspace focus pointer
+   * used for editor-state matching and screenshot capture. Selecting is additive so
+   * multiple repositories can run concurrently (see CodingRunner lanes); focusing (used by
+   * the VS Code extension) only moves the editor-context pointer and never changes this set.
+   */
+  readonly #selectedWorkspaces: Set<string>;
   readonly #screenshotDirectory: string | null;
 
   constructor(options: IpcServerOptions) {
     this.#token = options.token;
     this.#hooks = options.hooks ?? {};
     this.#workspace = realpathSync(options.initialWorkspace ?? process.cwd());
+    this.#selectedWorkspaces = new Set([this.#workspace]);
     const databasePath = options.databasePath ?? ":memory:";
     this.#screenshotDirectory = databasePath === ":memory:"
       ? null
@@ -189,6 +199,7 @@ export class MamachiIpcServer {
           this.#send(socket, "server.ready", {
             clientId: socket.data.id,
             workspace: this.#workspace,
+            selectedWorkspaces: [...this.#selectedWorkspaces],
             snapshot: this.#controller.snapshot(),
             facts: this.#facts.project(this.#controller.snapshot()),
           });
@@ -215,6 +226,10 @@ export class MamachiIpcServer {
 
   get workspace(): string {
     return this.#workspace;
+  }
+
+  get selectedWorkspaces(): readonly string[] {
+    return [...this.#selectedWorkspaces];
   }
 
   emit(type: string, payload: unknown): void {
@@ -323,11 +338,11 @@ export class MamachiIpcServer {
   async executeCommand(input: unknown): Promise<ActionResult> {
     const command = parseCommand(input);
     if (command.type === "task.submit") {
-      if (command.payload.repositoryId !== this.#workspace) {
+      if (!this.#selectedWorkspaces.has(command.payload.repositoryId)) {
         return {
           status: "rejected",
           code: "workspace_mismatch",
-          explanation: "The task repository does not match the selected workspace",
+          explanation: "The task repository is not one of the selected workspaces",
         };
       }
       const attachments = this.#artifacts.get(command.payload.attachmentIds);
@@ -446,6 +461,19 @@ export class MamachiIpcServer {
     this.#memories.close();
   }
 
+  #resolveWorkspacePath(request: RequestEnvelope): string {
+    if (
+      !isObject(request.payload) ||
+      !hasOnlyKeys(request.payload, ["path"]) ||
+      typeof request.payload["path"] !== "string"
+    ) {
+      throw new Error(`${request.type} requires one path string`);
+    }
+    const path = realpathSync(request.payload["path"]);
+    if (!statSync(path).isDirectory()) throw new Error("Selected workspace is not a directory");
+    return path;
+  }
+
   #handleUpgrade(request: Request, server: Server<ClientData>): Response | undefined {
     const url = new URL(request.url);
     if (url.pathname === "/health") {
@@ -493,25 +521,47 @@ export class MamachiIpcServer {
           : [];
         return {
           workspace: this.#workspace,
+          selectedWorkspaces: [...this.#selectedWorkspaces],
           snapshot,
           facts: this.#facts.project(snapshot),
           events,
           reset,
         };
       }
-      case "workspace.select":
-      case "workspace.focus": {
-        if (
-          !isObject(request.payload) ||
-          !hasOnlyKeys(request.payload, ["path"]) ||
-          typeof request.payload["path"] !== "string"
-        ) {
-          throw new Error(`${request.type} requires one path string`);
-        }
-        const path = realpathSync(request.payload["path"]);
-        if (!statSync(path).isDirectory()) throw new Error("Selected workspace is not a directory");
+      case "workspace.select": {
+        const path = this.#resolveWorkspacePath(request);
+        this.#selectedWorkspaces.add(path);
         this.#workspace = path;
-        this.emit("workspace.changed", { path, source: request.type === "workspace.focus" ? "vscode" : "user" });
+        this.emit("workspace.changed", {
+          path,
+          selected: [...this.#selectedWorkspaces],
+          source: "user",
+        });
+        return { path, selected: [...this.#selectedWorkspaces] };
+      }
+      case "workspace.deselect": {
+        const path = this.#resolveWorkspacePath(request);
+        if (this.#selectedWorkspaces.size <= 1) {
+          throw new Error("At least one workspace must remain selected");
+        }
+        this.#selectedWorkspaces.delete(path);
+        if (this.#workspace === path) {
+          this.#workspace = this.#selectedWorkspaces.values().next().value as string;
+        }
+        this.emit("workspace.changed", {
+          path: this.#workspace,
+          selected: [...this.#selectedWorkspaces],
+          source: "user",
+        });
+        return { path, selected: [...this.#selectedWorkspaces] };
+      }
+      case "workspace.focus": {
+        // Editor-context focus only: it moves the single #workspace pointer that
+        // editor.state / screenshot capture match against. It never changes which
+        // repositories task.submit may target — use workspace.select for that.
+        const path = this.#resolveWorkspacePath(request);
+        this.#workspace = path;
+        this.emit("workspace.changed", { path, source: "vscode" });
         return { path };
       }
       case "editor.state": {

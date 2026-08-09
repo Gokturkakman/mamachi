@@ -204,7 +204,7 @@ const daemon = new MamachiIpcServer({
 
 const voiceCallbacks = {
   getWorkspace: () => daemon.workspace,
-  getAvailableWorkspaces: () => [daemon.workspace],
+  getAvailableWorkspaces: () => daemon.selectedWorkspaces,
   getCodingProfiles: () => ["auto", "primary", "fast"],
   getComputerCapabilities: () => runtimeSettings.computerCapabilities,
   getComputerConfirmationMode: () => runtimeSettings.computerConfirmationMode,

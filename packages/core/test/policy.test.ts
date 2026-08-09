@@ -28,6 +28,16 @@ describe("assessToolCall", () => {
     expect(publication.effectFingerprint).not.toBe(outsideWrite.effectFingerprint);
   });
 
+  test("requires approval to open a pull request, same as a release or a push", () => {
+    const openPr = assessToolCall("bash", { command: "gh pr create --title x --body y" }, repository);
+    const release = assessToolCall("bash", { command: "gh release create v1.0.0" }, repository);
+    const prList = assessToolCall("bash", { command: "gh pr list" }, repository);
+
+    expect(openPr).toMatchObject({ tier: "visual_approval", category: "external_publication" });
+    expect(release).toMatchObject({ tier: "visual_approval", category: "external_publication" });
+    expect(prList).toMatchObject({ tier: "automatic", category: "routine" });
+  });
+
   test("rejects commands that enumerate the daemon environment", () => {
     expect(assessToolCall("bash", { command: "env" }, repository))
       .toMatchObject({ tier: "reject", category: "credential_access" });
