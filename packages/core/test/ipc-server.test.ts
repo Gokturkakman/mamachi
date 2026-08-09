@@ -413,3 +413,37 @@ test("IPC deselects a workspace, refuses further submissions to it, and keeps at
     rmSync(repoB, { recursive: true, force: true });
   }
 });
+
+test("IPC workspace.focus also selects the focused repository, so captured context is never orphaned", async () => {
+  const repoA = mkdtempSync(join(tmpdir(), "mamachi-ipc-focus-a-"));
+  const repoB = mkdtempSync(join(tmpdir(), "mamachi-ipc-focus-b-"));
+  const server = new MamachiIpcServer({ token: "focus-token", port: 0, initialWorkspace: repoA });
+  const socket = new WebSocket(`ws://127.0.0.1:${server.port}/ws`, {
+    headers: { Authorization: "Bearer focus-token" },
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", () => resolve());
+      socket.once("error", reject);
+    });
+
+    const focused = await request(socket, "workspace.focus", { path: repoB });
+    expect(focused.ok).toBe(true);
+    expect([...server.selectedWorkspaces].sort()).toEqual([realpathSync(repoA), realpathSync(repoB)].sort());
+    expect(server.workspace).toBe(realpathSync(repoB));
+
+    const submitted = await server.executeCommand({
+      id: Bun.randomUUIDv7(),
+      type: "task.submit",
+      actor: "voice",
+      expectedRevision: null,
+      payload: submitPayload(realpathSync(repoB), "Repo B is submittable right after VS Code focused it"),
+    });
+    expect(submitted.status).toBe("accepted");
+  } finally {
+    socket.close();
+    server.close();
+    rmSync(repoA, { recursive: true, force: true });
+    rmSync(repoB, { recursive: true, force: true });
+  }
+});

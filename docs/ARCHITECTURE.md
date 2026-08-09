@@ -337,8 +337,11 @@ snapshot. Replay is clamped to `seq <= snapshot.seq`.
 focus pointer to it (both, for backward compatibility with clients that only
 ever select one workspace); `workspace.deselect {path}` removes it and
 refuses to drop the last remaining entry. `workspace.focus` — the VS Code
-extension's signal that its active folder changed — only moves the focus
-pointer; it never changes the selected set. `getAvailableWorkspaces()`
+extension's signal that its active folder changed — moves the same focus
+pointer and also adds the path to the selected set (never removes), so
+context the editor captures is always tagged to a repository `task.submit`
+can already target; only `workspace.deselect` shrinks the set.
+`getAvailableWorkspaces()`
 (`daemon.ts`) already fed the voice toolkit's `get_workspace {view:"available"}`
 tool before this existed; it now returns the real selected set instead of a
 single-element stub, so `submit_task {repositoryId}` can target any selected

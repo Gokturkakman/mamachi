@@ -163,9 +163,10 @@ export class MamachiIpcServer {
   #workspace: string;
   /**
    * Repositories a task.submit may target, alongside the single #workspace focus pointer
-   * used for editor-state matching and screenshot capture. Selecting is additive so
-   * multiple repositories can run concurrently (see CodingRunner lanes); focusing (used by
-   * the VS Code extension) only moves the editor-context pointer and never changes this set.
+   * used for editor-state matching and screenshot capture. Both select and focus add to
+   * this set (never remove) so it's never possible to capture context tagged to a
+   * repository task.submit then refuses; only workspace.deselect removes one. Multiple
+   * selected repositories run concurrently (see CodingRunner lanes).
    */
   readonly #selectedWorkspaces: Set<string>;
   readonly #screenshotDirectory: string | null;
@@ -556,13 +557,19 @@ export class MamachiIpcServer {
         return { path, selected: [...this.#selectedWorkspaces] };
       }
       case "workspace.focus": {
-        // Editor-context focus only: it moves the single #workspace pointer that
-        // editor.state / screenshot capture match against. It never changes which
-        // repositories task.submit may target — use workspace.select for that.
+        // The VS Code extension's "active folder changed" signal. It moves the single
+        // #workspace pointer that editor.state / screenshot capture match against, and
+        // (like workspace.select) also adds the path to the selected set — otherwise
+        // captured context would get tagged to a repository task.submit can't target yet.
         const path = this.#resolveWorkspacePath(request);
+        this.#selectedWorkspaces.add(path);
         this.#workspace = path;
-        this.emit("workspace.changed", { path, source: "vscode" });
-        return { path };
+        this.emit("workspace.changed", {
+          path,
+          selected: [...this.#selectedWorkspaces],
+          source: "vscode",
+        });
+        return { path, selected: [...this.#selectedWorkspaces] };
       }
       case "editor.state": {
         if (
