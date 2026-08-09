@@ -497,6 +497,8 @@ export class TaskController {
           );
         }
         if (events.length === 0) return this.#reject("nothing_to_recover", "No active run needed recovery");
+        // ActionResult.taskId is a single field; with multiple lanes recovering at once,
+        // this is arbitrarily the first lane's task. All recovered lanes are in `events`.
         return this.#accept(events, laneTaskIds[0]);
       },
     );

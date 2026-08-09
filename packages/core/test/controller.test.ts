@@ -632,6 +632,48 @@ describe("TaskController", () => {
     }
   });
 
+  test("cancelling a queued task never starts it as its own successor, and lanes stay independent", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const alphaFirst = submitToRepository(controller, "repo_alpha");
+      const alphaSecond = submitToRepository(controller, "repo_alpha");
+      const betaFirst = submitToRepository(controller, "repo_beta");
+
+      expect(controller.snapshot().queue).toEqual([alphaSecond]);
+
+      const cancelQueued = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.cancel",
+        actor: "voice",
+        expectedRevision: 1,
+        payload: { taskId: alphaSecond, reason: "No longer needed" },
+      });
+      expect(cancelQueued.status).toBe("accepted");
+      expect(controller.eventsAfter().at(-1)?.type).toBe("task.cancelled");
+
+      let snapshot = controller.snapshot();
+      expect(snapshot.tasks.find((task) => task.id === alphaSecond)?.state).toBe("cancelled");
+      expect(snapshot.activeTaskIds).toEqual({ repo_alpha: alphaFirst, repo_beta: betaFirst });
+      expect(snapshot.queue).toEqual([]);
+
+      const cancelActive = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.cancel",
+        actor: "voice",
+        expectedRevision: 1,
+        payload: { taskId: alphaFirst, reason: "Superseded" },
+      });
+      expect(cancelActive.status).toBe("accepted");
+
+      snapshot = controller.snapshot();
+      expect(snapshot.activeTaskIds).toEqual({ repo_beta: betaFirst });
+      expect(snapshot.tasks.find((task) => task.id === betaFirst)?.state).toBe("running");
+    } finally {
+      store.close();
+    }
+  });
+
   test("recovers every lane's unfinished run independently after a restart", () => {
     const directory = mkdtempSync(join(tmpdir(), "mamachi-controller-lanes-"));
     const databasePath = join(directory, "state.sqlite");
