@@ -97,7 +97,8 @@ export interface ConfirmationRecord {
 
 export interface ControllerState {
   seq: number;
-  activeTaskId: string | null;
+  /** One active-task slot per repositoryId ("lane"). A repository never runs two tasks at once; different repositories run concurrently. */
+  activeTaskIds: Map<string, string>;
   queue: string[];
   tasks: Map<string, TaskRecord>;
   runs: Map<string, RunRecord>;
@@ -107,6 +108,12 @@ export interface ControllerState {
 
 export interface ControllerSnapshot {
   seq: number;
+  /** repositoryId -> the task currently occupying that repository's active slot. Always present on a real snapshot; optional only so pre-lane test fixtures still typecheck. */
+  activeTaskIds?: Record<string, string>;
+  /**
+   * Deprecated single-repository view: the first lane's active task, or null if none.
+   * Kept for clients that only ever select one workspace at a time. Prefer `activeTaskIds`.
+   */
   activeTaskId: string | null;
   queue: string[];
   tasks: TaskRecord[];
@@ -118,7 +125,7 @@ export interface ControllerSnapshot {
 export function createEmptyState(): ControllerState {
   return {
     seq: 0,
-    activeTaskId: null,
+    activeTaskIds: new Map(),
     queue: [],
     tasks: new Map(),
     runs: new Map(),
@@ -210,8 +217,9 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       const taskId = requireTaskId(event);
       const task = requiredTask(state, taskId);
       const runId = event.payload.runId;
-      if (state.activeTaskId && state.activeTaskId !== taskId) {
-        throw new Error(`Cannot start ${taskId}; ${state.activeTaskId} owns the active slot`);
+      const laneOwner = state.activeTaskIds.get(task.repositoryId);
+      if (laneOwner && laneOwner !== taskId) {
+        throw new Error(`Cannot start ${taskId}; ${laneOwner} owns the active slot for ${task.repositoryId}`);
       }
       if (state.runs.has(runId)) throw new Error(`Run ${runId} already exists`);
       removeFromQueue(state, taskId);
@@ -228,7 +236,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
         startedAt: event.at,
         endedAt: null,
       });
-      state.activeTaskId = taskId;
+      state.activeTaskIds.set(task.repositoryId, taskId);
       break;
     }
     case "task.pauseRequested": {
@@ -350,7 +358,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       task.terminalSummary = event.payload.summary;
       task.pendingQuestion = null;
       removeFromQueue(state, taskId);
-      if (state.activeTaskId === taskId) state.activeTaskId = null;
+      if (state.activeTaskIds.get(task.repositoryId) === taskId) state.activeTaskIds.delete(task.repositoryId);
       break;
     }
     case "task.failed": {
@@ -365,7 +373,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       task.terminalSummary = event.payload.error;
       task.pendingQuestion = null;
       removeFromQueue(state, taskId);
-      if (state.activeTaskId === taskId) state.activeTaskId = null;
+      if (state.activeTaskIds.get(task.repositoryId) === taskId) state.activeTaskIds.delete(task.repositoryId);
       break;
     }
     case "task.cancelled": {
@@ -382,7 +390,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       task.terminalSummary = event.payload.reason;
       task.pendingQuestion = null;
       removeFromQueue(state, taskId);
-      if (state.activeTaskId === taskId) state.activeTaskId = null;
+      if (state.activeTaskIds.get(task.repositoryId) === taskId) state.activeTaskIds.delete(task.repositoryId);
       break;
     }
     case "run.interrupted": {
@@ -468,7 +476,8 @@ export function replayEvents(events: readonly DomainEvent[]): ControllerState {
 export function snapshotState(state: ControllerState): ControllerSnapshot {
   return {
     seq: state.seq,
-    activeTaskId: state.activeTaskId,
+    activeTaskIds: Object.fromEntries(state.activeTaskIds),
+    activeTaskId: state.activeTaskIds.values().next().value ?? null,
     queue: [...state.queue],
     tasks: [...state.tasks.values()].map((task) => structuredClone(task)),
     runs: [...state.runs.values()].map((run) => structuredClone(run)),
@@ -487,9 +496,12 @@ export function assertStateInvariants(state: ControllerState): void {
     if (task.state !== "queued") throw new Error(`Queue contains non-queued task ${taskId}`);
   }
 
-  if (state.activeTaskId) {
-    const task = state.tasks.get(state.activeTaskId);
-    if (!task) throw new Error(`Active slot references missing task ${state.activeTaskId}`);
+  for (const [repositoryId, activeTaskId] of state.activeTaskIds) {
+    const task = state.tasks.get(activeTaskId);
+    if (!task) throw new Error(`Active slot for ${repositoryId} references missing task ${activeTaskId}`);
+    if (task.repositoryId !== repositoryId) {
+      throw new Error(`Active slot for ${repositoryId} points at task ${task.id} owned by ${task.repositoryId}`);
+    }
     if (!(["running", "pause_requested", "paused", "awaiting_user"] as TaskState[]).includes(task.state)) {
       throw new Error(`Active task ${task.id} has invalid state ${task.state}`);
     }

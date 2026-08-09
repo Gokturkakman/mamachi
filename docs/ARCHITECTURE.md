@@ -208,8 +208,9 @@ passes `artifact.id` as the signal id, so an artifact can never double-record.
 `assertStateInvariants` after **every** event:
 
 - no duplicate queue ids; every queued id exists and is `queued`
-- `activeTaskId`, if set, names a task in `running | pause_requested | paused |
-  awaiting_user` and not simultaneously queued
+- every entry in `activeTaskIds` (one per repository) names a task owned by
+  that repository, in `running | pause_requested | paused | awaiting_user`,
+  and not simultaneously queued
 - `activeRunId` resolves to a run of that task in `running` or `interrupted`
 - at most one `open` question per task, and an open question implies
   `awaiting_user`
@@ -224,15 +225,38 @@ States: `queued | running | pause_requested | paused | awaiting_user |
 completed | failed | cancelled`. A **run** is one execution segment under one
 task-spec revision; every resume, answer, and approval mints a fresh `runId`.
 
-**One mutating job, globally.** Three mechanisms enforce it: `activeTaskId` is a
-single slot; `#submit` only emits `task.started` when the slot is free; and
-handoff is atomic — `#finishTask` and `#cancel` emit the next task's
-`task.started` *in the same transaction* as the terminal event. No scheduler
-tick, no race window.
+**One mutating job per repository ("lane").** `ControllerState.activeTaskIds`
+is a `Map<repositoryId, taskId>` — one slot per repository, not one slot
+globally. Different repositories run concurrently; the same repository never
+runs two tasks at once. Three mechanisms enforce it: `#submit` only emits
+`task.started` when *that repository's* slot is free; handoff is atomic —
+`#finishTask` and `#cancel` emit the next queued task *for that repository*
+in the same transaction as the terminal event, found by scanning the shared
+`queue` for the first entry owned by that `repositoryId`. No scheduler tick,
+no race window, and the single global FIFO ordering `queue.move` /
+`queue.reordered` operate on is unchanged — only admission became per-lane.
+
+`ControllerSnapshot.activeTaskId` (singular) survives as a deprecated
+convenience: the first lane's active task, or `null`. It is only meaningful
+while at most one repository is ever selected/submitted against at a time
+(true for every client today — see [§10](#10-where-to-make-a-given-change)
+for what changes when that stops being true). New code should read
+`activeTaskIds` and index by repository.
+
+`CodingRunner` mirrors this: it holds one full `{omp, codex, claude}` runner
+set per repository (a *lane*), built lazily on that repository's first
+`task.started`/`task.resumed` and kept for the daemon's lifetime. This is
+what actually makes concurrent lanes safe — `OmpRunner` and
+`ExternalCliRunner` each hold single-task instance state (one session, one
+`WorkspaceGuard`), so two repositories running at once must never share an
+instance. `askCoder`/`steer`/`followUp(taskId, …)` resolve the owning lane via
+`getTask(taskId).repositoryId` before dispatching.
 
 **Queue priority.** A task with `spec.codingProfileId === "fast"` appends to the
 end. Anything else inserts before the first queued fast task, so substantive
-coding work jumps ahead of research and lookups.
+coding work jumps ahead of research and lookups. This ordering is global
+across all repositories; per-lane admission then picks, for each freed
+repository, that repository's earliest queued task in this shared order.
 
 **Pause is two-phase, never preemptive.** `task.requestPause` →
 `pause_requested`. The runner keeps going until a safe tool boundary, signals
@@ -247,10 +271,12 @@ confirmation at the current revision (`confirmation_pending`) exists. If a
 workspace conflict is open, resuming emits `workspace.conflictResolved` first —
 resuming *is* the reconciliation act, and it is recorded.
 
-**Recovery.** `recoverAfterRestart` emits, in one transaction: `run.interrupted`,
-then `coder.recoveryBoundary {unknownToolCall: true}` if a coding session was
-bound, then `task.paused {reason: "recovery requires explicit resume"}`. Nothing
-resumes implicitly and no in-flight tool call is ever replayed.
+**Recovery.** `recoverAfterRestart` emits, in one transaction, for *every* lane
+that owns an unfinished run: `run.interrupted`, then
+`coder.recoveryBoundary {unknownToolCall: true}` if a coding session was
+bound, then `task.paused {reason: "recovery requires explicit resume"}`. Each
+repository recovers independently; nothing resumes implicitly and no
+in-flight tool call is ever replayed.
 
 ### 4.6 Persistence
 
@@ -491,11 +517,14 @@ consumers; nothing calls them to "start work".
 
 ### 5.2 Dispatch
 
-`CodingRunner` holds `Record<CodingBackend, CodingBackendRunner>`, built eagerly
-— all backends live for the whole daemon lifetime, one is `#activeBackend`.
-On `task.started`/`task.resumed`, a task with a persisted
-`codingSession.backend` **pins** to it; otherwise `RuntimeSettings.codingBackend`
-decides. A task never silently migrates between backends or accounts.
+`CodingRunner` holds one *lane* per `repositoryId`, each a
+`Record<CodingBackend, CodingBackendRunner>` plus that lane's
+`activeBackend`. A lane is built lazily on that repository's first
+`task.started`/`task.resumed` and lives for the daemon's lifetime after that
+— see [§4.5](#45-task-lifecycle). On `task.started`/`task.resumed`, a task
+with a persisted `codingSession.backend` **pins** to it; otherwise
+`RuntimeSettings.codingBackend` decides, per lane. A task never silently
+migrates between backends or accounts.
 
 ### 5.3 Embedded OMP (`omp-runner.ts`)
 
@@ -785,6 +814,7 @@ truncation.
 | New env var or wiring | `daemon.ts` only. `MamachiIpcServer` reads no environment. |
 | New coding backend | [§5.5](#55-adding-a-fourth-backend) |
 | New voice engine | [§6.5](#65-adding-a-third-voice-engine) |
+| Per-repository ("lane") admission rule | `domain.ts` `activeTaskIds` + `assertStateInvariants` → `controller.ts` `#submit`/`#finishTask`/`#cancel`/`#startNextEvent` → `coding-runner.ts` `#lane` |
 | New daemon → UI event | add a case to `AppModel.handle(_:)` |
 
 ---

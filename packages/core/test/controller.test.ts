@@ -30,6 +30,18 @@ function submit(
   return result.taskId;
 }
 
+function submitToRepository(controller: TaskController, repositoryId: string): string {
+  const result = controller.handle({
+    id: Bun.randomUUIDv7(),
+    type: "task.submit",
+    actor: "voice",
+    expectedRevision: null,
+    payload: { ...spec, repositoryId },
+  });
+  if (result.status !== "accepted" || !result.taskId) throw new Error("Task submission failed");
+  return result.taskId;
+}
+
 describe("TaskController", () => {
   test("runs one task and atomically starts the next queued task", () => {
     const store = new EventStore();
@@ -578,6 +590,68 @@ describe("TaskController", () => {
       const replayed = new TaskController(replayStore).snapshot();
       expect(replayed.tasks).toEqual(live.tasks);
       replayStore.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("runs one task per repository concurrently, each repository its own lane", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store, {
+        validateEvidence: () => ({
+          valid: true,
+          implementationComplete: true,
+          verificationComplete: true,
+          explanation: "test evidence accepted",
+        }),
+      });
+      const alphaFirst = submitToRepository(controller, "repo_alpha");
+      const betaFirst = submitToRepository(controller, "repo_beta");
+      const alphaSecond = submitToRepository(controller, "repo_alpha");
+
+      let snapshot = controller.snapshot();
+      expect(snapshot.activeTaskIds).toEqual({ repo_alpha: alphaFirst, repo_beta: betaFirst });
+      expect(snapshot.queue).toEqual([alphaSecond]);
+      expect(snapshot.tasks.find((task) => task.id === betaFirst)?.state).toBe("running");
+
+      const completion = controller.completeTask(
+        Bun.randomUUIDv7(),
+        alphaFirst,
+        "Alpha work verified",
+        [Bun.randomUUIDv7()],
+      );
+      expect(completion.status).toBe("accepted");
+
+      snapshot = controller.snapshot();
+      expect(snapshot.activeTaskIds).toEqual({ repo_alpha: alphaSecond, repo_beta: betaFirst });
+      expect(snapshot.tasks.find((task) => task.id === betaFirst)?.state).toBe("running");
+      expect(snapshot.tasks.find((task) => task.id === alphaSecond)?.state).toBe("running");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("recovers every lane's unfinished run independently after a restart", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mamachi-controller-lanes-"));
+    const databasePath = join(directory, "state.sqlite");
+    try {
+      const firstStore = new EventStore(databasePath);
+      const firstController = new TaskController(firstStore);
+      const alphaTaskId = submitToRepository(firstController, "repo_alpha");
+      const betaTaskId = submitToRepository(firstController, "repo_beta");
+      firstStore.close();
+
+      const recoveryStore = new EventStore(databasePath);
+      const recoveryController = new TaskController(recoveryStore);
+      const recovery = recoveryController.recoverAfterRestart(Bun.randomUUIDv7());
+      expect(recovery.status).toBe("accepted");
+
+      const snapshot = recoveryController.snapshot();
+      expect(snapshot.tasks.find((task) => task.id === alphaTaskId)?.state).toBe("paused");
+      expect(snapshot.tasks.find((task) => task.id === betaTaskId)?.state).toBe("paused");
+      expect(snapshot.activeTaskIds).toEqual({ repo_alpha: alphaTaskId, repo_beta: betaTaskId });
+      recoveryStore.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
