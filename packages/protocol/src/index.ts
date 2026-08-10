@@ -36,6 +36,9 @@ export const TaskSpecSchema = {
     codingProfileId: {
       oneOf: [{ type: "string", minLength: 1 }, { type: "null" }],
     },
+    delivery: {
+      enum: ["working_tree", "commit", "pull_request"],
+    },
   },
   required: [
     "repositoryId",

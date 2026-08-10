@@ -4,7 +4,7 @@ import Foundation
 
 public enum MamachiProtocol {
     public static let envelopeVersion = 1
-    public static let schemaSHA256 = "c133572c8794bfc39d1afa15c1dee49114ad035e444c62ad12f26bb80e496273"
+    public static let schemaSHA256 = "0dc57f732801402cafe4a33f5b7550bc9e2d6fc98c828026c197465a09eb9353"
     public static let commandSchemaJSON = #"""
 {
   "oneOf": [
@@ -63,6 +63,13 @@ public enum MamachiProtocol {
                 "type": "string"
               },
               "type": "array"
+            },
+            "delivery": {
+              "enum": [
+                "working_tree",
+                "commit",
+                "pull_request"
+              ]
             },
             "objective": {
               "minLength": 1,
@@ -206,6 +213,13 @@ public enum MamachiProtocol {
                     "type": "string"
                   },
                   "type": "array"
+                },
+                "delivery": {
+                  "enum": [
+                    "working_tree",
+                    "commit",
+                    "pull_request"
+                  ]
                 },
                 "objective": {
                   "minLength": 1,
@@ -895,6 +909,13 @@ public enum MamachiProtocol {
             },
             "type": "array"
           },
+          "delivery": {
+            "enum": [
+              "working_tree",
+              "commit",
+              "pull_request"
+            ]
+          },
           "objective": {
             "minLength": 1,
             "type": "string"
@@ -1104,6 +1125,13 @@ public enum MamachiProtocol {
               "type": "string"
             },
             "type": "array"
+          },
+          "delivery": {
+            "enum": [
+              "working_tree",
+              "commit",
+              "pull_request"
+            ]
           },
           "objective": {
             "minLength": 1,

@@ -92,6 +92,8 @@ The local controller and tool results are authoritative for workspace, task, que
 # Conversation versus action
 Brainstorming, hypotheticals, examples, and side discussion are non-operative. A concrete coding request belongs to the coding agent: call submit_task when the objective, at least one observable acceptance criterion, and constraints are clear. For a broad request, summarize it and obtain confirmation first. Ask one question at a time.
 
+Choose submit_task delivery from what the user actually asked for: working_tree by default; commit only if they asked to commit; pull_request only if they asked to open a pull request. Never upgrade delivery on your own. To change several repositories at once, call submit_task once per repository, each with its own spec and delivery — there is no batch form. A pull request exists only once a tool result reports its URL; never claim one was opened otherwise.
+
 # Active work
 Coding continues after submit_task returns. Stay available for unrelated conversation. For status, use get_task_status. Do not narrate routine tools. Surface blockers, consequential changes, requested status, and completion. Controller completion, failure, and input-needed events require an immediate brief update; never wait for the user to ask.
 
@@ -194,6 +196,12 @@ ${this.#host.getWorkspace()}
             constraints: { type: "array", items: { type: "string", minLength: 1 } },
             attachmentIds: { type: "array", items: { type: "string", minLength: 1 } },
             codingProfileId: { type: ["string", "null"] },
+            delivery: {
+              type: "string",
+              enum: ["working_tree", "commit", "pull_request"],
+              description:
+                "How the work is delivered. working_tree (default) leaves changes uncommitted; commit stages and commits; pull_request also branches, pushes, and opens a PR. Only pick a mode the user actually asked for; never upgrade to commit or pull_request on your own.",
+            },
           },
           required: ["repositoryId", "objective", "acceptanceCriteria", "constraints", "attachmentIds", "codingProfileId"],
         },
@@ -514,7 +522,7 @@ ${this.#host.getWorkspace()}
       case "submit_task": {
         assertOnlyKeys(
           input,
-          ["repositoryId", "objective", "acceptanceCriteria", "constraints", "attachmentIds", "codingProfileId"],
+          ["repositoryId", "objective", "acceptanceCriteria", "constraints", "attachmentIds", "codingProfileId", "delivery"],
           name,
         );
         const repositoryId = requireString(input["repositoryId"], "repositoryId");
@@ -523,12 +531,24 @@ ${this.#host.getWorkspace()}
         const constraints = requireStringArray(input["constraints"], "constraints", true);
         const attachmentIds = requireStringArray(input["attachmentIds"], "attachmentIds", true);
         const codingProfileId = requireNullableString(input["codingProfileId"], "codingProfileId");
+        const delivery = input["delivery"];
+        if (delivery !== undefined && delivery !== "working_tree" && delivery !== "commit" && delivery !== "pull_request") {
+          throw new Error("delivery must be working_tree, commit, or pull_request");
+        }
         const result = await this.#host.executeCommand({
           id: Bun.randomUUIDv7(),
           type: "task.submit",
           actor: "voice",
           expectedRevision: null,
-          payload: { repositoryId, objective, acceptanceCriteria, constraints, attachmentIds, codingProfileId },
+          payload: {
+            repositoryId,
+            objective,
+            acceptanceCriteria,
+            constraints,
+            attachmentIds,
+            codingProfileId,
+            ...(delivery !== undefined ? { delivery } : {}),
+          },
         });
         if (result.status === "accepted") {
           for (const id of attachmentIds) this.#pendingContext.delete(id);

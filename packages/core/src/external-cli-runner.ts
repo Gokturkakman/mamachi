@@ -231,15 +231,27 @@ function commandFromInput(input: Record<string, unknown>): string {
   return nonEmptyString(input["command"]) ?? nonEmptyString(input["cmd"]) ?? "";
 }
 
+type DeliveryMode = "working_tree" | "commit" | "pull_request";
+
+/**
+ * How the task's work is delivered. The accepted specification decides this — not
+ * the wording of the objective. `working_tree` (the default when a spec predates
+ * this field) leaves changes uncommitted; `commit` may stage and commit; and
+ * `pull_request` may additionally branch, push, and open a PR, so it is the only
+ * mode granted network access.
+ */
+function deliveryOf(task: TaskRecord): DeliveryMode {
+  return task.spec.delivery ?? "working_tree";
+}
+
+/** Staging and committing require write access to `.git`; both `commit` and `pull_request` allow it. */
 function taskAllowsGitMetadataWrite(task: TaskRecord): boolean {
-  if (task.spec.constraints.some((constraint) =>
-    /\b(?:do not|don't|must not|never)\s+(?:git\s+)?(?:commit|stage)\b/i.test(constraint)
-  )) {
-    return false;
-  }
-  return [task.spec.objective, ...task.spec.acceptanceCriteria].some((requirement) =>
-    /\b(?:commit|commits|committed|committing|stage|staged|staging)\b/i.test(requirement)
-  );
+  return deliveryOf(task) !== "working_tree";
+}
+
+/** Only opening a pull request needs to reach the network (push + `gh pr create`). */
+function taskAllowsNetwork(task: TaskRecord): boolean {
+  return deliveryOf(task) === "pull_request";
 }
 
 function taskPrompt(
@@ -271,7 +283,16 @@ function taskPrompt(
         "The previous process may have stopped during a tool action. Do not replay an unknown action. Inspect current repository state first.",
       ]
     : [];
-  const gitMetadataWriteAllowed = taskAllowsGitMetadataWrite(task);
+  const delivery = deliveryOf(task);
+  const deliveryInstruction =
+    delivery === "pull_request"
+      ? [
+          "Delivery mode: pull_request. After the change is implemented and verified, create a new branch, commit the work, push it, and open a pull request with `gh pr create`. Each push and `gh pr create` will surface a separate approval card; wait for approval rather than retrying. Report the resulting pull request URL in your final summary.",
+          "Do not access credentials or deploy. Do not force-push or touch branches other than the one you create.",
+        ]
+      : delivery === "commit"
+        ? ["Delivery mode: commit. The accepted task authorizes staging and committing inside this repository. Do not switch branches, push, publish, deploy, or access credentials."]
+        : ["Delivery mode: working_tree. Preserve pre-existing user changes. Do not commit, switch branches, publish, deploy, or access credentials."];
   return [
     resumed
       ? `Resume task ${task.id} under accepted specification revision ${task.revision}. Re-read affected files before editing.`
@@ -289,9 +310,7 @@ function taskPrompt(
     ...capturedContext,
     "",
     "Work autonomously inside this repository until the task is complete.",
-    gitMetadataWriteAllowed
-      ? "The accepted task explicitly authorizes staging and committing inside this repository. Do not switch branches, publish, deploy, or access credentials."
-      : "Preserve pre-existing user changes. Do not commit, switch branches, publish, deploy, or access credentials.",
+    ...deliveryInstruction,
     "Use the agent's repository tools and verify the changed behavior with the smallest authoritative command.",
     "If one missing user decision makes further work unsafe, end with exactly `MAMACHI_NEEDS_INPUT: <one concise question>`.",
     "Otherwise end with a concise evidence-based summary. Do not claim completion before verification succeeds.",
@@ -738,6 +757,7 @@ export class ExternalCliRunner {
     policyHookCommand: string,
   ): string[] {
     const gitMetadataWriteAllowed = taskAllowsGitMetadataWrite(task);
+    const networkAllowed = taskAllowsNetwork(task);
     if (this.#backend === "codex") {
       const hookConfig = [
         "{ matcher = \".*\", hooks = [",
@@ -757,6 +777,10 @@ export class ExternalCliRunner {
         ...(gitMetadataWriteAllowed
           ? ["-c", `sandbox_workspace_write.writable_roots=[${JSON.stringify(join(task.repositoryId, ".git"))}]`]
           : []),
+        // The workspace-write sandbox denies network by default; opening a PR needs push
+        // access. Grant it only for pull_request delivery — every command still passes the
+        // PreToolUse policy hook, and push / gh pr create each park their own approval card.
+        ...(networkAllowed ? ["-c", "sandbox_workspace_write.network_access=true"] : []),
       ];
       if (this.#sessionId) {
         return [
@@ -804,9 +828,11 @@ export class ExternalCliRunner {
       "--settings",
       settings,
       "--append-system-prompt",
-      gitMetadataWriteAllowed
-        ? "Mamachi is supervising this coding run. The accepted task authorizes staging and committing inside the selected repository. Preserve user changes, avoid other external side effects, and verify before finishing."
-        : "Mamachi is supervising this coding run. Stay inside the selected repository, preserve user changes, avoid commits and external side effects, and verify before finishing.",
+      networkAllowed
+        ? "Mamachi is supervising this coding run. The accepted task authorizes staging, committing, pushing a new branch, and opening a pull request inside the selected repository. Preserve user changes, avoid other external side effects, and verify before finishing."
+        : gitMetadataWriteAllowed
+          ? "Mamachi is supervising this coding run. The accepted task authorizes staging and committing inside the selected repository. Do not push or publish. Preserve user changes, avoid other external side effects, and verify before finishing."
+          : "Mamachi is supervising this coding run. Stay inside the selected repository, preserve user changes, avoid commits and external side effects, and verify before finishing.",
       ...(model ? ["--model", model] : []),
       ...(this.#sessionId ? ["--resume", this.#sessionId] : []),
     ];

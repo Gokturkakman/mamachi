@@ -262,9 +262,12 @@ describe("ExternalCliRunner", () => {
     const repository = mkdtempSync(join(tmpdir(), "mamachi-codex-commit-"));
     temporaryDirectories.push(repository);
     const task = createTask(repository, "codex");
-    task.spec.objective = "Commit all current uncommitted changes";
-    task.spec.acceptanceCriteria = ["All current changes are committed with an agent-selected message"];
-    task.spec.constraints = ["Do not modify files beyond what is needed to commit existing changes"];
+    // Deliberately never say "commit" in the objective — Git write access must come from
+    // the accepted delivery mode, not from prose phrasing (the old regex heuristic is gone).
+    task.spec.objective = "Persist the current working-tree changes to the repository history";
+    task.spec.acceptanceCriteria = ["The current changes are saved with an agent-selected message"];
+    task.spec.constraints = ["Do not modify files beyond what is needed to save existing changes"];
+    task.spec.delivery = "commit";
     const argumentsPath = join(repository, "captured-arguments");
     const promptPath = join(repository, "captured-prompt");
     const environmentPath = join(repository, "captured-environment");
@@ -339,12 +342,140 @@ describe("ExternalCliRunner", () => {
       expect(argumentsList).not.toContain("resume");
       expect(argumentsList).not.toContain("codex-existing-session");
       const prompt = readFileSync(promptPath, "utf8");
-      expect(prompt).toContain("explicitly authorizes staging and committing");
+      expect(prompt).toContain("Delivery mode: commit");
+      expect(prompt).toContain("authorizes staging and committing");
       expect(prompt).toContain("The exact answer to your pending question is: Yes, grant write access to .git");
       expect(prompt).not.toContain("Do not commit");
       const childEnvironment = readFileSync(environmentPath, "utf8");
       expect(childEnvironment).not.toContain("test-openai-secret");
       expect(childEnvironment).not.toContain("test-anthropic-secret");
+    } finally {
+      await runner.dispose();
+    }
+  });
+
+  test("grants Git write and network only for pull_request delivery, and instructs opening a PR", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "mamachi-codex-pr-"));
+    temporaryDirectories.push(repository);
+    const task = createTask(repository);
+    task.spec.objective = "Land the requested change and share it for review";
+    task.spec.acceptanceCriteria = ["The change is implemented and offered for review"];
+    task.spec.constraints = [];
+    task.spec.delivery = "pull_request";
+    const argumentsPath = join(repository, "captured-arguments");
+    const promptPath = join(repository, "captured-prompt");
+    const executable = fakeExecutable(repository, [
+      { type: "thread.started", thread_id: "new-pr-session" },
+      {
+        type: "item.completed",
+        item: { id: "message-pr", type: "agent_message", text: "Opened https://github.com/x/y/pull/1" },
+      },
+      { type: "turn.completed" },
+    ], { argumentsPath, promptPath });
+    const completed = Promise.withResolvers<void>();
+    let ordinal = 0;
+    const runner = new ExternalCliRunner({
+      backend: "codex",
+      executable,
+      getTask: (taskId) => (taskId === task.id ? task : undefined),
+      emit: () => {},
+      onSafePause: async () => accepted(),
+      onAuthorizeTool: async () => accepted(),
+      onWorkspaceConflict: async () => accepted(),
+      onRecordEvidence: async (input) => evidence(input, ++ordinal),
+      onComplete: async () => {
+        completed.resolve();
+        return accepted();
+      },
+      onFail: async (_taskId, error) => {
+        completed.reject(new Error(error));
+        return accepted();
+      },
+      onNeedInput: async () => accepted(),
+      onSessionBound: async () => accepted(),
+      runtimeSettings: {
+        ...defaultRuntimeSettings,
+        codingBackend: "codex",
+        primaryModel: "openai-codex/gpt-5.4-mini",
+        automaticRouting: false,
+      },
+    });
+
+    runner.handleEvents([
+      {
+        type: "task.started",
+        taskId: task.id,
+        payload: { runId: task.activeRunId!, revision: task.revision },
+      } as DomainEvent,
+    ]);
+    try {
+      await completed.promise;
+      const argumentsList = readFileSync(argumentsPath, "utf8").trim().split("\n");
+      expect(argumentsList).toContain("sandbox_workspace_write.network_access=true");
+      expect(argumentsList).toContain("--add-dir");
+      expect(argumentsList[argumentsList.indexOf("--add-dir") + 1]).toBe(join(repository, ".git"));
+      const prompt = readFileSync(promptPath, "utf8");
+      expect(prompt).toContain("Delivery mode: pull_request");
+      expect(prompt).toContain("gh pr create");
+    } finally {
+      await runner.dispose();
+    }
+  });
+
+  test("keeps a default working_tree task off the network and out of .git", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "mamachi-codex-wt-"));
+    temporaryDirectories.push(repository);
+    const task = createTask(repository);
+    const argumentsPath = join(repository, "captured-arguments");
+    const executable = fakeExecutable(repository, [
+      { type: "thread.started", thread_id: "new-wt-session" },
+      {
+        type: "item.completed",
+        item: { id: "message-wt", type: "agent_message", text: "Done" },
+      },
+      { type: "turn.completed" },
+    ], { argumentsPath });
+    const completed = Promise.withResolvers<void>();
+    let ordinal = 0;
+    const runner = new ExternalCliRunner({
+      backend: "codex",
+      executable,
+      getTask: (taskId) => (taskId === task.id ? task : undefined),
+      emit: () => {},
+      onSafePause: async () => accepted(),
+      onAuthorizeTool: async () => accepted(),
+      onWorkspaceConflict: async () => accepted(),
+      onRecordEvidence: async (input) => evidence(input, ++ordinal),
+      onComplete: async () => {
+        completed.resolve();
+        return accepted();
+      },
+      onFail: async (_taskId, error) => {
+        completed.reject(new Error(error));
+        return accepted();
+      },
+      onNeedInput: async () => accepted(),
+      onSessionBound: async () => accepted(),
+      runtimeSettings: {
+        ...defaultRuntimeSettings,
+        codingBackend: "codex",
+        primaryModel: "openai-codex/gpt-5.4-mini",
+        automaticRouting: false,
+      },
+    });
+
+    runner.handleEvents([
+      {
+        type: "task.started",
+        taskId: task.id,
+        payload: { runId: task.activeRunId!, revision: task.revision },
+      } as DomainEvent,
+    ]);
+    try {
+      await completed.promise;
+      const argumentsList = readFileSync(argumentsPath, "utf8").trim().split("\n");
+      expect(argumentsList).not.toContain("sandbox_workspace_write.network_access=true");
+      expect(argumentsList).not.toContain("--add-dir");
     } finally {
       await runner.dispose();
     }

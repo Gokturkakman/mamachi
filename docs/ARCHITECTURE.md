@@ -352,7 +352,7 @@ returning `tier ∈ {automatic, visual_approval, reject}`:
 | 1 | `rm -rf /`, `mkfs`/`diskutil eraseDisk`, fork bomb | **reject** / `unsupported` |
 | 2 | credential access: `*_API_KEY`, `MAMACHI_TOKEN`, `AWS_*`, `GITHUB_TOKEN`, `.env`, `.ssh/`, `id_rsa`, `security find-*-password`, bare `env`/`printenv`/`export` | **reject** / `credential_access` |
 | 3 | purchase / checkout / `stripe payment` | approval / `purchase` |
-| 4 | `npm\|bun\|cargo\|gem\|pypi\|twine publish`, `gh release`, `git push` | approval / `external_publication` |
+| 4 | `npm\|bun\|cargo\|gem\|pypi\|twine publish`, `gh release create\|upload`, `gh pr create`, `git push` | approval / `external_publication` |
 | 5 | `vercel\|netlify\|fly\|railway\|firebase deploy`, `kubectl apply`, `terraform apply` | approval / `deployment` |
 | 6 | `git reset --hard`, `clean`, `restore`, `checkout --`, `switch`, `branch -D`, `rebase`, `commit`, `push`, `tag -d` | approval / `destructive_git` |
 | 7 | `rm`, `shred`, `dd`, `chmod -R`, output redirection | approval / `destructive_filesystem` |
@@ -526,8 +526,23 @@ authenticated loopback policy service; native `PreToolUse` hooks synchronously
 submit every proposed tool call to `assessToolCall` and deny on service failure.
 The CLIs retain their native workspace sandbox as a second boundary.
 
-`--add-dir <repo>/.git` appears only for an explicit commit task — a
-deliberate, narrow escalation.
+**Delivery decides Git and network reach, not prose.** `TaskSpec.delivery`
+(`working_tree` | `commit` | `pull_request`, absent ⇒ `working_tree`) is the
+single gate. `deliveryOf(task)` drives three escalations, each narrower than the
+last:
+
+- `commit` and `pull_request` add `--add-dir <repo>/.git` and
+  `sandbox_workspace_write.writable_roots=[…/.git]`, so staging/commit can write
+  `.git`.
+- `pull_request` additionally sets `sandbox_workspace_write.network_access=true`
+  — the `workspace-write` sandbox denies network otherwise, so `git push` would
+  fail before the policy hook ran. Every command still passes the `PreToolUse`
+  hook, and `git push` / `gh pr create` each park their own approval card
+  (policy rule 4).
+
+This replaced a regex that granted `.git` write whenever the objective or an
+acceptance criterion contained the word "commit"/"stage": phrasing could grant
+privilege. Now only the accepted specification's `delivery` can.
 
 ### 5.5 Adding a fourth backend
 
@@ -604,6 +619,10 @@ Every schema is `additionalProperties: false`.
 or editing a file, listing a directory, running git, running tests, or running a
 build. Its instructions say so twice. All repository work is delegated through
 `submit_task`, `inspect_workspace`, `research_web`, and `ask_coder`.
+`submit_task` carries an optional `delivery` (`working_tree` | `commit` |
+`pull_request`); the instructions forbid the model from upgrading it on its own
+or claiming a pull request exists without a tool result carrying its URL, and
+require one call per repository rather than a batch form ([§5.4](#54-codex-cli-and-claude-code-external-cli-runnerts)).
 
 The one escape hatch is `control_computer` with `run_shell_command` (`/bin/zsh
 -lc`) or `run_applescript`. Both are gated on the `shell` / `apple_script`
