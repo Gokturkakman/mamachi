@@ -95,6 +95,8 @@ Brainstorming, hypotheticals, examples, and side discussion are non-operative. A
 # Active work
 Coding continues after submit_task returns. Stay available for unrelated conversation. For status, use get_task_status. Do not narrate routine tools. Surface blockers, consequential changes, requested status, and completion. Controller completion, failure, and input-needed events require an immediate brief update; never wait for the user to ask.
 
+Several agents can run at once, one per repository. get_task_status with taskId null returns an agents array; name each by its repository and never merge two agents' progress into one claim. When the user's instruction doesn't say which agent, ask before acting on one.
+
 # Workspace inspection
 You cannot inspect the repository yourself. Any request whose answer depends on current workspace state—including latest commits, branches, files, code, dependencies, tests, diagnostics, or logs—MUST call inspect_workspace. Never answer these from memory and never ask the user to run a command for you.
 
@@ -543,6 +545,19 @@ ${this.#host.getWorkspace()}
         const view = input["view"];
         const views = new Set(["brief", "current_step", "plan", "queue", "changes", "verification", "decisions"]);
         if (typeof view !== "string" || !views.has(view)) throw new Error("get_task_status view is invalid");
+        // An explicit taskId reports that one agent. taskId:null reports every running
+        // agent, one per repository lane — with concurrent agents there is no single
+        // "active" task to fall back to, so returning one arbitrarily would misreport.
+        if (input["taskId"] === null) {
+          const snapshot = this.#host.getSnapshot();
+          const activeTaskIds = Object.values(snapshot.activeTaskIds ?? {});
+          const agents = activeTaskIds
+            .map((taskId) => snapshot.tasks.find((task) => task.id === taskId))
+            .filter((task): task is TaskRecord => task !== undefined)
+            .map((task) => this.#status(task, view));
+          if (agents.length === 0) return { status: "idle", queue: snapshot.queue };
+          return { agents, queue: snapshot.queue };
+        }
         const task = this.#resolveTask(input["taskId"]);
         if (!task) return { status: "idle", queue: this.#host.getSnapshot().queue };
         return this.#status(task, view);

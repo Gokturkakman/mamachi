@@ -50,9 +50,12 @@ function makeTask(overrides: Partial<TaskRecord> = {}): TaskRecord {
 }
 
 function makeSnapshot(tasks: TaskRecord[] = [makeTask()]): ControllerSnapshot {
+  const activeTaskIds: Record<string, string> = {};
+  for (const task of tasks) activeTaskIds[task.repositoryId] = task.id;
   return {
     seq: 1,
     activeTaskId: tasks[0]?.id ?? null,
+    activeTaskIds,
     queue: tasks.map((task) => task.id),
     tasks,
     runs: [],
@@ -224,15 +227,34 @@ describe("createVoiceToolkit", () => {
       queuePosition: 0,
     });
 
-    // taskId null resolves the active task, as in the realtime executor.
-    const step = asRecord(await toolkit.execute("get_task_status", { taskId: null, view: "current_step" }));
-    expect(step["currentStep"]).toBe("Editing auth.ts");
-    expect(stringField(step["recentActivity"], "summary")).toBe("coder.tool: bash");
+    // taskId null reports every active lane as an `agents` array.
+    const all = asRecord(await toolkit.execute("get_task_status", { taskId: null, view: "current_step" }));
+    const agents = all["agents"] as Record<string, unknown>[];
+    expect(agents).toHaveLength(1);
+    expect(agents[0]?.["currentStep"]).toBe("Editing auth.ts");
+    expect(stringField(agents[0]?.["recentActivity"], "summary")).toBe("coder.tool: bash");
 
     expect(await toolkit.execute("get_task_status", { taskId: "missing", view: "brief" })).toEqual({
       status: "idle",
       queue: ["task-1"],
     });
+    toolkit.dispose();
+  });
+
+  test("reports every running agent for an unaddressed status question", async () => {
+    const alpha = makeTask({ id: "task-alpha", repositoryId: "/repo-alpha" });
+    const beta = makeTask({
+      id: "task-beta",
+      repositoryId: "/repo-beta",
+      spec: { ...makeTask().spec, repositoryId: "/repo-beta", objective: "Add a rate limiter" },
+    });
+    const { host } = makeHost({ getSnapshot: () => makeSnapshot([alpha, beta]) });
+    const toolkit = createVoiceToolkit(host);
+
+    const result = asRecord(await toolkit.execute("get_task_status", { taskId: null, view: "brief" }));
+    const agents = result["agents"] as Record<string, unknown>[];
+    expect(agents.map((agent) => agent["repositoryId"]).sort()).toEqual(["/repo-alpha", "/repo-beta"]);
+    expect(agents.map((agent) => agent["id"]).sort()).toEqual(["task-alpha", "task-beta"]);
     toolkit.dispose();
   });
 
